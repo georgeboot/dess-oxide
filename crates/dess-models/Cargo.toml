@@ -1,0 +1,16 @@
+[package]
+name = "dess-models"
+description = "Learned forecasting models for dess-oxide (burn)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray", "autodiff"] }
+dess-core.workspace = true
+jiff.workspace = true
+
+[lints]
+workspace = true

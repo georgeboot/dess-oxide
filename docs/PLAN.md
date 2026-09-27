@@ -769,7 +769,7 @@ These are off by default, enabled with an app option. They're for automations th
 - [x] baseline forecasts: load from recorded history, PV from Open-Meteo GTI
 - [x] shadow planning every slot, with every plan stored
 - [x] the dess-oxide page: plan, last 24 hours against DAO's setpoint, forecast errors
-- [ ] `import` backfill from HA statistics
+- [x] backfill from HA statistics (automatic, in the service)
 - [ ] backtest harness
 
 **M2: Learned models.**

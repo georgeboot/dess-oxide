@@ -4,7 +4,7 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.3.0"
+version: "0.4.0"
 slug: dess_oxide
 description: Plans a Victron ESS against Dutch day-ahead prices. Shadow mode — it never writes to the Victron yet.
 url: https://github.com/georgeboot/dess-oxide

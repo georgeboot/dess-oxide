@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- **Learned PV model:** dess-oxide trains a PV model on your history (HA
+  statistics and its own recordings) and the archived weather. It learns
+  effective kWp, tilt and azimuth per array, plus your inverter's output
+  limit, starting from the arrays you configured. It trains shortly after
+  startup and then nightly. It's only used when it beats the configured
+  arrays on held-out data. The dess-oxide page shows what it learned.
+- **Unknown options** are now logged and ignored instead of stopping the app.
+
 ## 0.3.0
 
 - **History import:** configure `history` with your HA energy sensors. dess-oxide

@@ -104,10 +104,29 @@ const MIGRATIONS: &[&str] = &[
         issued_at   INTEGER NOT NULL
     ) STRICT;
 ",
+    r"
+    -- The latest fit of each learned model.
+    CREATE TABLE models (
+        name       TEXT PRIMARY KEY,
+        trained_at INTEGER NOT NULL,
+        params     TEXT NOT NULL, -- JSON
+        metrics    TEXT NOT NULL, -- JSON
+        promoted   INTEGER NOT NULL -- beats its baseline, so it's used
+    ) STRICT;
+",
 ];
 
 pub struct Store {
     conn: Connection,
+}
+
+/// A learned model as stored.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredModel {
+    pub trained_at: jiff::Timestamp,
+    pub params: serde_json::Value,
+    pub metrics: serde_json::Value,
+    pub promoted: bool,
 }
 
 /// One recorded slot, with what was planned and forecast for it.
@@ -459,7 +478,6 @@ impl Store {
     }
 
     /// Weather for `[from, until)`.
-    #[allow(dead_code, reason = "read by the M2 training pipeline, next")]
     pub fn weather(&self, from: Slot, until: Slot) -> anyhow::Result<BTreeMap<Slot, Weather>> {
         let mut query = self.conn.prepare_cached(
             "SELECT slot_start, ghi, dni, dhi, temperature, humidity, wind FROM weather
@@ -496,6 +514,94 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(last.and_then(Slot::from_start_unix))
+    }
+
+    pub fn save_model(
+        &self,
+        name: &str,
+        trained_at: jiff::Timestamp,
+        params: &serde_json::Value,
+        metrics: &serde_json::Value,
+        promoted: bool,
+    ) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO models VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                name,
+                trained_at.as_second(),
+                params.to_string(),
+                metrics.to_string(),
+                promoted
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The stored fit of `name`: when, parameters, metrics, and whether it's promoted.
+    pub fn model(&self, name: &str) -> anyhow::Result<Option<StoredModel>> {
+        let row = self.conn.query_row(
+            "SELECT trained_at, params, metrics, promoted FROM models WHERE name = ?1",
+            [name],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, bool>(3)?,
+                ))
+            },
+        );
+        match row {
+            Ok((trained_at, params, metrics, promoted)) => Ok(Some(StoredModel {
+                trained_at: jiff::Timestamp::from_second(trained_at)?,
+                params: serde_json::from_str(&params)?,
+                metrics: serde_json::from_str(&metrics)?,
+                promoted,
+            })),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Recorded AC PV energy per slot since `from`, for fully covered slots
+    /// with the PV relay in the PV-on state throughout (per `pv_on`).
+    pub fn recorded_pv(
+        &self,
+        from: Slot,
+        relay_closed_means_pv_on: Option<(usize, bool)>,
+    ) -> anyhow::Result<BTreeMap<Slot, f64>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, pv_ac_wh, relay1_closed_seconds, relay2_closed_seconds, covered_seconds
+             FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds >= 850",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                [row.get::<_, f64>(2)?, row.get::<_, f64>(3)?],
+                row.get::<_, f64>(4)?,
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (start, wh, closed, covered) = row?;
+            let pv_was_on = match relay_closed_means_pv_on {
+                None => true,
+                Some((relay, closed_means_on)) => {
+                    let closed_all = closed[relay] >= covered - 1.0;
+                    let open_all = closed[relay] <= 1.0;
+                    if closed_means_on {
+                        closed_all
+                    } else {
+                        open_all
+                    }
+                }
+            };
+            if let (true, Some(slot)) = (pv_was_on, Slot::from_start_unix(start)) {
+                out.insert(slot, wh);
+            }
+        }
+        Ok(out)
     }
 
     /// Adds steady-state conversion samples to the day's bins.

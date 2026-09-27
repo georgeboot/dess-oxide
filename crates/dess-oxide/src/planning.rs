@@ -331,11 +331,13 @@ pub async fn resolve_location(
     }
 }
 
-/// Expected PV power per slot from the weather and the configured arrays.
+/// Expected PV power per slot from the weather: the learned model when
+/// there is one, else the configured arrays.
 pub fn pv_from_weather(
     weather: &BTreeMap<Slot, Weather>,
     config: &Config,
     location: LocationConfig,
+    learned: Option<&dess_models::pv::PvModel>,
 ) -> BTreeMap<Slot, Watts> {
     let arrays: Vec<PvArray> = config
         .pv
@@ -348,19 +350,19 @@ pub fn pv_from_weather(
             },
         })
         .collect();
+    let (latitude, longitude) = (location.latitude, location.longitude);
     weather
         .iter()
         .map(|(slot, w)| {
-            (
-                *slot,
-                dess_core::weather::baseline_pv(
-                    *slot,
-                    w,
-                    &arrays,
-                    location.latitude,
-                    location.longitude,
+            let power = match learned {
+                Some(model) => Watts(
+                    model.power_kw(&dess_models::pv::Quarter::new(
+                        *slot, w, latitude, longitude,
+                    )) * 1000.0,
                 ),
-            )
+                None => dess_core::weather::baseline_pv(*slot, w, &arrays, latitude, longitude),
+            };
+            (*slot, power)
         })
         .collect()
 }

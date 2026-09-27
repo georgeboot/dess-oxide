@@ -2,6 +2,9 @@
 //! file when running standalone. Both use the same schema.
 //!
 //! Only what can't be measured lives here. Units: kW, kWh, €/kWh, degrees.
+//!
+//! Unknown options are logged and ignored rather than fatal: Home Assistant
+//! and the image can briefly disagree about the schema during an update.
 
 use std::path::Path;
 
@@ -13,7 +16,6 @@ use jiff::tz::TimeZone;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Config {
     pub victron: VictronConfig,
     #[serde(default)]
@@ -42,7 +44,7 @@ pub struct Config {
 /// Energy sensors (cumulative kWh, as in HA's energy dashboard). House load
 /// is derived as `grid_import − grid_export + pv − battery_in + battery_out`.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct HistoryConfig {
     pub grid_import: Option<String>,
     pub grid_export: Option<String>,
@@ -77,7 +79,6 @@ impl HistoryConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct HomeAssistantConfig {
     /// e.g. `http://homeassistant.local:8123`
     pub url: String,
@@ -86,7 +87,6 @@ pub struct HomeAssistantConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct VictronConfig {
     /// Host name or IP address of the GX device.
     pub host: String,
@@ -114,7 +114,7 @@ pub enum RelayAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct GridConfig {
     pub max_import_kw: f64,
     pub max_export_kw: f64,
@@ -131,7 +131,7 @@ impl Default for GridConfig {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct BatteryConfig {
     /// Usable capacity. Defaults to Venus's Dynamic ESS capacity setting, or
     /// the BMS's installed Ah at nominal LFP voltage.
@@ -143,7 +143,7 @@ pub struct BatteryConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields, default)]
+#[serde(default)]
 pub struct PricesConfig {
     /// Nord Pool delivery area.
     pub area: String,
@@ -159,7 +159,6 @@ impl Default for PricesConfig {
 
 /// A value that takes effect on a date.
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct Change {
     pub from: Date,
     pub value: f64,
@@ -167,7 +166,6 @@ pub struct Change {
 
 /// €/kWh excluding VAT; see [`Tariff`] for the formulas.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct TariffConfig {
     pub vat: Vec<Change>,
     pub energy_tax: Vec<Change>,
@@ -188,14 +186,12 @@ pub struct TariffConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct LocationConfig {
     pub latitude: f64,
     pub longitude: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct PvArrayConfig {
     pub kwp: f64,
     /// Degrees from horizontal.
@@ -216,13 +212,27 @@ impl Config {
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-        let config: Self = if path.extension().is_some_and(|ext| ext == "json") {
-            serde_json::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-        } else {
-            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?
-        };
+        let is_json = path.extension().is_some_and(|ext| ext == "json");
+        let (config, ignored) =
+            Self::parse(&text, is_json).with_context(|| format!("parsing {}", path.display()))?;
+        for option in ignored {
+            tracing::warn!(%option, "ignoring an option this version doesn't know");
+        }
         config.validate()?;
         Ok(config)
+    }
+
+    /// Parses JSON or TOML, and returns the paths of options it didn't know.
+    fn parse(text: &str, is_json: bool) -> anyhow::Result<(Self, Vec<String>)> {
+        let mut ignored = Vec::new();
+        let config = if is_json {
+            let value: serde_json::Value = serde_json::from_str(text)?;
+            serde_ignored::deserialize(value, |path| ignored.push(path.to_string()))?
+        } else {
+            let value: toml::Value = toml::from_str(text)?;
+            serde_ignored::deserialize(value, |path| ignored.push(path.to_string()))?
+        };
+        Ok((config, ignored))
     }
 
     fn validate(&self) -> anyhow::Result<()> {
@@ -315,8 +325,16 @@ mod tests {
     }
 
     #[test]
-    fn rejects_unknown_keys() {
-        assert!(toml::from_str::<Config>("[victron]\nhost = \"x\"\nprot = 1\n").is_err());
+    fn unknown_options_are_reported_not_fatal() {
+        let (config, ignored) = Config::parse(
+            r#"{"victron": {"host": "x", "prot": 1}, "future_section": {}}"#,
+            true,
+        )
+        .unwrap();
+        assert_eq!(config.victron.host, "x");
+        let mut ignored = ignored;
+        ignored.sort();
+        assert_eq!(ignored, vec!["future_section", "victron.prot"]);
     }
 
     #[test]

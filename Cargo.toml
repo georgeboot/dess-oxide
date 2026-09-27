@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 rust-version = "1.90"
 repository = "https://github.com/georgeboot/dess-oxide"
@@ -11,6 +11,7 @@ repository = "https://github.com/georgeboot/dess-oxide"
 [workspace.dependencies]
 dess-core = { path = "crates/dess-core" }
 dess-victron = { path = "crates/dess-victron" }
+dess-models = { path = "crates/dess-models" }
 
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
@@ -25,6 +26,7 @@ rusqlite = { version = "0.40.2", features = ["bundled"] }
 # ring instead of aws-lc-rs: no cmake/clang needed to build for musl.
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
+serde_ignored = "0.1.14"
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
@@ -50,6 +52,11 @@ float_cmp = "allow"
 similar_names = "allow"
 # Only lock poisoning, which is a bug elsewhere, can panic.
 missing_panics_doc = "allow"
+
+# Numeric dependencies (burn, ndarray) are far too slow unoptimised; our own
+# code stays debuggable.
+[profile.dev.package."*"]
+opt-level = 2
 
 [profile.release]
 lto = "thin"

@@ -19,10 +19,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Context;
+use dess_core::Slot;
 use dess_core::efficiency::EfficiencySampler;
 use dess_core::record::{Recorder, SlotRecord};
 use dess_core::tariff::Tariff;
-use dess_core::{Slot, Watts};
+use dess_core::weather::Weather;
+use dess_models::pv::PvModel;
 use dess_victron::probe::{ProbeReport, Severity};
 use dess_victron::{Snapshot, Venus, VenusOptions, reading};
 use jiff::tz::TimeZone;
@@ -32,7 +34,7 @@ use tokio::task::JoinHandle;
 use tokio::time::MissedTickBehavior;
 use tracing::{error, info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, LocationConfig};
 use crate::nordpool::NordPool;
 use crate::planning::{self, PlanView, lock};
 use crate::store::Store;
@@ -52,7 +54,11 @@ pub struct Shared {
     pub tz: TimeZone,
     pub store: Mutex<Store>,
     pub plan: watch::Sender<Option<Arc<PlanView>>>,
-    pub pv: watch::Sender<Arc<BTreeMap<Slot, Watts>>>,
+    /// The latest weather forecast.
+    pub weather: watch::Sender<Arc<BTreeMap<Slot, Weather>>>,
+    pub location: watch::Sender<Option<LocationConfig>>,
+    /// The learned PV model, when it beats the configured arrays.
+    pub pv_model: watch::Sender<Option<Arc<PvModel>>>,
     pub status: Mutex<Status>,
 }
 
@@ -91,7 +97,9 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
         tz,
         store: Mutex::new(store),
         plan: watch::Sender::new(None),
-        pv: watch::Sender::new(Arc::new(BTreeMap::new())),
+        weather: watch::Sender::new(Arc::new(BTreeMap::new())),
+        location: watch::Sender::new(None),
+        pv_model: watch::Sender::new(None),
         status: Mutex::new(Status::default()),
     });
     let (stop, stopped) = watch::channel(false);
@@ -142,6 +150,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
             client,
             stopped.clone(),
         )));
+        tasks.push(tokio::spawn(train(Arc::clone(&shared), stopped.clone())));
         tasks.push(tokio::spawn(plan_loop(
             Arc::clone(&venus),
             Arc::clone(&shared),
@@ -296,6 +305,85 @@ fn next_price_check(now: Timestamp, tz: &TimeZone, tomorrow_complete: bool) -> D
     wait.unsigned_abs().max(Duration::from_secs(1))
 }
 
+/// Trains the learned models: shortly after startup (once the history
+/// imports have had a moment), then nightly at 03:30.
+async fn train(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    // A promoted model from an earlier run is used straight away.
+    match lock(&shared.store).model("pv") {
+        Ok(Some(stored)) if stored.promoted => {
+            if let Some(model) = crate::training::pv_model_from_json(&stored.params) {
+                shared.pv_model.send_replace(Some(Arc::new(model)));
+            }
+        }
+        Ok(_) => {}
+        Err(error) => warn!("loading the PV model: {error:#}"),
+    }
+    let mut wait = Duration::from_secs(10 * 60);
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = stopped(&mut stop) => return,
+        }
+        let location = *shared.location.borrow();
+        if let Some(location) = location {
+            train_pv(&shared, location).await;
+        }
+        wait = until_local(&shared.tz, 3, 30);
+    }
+}
+
+async fn train_pv(shared: &Arc<Shared>, location: LocationConfig) {
+    let now = Timestamp::now();
+    let shared_for_fit = Arc::clone(shared);
+    let result = tokio::task::spawn_blocking(move || {
+        let store = lock(&shared_for_fit.store);
+        crate::training::train_pv(&store, &shared_for_fit.config, location, now)
+    })
+    .await;
+    match result {
+        Ok(Ok(Some(report))) => {
+            let promoted = report.improves();
+            info!(
+                hours = report.hours,
+                learned_mae_kwh = format!("{:.3}", report.validation_mae),
+                configured_mae_kwh = format!("{:.3}", report.initial_validation_mae),
+                promoted,
+                model = %crate::training::pv_model_json(&report.model),
+                "trained the PV model"
+            );
+            let saved = lock(&shared.store).save_model(
+                "pv",
+                now,
+                &crate::training::pv_model_json(&report.model),
+                &crate::training::fit_metrics(&report),
+                promoted,
+            );
+            if let Err(error) = saved {
+                error!(%error, "storing the PV model");
+            }
+            shared
+                .pv_model
+                .send_replace(promoted.then(|| Arc::new(report.model)));
+        }
+        Ok(Ok(None)) => info!("not enough history to train the PV model yet"),
+        Ok(Err(error)) => warn!("training the PV model: {error:#}"),
+        Err(error) => error!(%error, "PV training panicked"),
+    }
+}
+
+/// Time until the next `hour:minute` local time.
+fn until_local(tz: &TimeZone, hour: i8, minute: i8) -> Duration {
+    let now = Timestamp::now();
+    let today = now.to_zoned(tz.clone()).date();
+    let next = [today, today.tomorrow().unwrap_or(today)]
+        .into_iter()
+        .filter_map(|d| d.at(hour, minute, 0, 0).to_zoned(tz.clone()).ok())
+        .map(|z| z.timestamp())
+        .find(|t| *t > now)
+        .unwrap_or(now + SignedDuration::from_hours(24));
+    next.duration_since(now).unsigned_abs()
+}
+
 /// Hourly: the weather forecast, and from it the PV forecast. Once a day's
 /// archive is complete, it's copied too, for training.
 async fn fetch_weather(
@@ -307,7 +395,10 @@ async fn fetch_weather(
     loop {
         if location.is_none() {
             match planning::resolve_location(&client, &shared.config).await {
-                Ok(found) => location = Some(found),
+                Ok(found) => {
+                    location = Some(found);
+                    shared.location.send_replace(Some(found));
+                }
                 Err(error) => warn!("no weather yet: {error:#}"),
             }
         }
@@ -320,9 +411,8 @@ async fn fetch_weather(
                     }) {
                         error!(%error, "storing the weather forecast");
                     }
-                    let pv = planning::pv_from_weather(&weather, &shared.config, location);
                     shared.update_status(|s| s.pv_updated = Some(now));
-                    shared.pv.send_replace(Arc::new(pv));
+                    shared.weather.send_replace(Arc::new(weather));
                 }
                 Err(error) => warn!("weather forecast: {error:#}"),
             }
@@ -367,7 +457,8 @@ async fn plan_loop(
     mut prices: watch::Receiver<u64>,
     mut stop: watch::Receiver<bool>,
 ) {
-    let mut pv = shared.pv.subscribe();
+    let mut weather = shared.weather.subscribe();
+    let mut model = shared.pv_model.subscribe();
     loop {
         replan(&venus, &shared);
         let now = Timestamp::now();
@@ -375,7 +466,8 @@ async fn plan_loop(
         tokio::select! {
             () = tokio::time::sleep(next.duration_since(now).unsigned_abs()) => {}
             _ = prices.changed() => {}
-            _ = pv.changed() => {}
+            _ = weather.changed() => {}
+            _ = model.changed() => {}
             () = stopped(&mut stop) => return,
         }
     }
@@ -385,7 +477,15 @@ fn replan(venus: &Venus, shared: &Shared) {
     let Some(tariff) = &shared.tariff else { return };
     let now = Timestamp::now();
     let snapshot = venus.snapshot();
-    let pv = shared.pv.borrow().clone();
+    let pv = match *shared.location.borrow() {
+        Some(location) => planning::pv_from_weather(
+            &shared.weather.borrow(),
+            &shared.config,
+            location,
+            shared.pv_model.borrow().as_deref(),
+        ),
+        None => BTreeMap::new(),
+    };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)
         .and_then(|()| {

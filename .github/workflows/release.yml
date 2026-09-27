@@ -1,6 +1,8 @@
 # Builds the Home Assistant app image natively per architecture and publishes
 # a multi-arch manifest as ghcr.io/<owner>/dess-oxide:<version>.
 # Trigger: push a tag `v<version>` matching dess_oxide/config.yaml.
+# Push the tag *before* main: HA reads the app definition from main, so it
+# must never announce a version whose image isn't published yet.
 name: Release
 
 on:
@@ -15,7 +17,20 @@ env:
   IMAGE: ghcr.io/${{ github.repository_owner }}/dess-oxide
 
 jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets --locked -- -D warnings
+      - run: cargo test --locked
+
   build:
+    needs: check
     strategy:
       matrix:
         include:

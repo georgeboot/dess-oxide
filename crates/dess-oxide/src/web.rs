@@ -22,7 +22,7 @@ use tracing::{error, info};
 use crate::chart::{Chart, Kind, Series};
 use crate::planning::{PlanView, lock};
 use crate::run::Shared;
-use crate::store::HistorySlot;
+use crate::store::{HistorySlot, StoredModel};
 
 /// Home Assistant's ingress proxy; the only client allowed inside HA.
 const INGRESS_PROXY: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 30, 32, 2));
@@ -109,13 +109,19 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             error!(%error, "reading history");
             Vec::new()
         });
-    Html(render(&shared, view.as_deref(), &history, now).into_string())
+    let pv_model =
+        tokio::task::block_in_place(|| lock(&shared.store).model("pv")).unwrap_or_else(|error| {
+            error!(%error, "reading the PV model");
+            None
+        });
+    Html(render(&shared, view.as_deref(), &history, pv_model.as_ref(), now).into_string())
 }
 
 fn render(
     shared: &Shared,
     view: Option<&PlanView>,
     history: &[HistorySlot],
+    pv_model: Option<&StoredModel>,
     now: Timestamp,
 ) -> Markup {
     let status = shared.status.lock().expect("status lock poisoned").clone();
@@ -145,6 +151,7 @@ fn render(
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
                 }
                 (history_section(shared, history, now))
+                (models_section(shared, pv_model))
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -368,6 +375,48 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
             (grid.render(&shared.tz))
             (load.render(&shared.tz))
             (forecast_errors(history))
+        }
+    }
+}
+
+fn models_section(shared: &Shared, pv: Option<&StoredModel>) -> Markup {
+    html! {
+        section {
+            h2 { "Learned models" }
+            @match pv {
+                None => p.muted { "PV: not trained yet. It needs two weeks of history with weather, and [[pv]] arrays to start from." },
+                Some(model) => {
+                    p {
+                        strong { "PV" } " — trained " (local(shared, model.trained_at, "%a %d %b %H:%M"))
+                        " on " (model.metrics["hours"]) " hours. Held-out error "
+                        (format!("{:.3}", model.metrics["validation_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
+                        " kWh/h, against "
+                        (format!("{:.3}", model.metrics["configured_validation_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
+                        " for the configured arrays: "
+                        @if model.promoted { strong { "in use" } } @else { "not better, so not used" }
+                        "."
+                    }
+                    div.scroll {
+                        table {
+                            thead { tr { th { "array" } th { "effective kWp" } th { "tilt" } th { "azimuth" } } }
+                            tbody {
+                                @for (i, array) in model.params["arrays"].as_array().into_iter().flatten().enumerate() {
+                                    tr {
+                                        td { (i + 1) }
+                                        td { (format!("{:.2}", array["kwp"].as_f64().unwrap_or(f64::NAN))) }
+                                        td { (format!("{:.0}°", array["tilt"].as_f64().unwrap_or(f64::NAN))) }
+                                        td { (format!("{:.0}°", array["azimuth"].as_f64().unwrap_or(f64::NAN))) }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    p.muted {
+                        "Inverter limit " (format!("{:.1}", model.params["cap_kw"].as_f64().unwrap_or(f64::NAN)))
+                        " kW. Effective kWp includes system losses; the learned arrays needn't match the physical strings."
+                    }
+                }
+            }
         }
     }
 }

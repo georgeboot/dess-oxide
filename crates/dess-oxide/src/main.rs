@@ -6,6 +6,7 @@ mod openmeteo;
 mod planning;
 mod run;
 mod store;
+mod training;
 mod web;
 
 use std::io::IsTerminal;
@@ -169,7 +170,7 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
     let pv = match planning::resolve_location(&client, &config).await {
         Ok(location) if !config.pv.is_empty() => {
             let weather = openmeteo::forecast(&client, location).await?;
-            planning::pv_from_weather(&weather, &config, location)
+            planning::pv_from_weather(&weather, &config, location, None)
         }
         Ok(_) => {
             tracing::warn!("no PV forecast: no [[pv]] arrays configured");

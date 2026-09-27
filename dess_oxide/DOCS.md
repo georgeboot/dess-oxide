@@ -16,11 +16,10 @@ current setup (such as DAO) until you trust its plans.
 - **Fetches** Nord Pool's 15-minute day-ahead prices, and tomorrow's as soon
   as they're published, around 12:55.
 - **Forecasts:**
-  - PV from KNMI Harmonie (via Open-Meteo), for your configured arrays at
-    Home Assistant's location;
-  - load from the recorded history.
-
-  These are simple baselines; learned models come in a later version.
+  - PV from KNMI Harmonie (via Open-Meteo), at Home Assistant's location,
+    through a **learned PV model**. It's trained nightly on your history and
+    the archived weather, and starts from your configured arrays.
+  - load from history: recorded, plus HA's statistics.
 - **Plans** the cheapest battery schedule for the next 48 hours or more, at
   every quarter hour and whenever prices or forecasts change. Every plan is
   stored.

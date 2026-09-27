@@ -49,8 +49,17 @@ cargo run -- run --config dess.toml --data-dir data
 2. Install **dess-oxide**.
 3. Set the Cerbo's address in the app's configuration.
 
-Images are built by `.github/workflows/release.yml` when a `v<version>` tag
-is pushed. The tag must match `version` in `dess_oxide/config.yaml`.
+## Releasing
+
+1. Bump `version` in `Cargo.toml` and `dess_oxide/config.yaml`, and add a
+   `dess_oxide/CHANGELOG.md` entry.
+2. Commit, tag `v<version>`, and push **only the tag**. The release workflow
+   checks, builds and publishes the images.
+3. Push `main` after the release succeeds.
+
+Home Assistant reads the app definition from `main`, so this order means it
+never offers an update whose image doesn't exist yet. Never change the
+options in `dess_oxide/config.yaml` without a version bump.
 
 ## Development
 
