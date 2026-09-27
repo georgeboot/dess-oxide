@@ -57,6 +57,15 @@ impl<'a> Series<'a> {
         self.dashed = true;
         self
     }
+
+    /// Classes for the legend's and tooltip's swatch.
+    fn swatch(&self) -> String {
+        if self.dashed {
+            format!("{} dash", self.class)
+        } else {
+            self.class.to_string()
+        }
+    }
 }
 
 pub struct Chart<'a> {
@@ -164,7 +173,7 @@ impl Chart<'_> {
                 figcaption {
                     span.unit { (self.unit) }
                     @for (i, series) in self.series.iter().enumerate() {
-                        span.legend data-i=(i) title=(self.lang.t("click to hide or show", "klik om te verbergen of te tonen")) { i class=(series.class) {} (series.label) }
+                        span.legend data-i=(i) title=(self.lang.t("click to hide or show", "klik om te verbergen of te tonen")) { i class=(series.swatch()) {} (series.label) }
                     }
                 }
             }
@@ -189,7 +198,7 @@ impl Chart<'_> {
                 .iter()
                 .map(|s| serde_json::json!({
                     "label": s.label,
-                    "class": s.class,
+                    "class": s.swatch(),
                     "values": s.values.iter().map(round).collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>(),

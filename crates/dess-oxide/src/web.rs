@@ -923,7 +923,7 @@ fn history_section(
     html! {
         section {
             h2 { (l.t("Last 24 hours", "Afgelopen 24 uur")) }
-            p.muted { (l.t("What happened, what dess-oxide planned for it, and the setpoint ESS actually ran (DAO's, while DAO is in control). No setpoint line: ESS was in external control (bypass, the battery idle).", "Wat er gebeurde, wat dess-oxide ervoor had gepland, en het setpoint dat ESS echt draaide (dat van DAO, zolang DAO stuurt). Geen setpointlijn: ESS stond op externe sturing (bypass, accu stil).")) }
+            p.muted { (l.t("The first chart: what went through the grid, what dess-oxide had planned for it, and the setpoint ESS steered to (DAO's, while DAO is in control). Where the setpoint line is missing, ESS was in bypass: the battery idle, the grid passing through.", "De eerste grafiek: wat er door het net ging, wat dess-oxide daarvoor had gepland, en het setpoint waarop ESS stuurde (dat van DAO, zolang DAO stuurt). Waar de setpointlijn ontbreekt, stond ESS in bypass: accu stil, het net gaat er rechtstreeks doorheen.")) }
             (grid.render(&shared.tz))
             (load.render(&shared.tz))
             (forecast_errors(l, history))
@@ -974,6 +974,11 @@ fn price_history(
         lang: l,
     };
     html! {
+        h3 { (l.t("Prices: forecast and actual", "Prijzen: verwacht en echt")) }
+        p.muted {
+            (l.t("Solid: the actual buy price. Dashed: what dess-oxide expected for that quarter hour just before the price was published (day-ahead prices come out around 13:00 for the whole next day). The forecast is the price model's once it's in use, else the median of the past two weeks.",
+                 "Doorgetrokken: de echte leveringsprijs. Gestippeld: wat dess-oxide voor dat kwartier verwachtte vlak voordat de prijs werd gepubliceerd (de day-aheadprijzen komen rond 13:00 uit, voor de hele volgende dag). De verwachting komt van het prijsmodel zodra dat in gebruik is, anders van de mediaan van de afgelopen twee weken."))
+        }
         (price.render(&shared.tz))
         (price_errors(l, prices))
     }
@@ -988,14 +993,13 @@ fn price_errors(l: Lang, prices: &PastPrices) -> Markup {
         .collect();
     html! {
         p.muted {
-            (l.t("Each quarter hour's price as the last plan before the day-ahead auction expected it (the price model once it's in use, else the recent median), against the published price. ",
-                 "De prijs per kwartier zoals de laatste planning vóór de day-aheadveiling die verwachtte (het prijsmodel zodra dat in gebruik is, anders de recente mediaan), tegen de gepubliceerde prijs. "))
             @if errors.is_empty() {
-                (l.t("No forecast for these hours: their prices were already out when the plans were made.", "Geen verwachting voor deze uren: hun prijzen waren al bekend toen de planningen werden gemaakt."))
+                (l.t("No dashed line yet: dess-oxide hadn't planned these hours before their prices came out, so there's nothing to compare. Once it has run for a day longer, what it expected shows up here.",
+                     "Nog geen stippellijn: dess-oxide had deze uren nog niet gepland voordat hun prijzen bekend werden, dus er is niets om te vergelijken. Zodra het een dag langer draait, staat hier wat het vooraf verwachtte."))
             } @else {
-                (l.t("Mean absolute error ", "Gemiddelde absolute fout "))
+                (l.t("On average the forecast was ", "Gemiddeld zat de verwachting er "))
                 (format!("{:.1} ct/kWh", errors.iter().sum::<f64>() / errors.len() as f64 * 100.0))
-                (l.t(" over ", " over ")) (errors.len()) (l.t(" quarter hours, including taxes.", " kwartieren, inclusief belastingen."))
+                (l.t(" off, over ", " naast, over ")) (errors.len()) (l.t(" quarter hours (prices with taxes and VAT).", " kwartieren (prijzen met belastingen en btw)."))
             }
         }
     }
@@ -1539,14 +1543,26 @@ fn forecast_errors(l: Lang, history: &[HistorySlot]) -> Markup {
         })
     };
     let load = mean_error(|h| h.forecast_load.map(|f| (f.0, h.load.0)));
-    let pv = mean_error(|h| h.forecast_pv.map(|f| (f.0, h.pv.0)));
+    // PV only where there was sun, or the night's zeros would flatter it.
+    let pv = mean_error(|h| {
+        h.forecast_pv
+            .filter(|f| f.0 > 50.0 || h.pv.0 > 50.0)
+            .map(|f| (f.0, h.pv.0))
+    });
     html! {
         p.muted {
-            (l.t("Mean absolute forecast error: ", "Gemiddelde absolute fout van de verwachting: "))
-            @match load { Some((e, n)) => { (l.t("load ", "verbruik ")) (format!("{e:.2} kW")) " over " (n) (l.t(" slots", " kwartieren")) }, None => (l.t("load –", "verbruik –")) }
-            "; "
-            @match pv { Some((e, n)) => { "PV " (format!("{e:.2} kW")) " over " (n) (l.t(" slots", " kwartieren")) }, None => "PV –" }
-            (l.t(". Each uses the learned model once it's in use (see below), else the baseline.", ". Elk gebruikt het geleerde model zodra dat in gebruik is (zie hieronder), anders de basislijn."))
+            (l.t("How far the forecast for a quarter hour was off, on average: ", "Hoeveel de verwachting per kwartier gemiddeld naast zat: "))
+            @match load {
+                Some((e, n)) => { (l.t("load ", "verbruik ")) (format!("{e:.2} kW")) (l.t(" (over ", " (over ")) (n) (l.t(" quarter hours)", " kwartieren)")) },
+                None => (l.t("load not yet", "verbruik nog niet")),
+            }
+            (l.t(", PV ", ", PV "))
+            @match pv {
+                Some((e, n)) => { (format!("{e:.2} kW")) (l.t(" (over ", " (over ")) (n) (l.t(" quarter hours with sun)", " kwartieren met zon)")) },
+                None => (l.t("not yet", "nog niet")),
+            }
+            (l.t(". Only quarter hours dess-oxide recorded and had a forecast for count. The forecast is the learned model's once it's in use (see Learned models), else a simple estimate: for load the average of the past days, for PV the weather forecast on the configured arrays.",
+                 ". Alleen kwartieren die dess-oxide heeft gemeten en waarvoor het een verwachting had, tellen mee. De verwachting komt van het geleerde model zodra dat in gebruik is (zie Geleerde modellen), anders van een eenvoudige schatting: voor verbruik het gemiddelde van de afgelopen dagen, voor PV de weersverwachting op de ingestelde panelen."))
         }
     }
 }
@@ -1792,6 +1808,7 @@ svg.chart { width: 100%; height: auto; display: block; }
 figcaption { font-size: 12px; color: var(--muted); padding: 2px 6px; display: flex; flex-wrap: wrap; gap: 12px; }
 .unit { font-weight: 600; }
 .legend i { display: inline-block; width: 12px; height: 3px; margin-right: 5px; vertical-align: middle; background: currentColor; }
+.legend i.dash, .tip i.dash { background: repeating-linear-gradient(90deg, currentColor 0 3px, transparent 3px 5px); }
 .grid { stroke: var(--line); stroke-width: 1; } .zero { stroke: var(--muted); stroke-width: 1; }
 .now { stroke: var(--fg); stroke-width: 1.5; stroke-dasharray: 2 3; }
 .axis { fill: var(--muted); font-size: 12px; font-family: system-ui, sans-serif; }

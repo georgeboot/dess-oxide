@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.20.2
+
+- **Clearer texts around the last 24 hours.** The price chart has its own
+  heading and says above it what the two lines are. Below it, it says the
+  average miss, or why there's no dashed line yet. The forecast error line
+  now reads as plain Dutch and English, and says where the forecast comes
+  from.
+- The PV forecast error only counts quarter hours with sun; the night's
+  zeros made it look better than it was.
+- Dashed lines are dashed in the legend and the tooltip too, so the
+  forecast and the actual price are told apart.
+
 ## 0.20.1
 
 Every field on the page checked against where it comes from. Fixed:
