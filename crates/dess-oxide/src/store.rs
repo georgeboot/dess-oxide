@@ -514,6 +514,27 @@ impl Store {
         Ok(history)
     }
 
+    /// Per slot from `from` on, the buy price in the last plan that still
+    /// had to estimate it: the forecast from just before the day-ahead
+    /// auction published the real one.
+    pub fn price_forecasts(&self, from: Slot) -> anyhow::Result<BTreeMap<Slot, EurPerKwh>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, buy, max(planned_at) FROM plans
+             WHERE estimated AND slot_start >= ?1 GROUP BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (start, buy) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                out.insert(slot, EurPerKwh(buy));
+            }
+        }
+        Ok(out)
+    }
+
     /// Stores hourly energy (kWh) per HA entity, replacing earlier values.
     pub fn save_ha_hourly(
         &mut self,
@@ -543,19 +564,23 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// An imported entity's total over `[from, until)`, and the hours it covers.
-    pub fn ha_total(
-        &self,
-        entity: &str,
-        from: jiff::Timestamp,
-        until: jiff::Timestamp,
-    ) -> anyhow::Result<(f64, i64)> {
-        Ok(self.conn.query_row(
-            "SELECT coalesce(sum(kwh), 0), count(*) FROM ha_hourly
-             WHERE entity = ?1 AND hour_start >= ?2 AND hour_start < ?3",
-            params![entity, from.as_second(), until.as_second()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?)
+    /// Per imported entity, its hours with a reading that can't be energy
+    /// that moved (see [`crate::planning::implausible`]).
+    pub fn ha_glitches(&self) -> anyhow::Result<std::collections::HashMap<String, usize>> {
+        let mut query = self
+            .conn
+            .prepare_cached("SELECT entity, kwh FROM ha_hourly WHERE kwh < 0 OR kwh > 50")?;
+        let rows = query.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut glitches = std::collections::HashMap::new();
+        for row in rows {
+            let (entity, kwh) = row?;
+            if crate::planning::implausible(kwh) {
+                *glitches.entry(entity).or_default() += 1;
+            }
+        }
+        Ok(glitches)
     }
 
     /// Per imported entity: its first and last hour, and how many hours.
@@ -1356,6 +1381,51 @@ mod tests {
         let prices = store.prices(first, second.next()).unwrap();
         assert_eq!(prices[&first], EurPerKwh(0.11));
         assert_eq!(store.final_price_count(first, second.next()).unwrap(), 2);
+    }
+
+    #[test]
+    fn the_price_forecast_is_the_last_estimate_before_publication() {
+        let store = Store::in_memory().unwrap();
+        let slot: i64 = 1_790_000_100; // a quarter-hour boundary
+        // Two plans estimated the slot's price, then a third had the real one.
+        for (planned_at, buy, estimated) in [(900, 0.30, 1), (1800, 0.25, 1), (2700, 0.20, 0)] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO plans VALUES (?1, ?2, 0, 0, ?3, 0, ?4, 0, 0, 1, 50, 0, NULL)",
+                    rusqlite::params![planned_at, slot, buy, estimated],
+                )
+                .unwrap();
+        }
+        let from = Slot::from_start_unix(slot).unwrap();
+        let forecasts = store.price_forecasts(from).unwrap();
+        assert_eq!(forecasts.len(), 1);
+        assert_eq!(forecasts[&from], EurPerKwh(0.25));
+    }
+
+    #[test]
+    fn counts_glitches_per_sensor() {
+        let mut store = Store::in_memory().unwrap();
+        let hour: jiff::Timestamp = "2026-09-27T12:00:00Z".parse().unwrap();
+        store
+            .save_ha_hourly(&[
+                ("sensor.a".into(), hour, 1.0),
+                (
+                    "sensor.a".into(),
+                    hour + jiff::SignedDuration::from_hours(1),
+                    4321.0,
+                ),
+                ("sensor.b".into(), hour, -2.0),
+                (
+                    "sensor.b".into(),
+                    hour + jiff::SignedDuration::from_hours(1),
+                    -0.001,
+                ),
+            ])
+            .unwrap();
+        let glitches = store.ha_glitches().unwrap();
+        assert_eq!(glitches.get("sensor.a"), Some(&1));
+        assert_eq!(glitches.get("sensor.b"), Some(&1));
     }
 
     #[test]

@@ -111,6 +111,8 @@ pub struct LoadFit {
     pub validation_mae: f64,
     /// The same for "same hour and weekday, the last four weeks".
     pub baseline_mae: f64,
+    /// What the held-out hours used on average, kWh, for scale.
+    pub mean_kwh: f64,
 }
 
 impl LoadFit {
@@ -150,6 +152,7 @@ pub fn fit(hours: &[LoadHour], iterations: usize) -> LoadFit {
     }));
     LoadFit {
         baseline_mae: seasonal_naive_mae(&usable, &validation),
+        mean_kwh: mean(validation.iter().map(|h| h.energy_kwh)),
         validation_mae,
         hours: usable.len(),
         model,

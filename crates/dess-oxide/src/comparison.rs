@@ -1,4 +1,4 @@
-//! The rollout comparison (PLAN.md §18): what actually happened (DAO's
+//! The rollout comparison (docs/DESIGN.md §7.8): what actually happened (DAO's
 //! result while it's in control) against dess-oxide's policy replayed over
 //! the same loads, PV and prices, perfect foresight, and no battery.
 //!

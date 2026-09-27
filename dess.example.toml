@@ -6,6 +6,10 @@
 
 # Never writes to the GX device while true (also when left out).
 dryrun = true
+# language = "auto"          # the page: auto (Home Assistant's), "en" or "nl"
+# ned_api_key = "…"          # a free key from ned.nl, for better price forecasts
+# openamber_device = "openamber"   # split the heat pump into heating and hot water
+# ha_entities = false        # publish a few entities for automations
 
 [victron]
 host = "192.168.1.20"   # the GX device; "MQTT on LAN" must be enabled
@@ -32,8 +36,7 @@ energy_tax = [{ from = "2025-01-01", value = 0.10154 }, { from = "2026-01-01", v
 markup_buy = [{ from = "2025-12-14", value = 0.01504 }]
 markup_sell = [{ from = "2025-12-14", value = 0.01504 }]
 net_metering_until = "2026-12-31"
-# Over the netting period, do exports exceed imports? Then the energy tax
-# isn't at stake on the marginal kWh and exports earn only the feed-in rate.
+# After net metering ends: whether exports earn VAT on top.
 vat_on_export = false
 
 # Home Assistant's location is used when running as an app.
@@ -57,7 +60,7 @@ heat_pump = "sensor.kwh_meter_warmtepomp_energy_import"
 # url = "http://homeassistant.local:8123"
 # token = "…"   # a long-lived access token
 
-# Optional: PV arrays as a starting point for the forecast; M2 learns the real values.
+# Optional: PV arrays as a starting point for the forecast; the PV model learns the real values.
 [[pv]]
 kwp = 5.59
 tilt = 33

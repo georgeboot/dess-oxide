@@ -242,39 +242,44 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
         error!(%error, "reading history");
         Vec::new()
     });
-    let (models, (losses, capacity), (accuracy, money, days)) = tokio::task::block_in_place(|| {
-        let store = lock(&shared.store);
-        let models = ["pv", "heat_pump", "load"].map(|name| {
-            store.model(name).unwrap_or_else(|error| {
-                error!(%error, name, "reading a model");
-                None
-            })
-        });
-        let accuracy = store
-            .forecast_accuracy(
-                Slot::containing(now - SignedDuration::from_hours(24 * 7)),
-                !shared.config.ev.on_input,
-                shared.config.victron.pv_relay_state(),
-            )
-            .unwrap_or_else(|error| {
-                error!(%error, "reading forecast accuracy");
+    let (models, (losses, capacity), (accuracy, money, days, prices)) =
+        tokio::task::block_in_place(|| {
+            let store = lock(&shared.store);
+            let models = ["pv", "heat_pump", "load"].map(|name| {
+                store.model(name).unwrap_or_else(|error| {
+                    error!(%error, name, "reading a model");
+                    None
+                })
+            });
+            let accuracy = store
+                .forecast_accuracy(
+                    Slot::containing(now - SignedDuration::from_hours(24 * 7)),
+                    !shared.config.ev.on_input,
+                    shared.config.victron.pv_relay_state(),
+                )
+                .unwrap_or_else(|error| {
+                    error!(%error, "reading forecast accuracy");
+                    Vec::new()
+                });
+            let battery = (
+                crate::planning::learned_losses(&store, now).ok(),
+                crate::planning::learned_capacity(&store, now).ok(),
+            );
+            let money = money_by_period(&shared, &store, now).unwrap_or_else(|error| {
+                error!(%error, "reading costs");
                 Vec::new()
             });
-        let battery = (
-            crate::planning::learned_losses(&store, now).ok(),
-            crate::planning::learned_capacity(&store, now).ok(),
-        );
-        let money = money_by_period(&shared, &store, now).unwrap_or_else(|error| {
-            error!(%error, "reading costs");
-            Vec::new()
-        });
-        let days = crate::accuracy::daily(&store, &shared.config, &shared.tz, now, 7)
-            .unwrap_or_else(|error| {
-                error!(%error, "reading daily forecast accuracy");
-                Vec::new()
+            let days = crate::accuracy::daily(&store, &shared.config, &shared.tz, now, 7)
+                .unwrap_or_else(|error| {
+                    error!(%error, "reading daily forecast accuracy");
+                    Vec::new()
+                });
+            let prices = past_prices(&shared, &store, since, now).unwrap_or_else(|error| {
+                error!(%error, "reading past prices");
+                PastPrices::default()
             });
-        (models, battery, (accuracy, money, days))
-    });
+            (models, battery, (accuracy, money, days, prices))
+        });
     let page = render(
         &shared,
         view.as_deref(),
@@ -284,6 +289,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             money: &money,
             comparison: *shared.comparison.lock().expect("comparison lock poisoned"),
             days: &days,
+            prices: &prices,
         },
         &models,
         (losses.as_ref(), capacity.as_ref()),
@@ -303,6 +309,38 @@ struct Recorded<'a> {
     money: &'a [(&'static str, Money)],
     comparison: Option<Comparison>,
     days: &'a [crate::accuracy::Day],
+    prices: &'a PastPrices,
+}
+
+/// Buy prices of past slots: the real ones, and what the plans expected
+/// before they were published.
+#[derive(Debug, Default)]
+struct PastPrices {
+    actual: std::collections::BTreeMap<Slot, f64>,
+    forecast: std::collections::BTreeMap<Slot, f64>,
+}
+
+fn past_prices(
+    shared: &Shared,
+    store: &crate::store::Store,
+    from: Slot,
+    now: Timestamp,
+) -> anyhow::Result<PastPrices> {
+    let Some(tariff) = &shared.tariff else {
+        return Ok(PastPrices::default());
+    };
+    let actual = store
+        .prices(from, Slot::containing(now).next())?
+        .into_iter()
+        .filter_map(|(slot, spot)| Some((slot, tariff.prices(slot, spot).ok()?.buy.0)))
+        .collect();
+    let forecast = store
+        .price_forecasts(from)?
+        .into_iter()
+        .filter(|(slot, _)| slot.start() <= now)
+        .map(|(slot, buy)| (slot, buy.0))
+        .collect();
+    Ok(PastPrices { actual, forecast })
 }
 
 /// Costs for today, yesterday, the last 7 days and this month.
@@ -395,11 +433,11 @@ fn render(
                     }
                     None => p.muted { (l.t("No plan yet: waiting for the Victron data and day-ahead prices.", "Nog geen planning: wacht op de gegevens van de Victron en de day-aheadprijzen.")) },
                 }
-                (history_section(shared, recorded.history, now))
+                (history_section(shared, recorded.history, recorded.prices, now))
                 (money_section(shared, recorded.money, recorded.comparison))
                 (accuracy_section(l, recorded.accuracy, recorded.days))
                 (models_section(shared, models))
-                @if let Some(view) = view { (battery_section(l, &view.battery, losses, capacity, battery_learned(shared, capacity))) }
+                @if let Some(view) = view { (battery_section(l, view, losses, capacity, battery_learned(shared))) }
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -549,12 +587,20 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
     let soc = shared.soc(Timestamp::now()).unwrap_or(view.soc);
     let capacity_kwh = view.battery.capacity.0 / 1000.0;
     let above_reserve = ((soc - view.min_soc) / 100.0 * capacity_kwh).max(0.0);
-    // The plan's value of stored energy, as break-even prices after losses.
+    // The plan's value of stored energy, as break-even prices after losses
+    // and wear (charged per kWh stored or taken out).
     let value = first.stored_energy_value.0;
+    let wear = view.settings.wear_cost.0;
     let efficiency = |ac: f64| view.battery.dc_for_ac(dess_core::Watts(ac)).0 / ac;
-    let charge_below = value * efficiency(3000.0);
-    let discharge_above = value * efficiency(-3000.0);
-    let action = if battery > 0.05 {
+    let charge_below = (value - wear) * efficiency(3000.0);
+    let discharge_above = (value + wear) * efficiency(-3000.0);
+    // What the plan expects to pay the grid (and wear) over its horizon.
+    let grid_cost: f64 = view.plan.slots.iter().map(|s| s.cost).sum();
+    let horizon_hours: f64 = view.plan.slots.iter().map(|s| s.hours).sum();
+    let soc_at_end = view.plan.slots.last().map_or(soc, |s| s.soc_end);
+    let action = if first.bypass {
+        "bypass"
+    } else if battery > 0.05 {
         l.t("charging", "laden")
     } else if battery < -0.05 {
         l.t("discharging", "ontladen")
@@ -590,10 +636,21 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
                 span.sub {
                     (l.t("So charging from the grid pays below €", "Laden uit het net loont dus onder €")) (format!("{:.3}", charge_below))
                     (l.t(" a kWh, and discharging into the grid above €", " per kWh, en ontladen naar het net boven €")) (format!("{:.3}", discharge_above))
-                    (l.t(" (with the losses at 3 kW). In between, the battery holds.", " (met de verliezen bij 3 kW). Daartussen blijft de accu staan."))
+                    (l.t(" (with the losses at 3 kW", " (met de verliezen bij 3 kW"))
+                    @if wear > 0.0 { (l.t(" and the wear", " en de slijtage")) }
+                    (l.t("). In between, the battery holds.", "). Daartussen blijft de accu staan."))
                 }
             }
-            div.card { span.label { (l.t("Expected over the horizon", "Verwacht over de horizon")) } span.value { (eur(view.plan.expected_cost)) } span.sub { (l.t("negative is money earned", "negatief is geld verdiend")) } }
+            div.card {
+                span.label { (l.t("Grid cost ahead", "Netkosten vooruit")) }
+                span.value { (eur(grid_cost)) }
+                span.sub {
+                    (l.t("over the next ", "over de komende ")) (format!("{horizon_hours:.0}")) (l.t(" h, ", " uur, "))
+                    @if wear > 0.0 { (l.t("with wear, ", "met slijtage, ")) }
+                    (l.t("with the battery going from ", "terwijl de accu van ")) (format!("{soc:.0} %")) (l.t(" to ", " naar "))
+                    (format!("{soc_at_end:.0} %")) (l.t("; negative is money earned", " gaat; negatief is geld verdiend"))
+                }
+            }
             (cheapest_start_card(shared))
         }
     }
@@ -761,7 +818,7 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
     html! {
         section {
             h2 { (l.t("Plan", "Planning")) }
-            p.muted { (l.t("The shaded part uses estimated prices; only the current quarter hour would be executed.", "Het gearceerde deel gebruikt geschatte prijzen; alleen het huidige kwartier wordt uitgevoerd.")) }
+            (plan_note(shared))
             (station_line(shared))
             (prices.render(&shared.tz))
             (power.render(&shared.tz))
@@ -770,7 +827,12 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
     }
 }
 
-fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> Markup {
+fn history_section(
+    shared: &Shared,
+    history: &[HistorySlot],
+    prices: &PastPrices,
+    now: Timestamp,
+) -> Markup {
     let l = shared.lang();
     if history.is_empty() {
         return html! { section { h2 { (l.t("Last 24 hours", "Afgelopen 24 uur")) } p.muted { (l.t("Nothing recorded yet.", "Nog niets gemeten.")) } } };
@@ -778,12 +840,7 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     // The full window, so the time axis is stable; unrecorded slots are gaps.
     let recorded: std::collections::HashMap<Slot, &HistorySlot> =
         history.iter().map(|h| (h.slot, h)).collect();
-    let mut window = Vec::new();
-    let mut slot = Slot::containing(now - SignedDuration::from_hours(24));
-    while slot.start() <= now {
-        window.push(slot);
-        slot = slot.next();
-    }
+    let window = last_day(now);
     let slots: Vec<Timestamp> = window.iter().map(|s| s.start()).collect();
     let values = |pick: fn(&HistorySlot) -> Option<dess_core::Watts>| {
         window
@@ -813,7 +870,7 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
             )
             .dashed(),
             Series::new(
-                l.t("ESS setpoint (DAO)", "ESS-setpoint (DAO)"),
+                l.t("ESS setpoint", "ESS-setpoint"),
                 "s-dao",
                 Kind::Step,
                 values(|h| h.setpoint),
@@ -866,10 +923,80 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     html! {
         section {
             h2 { (l.t("Last 24 hours", "Afgelopen 24 uur")) }
-            p.muted { (l.t("What happened, what dess-oxide planned for it, and the setpoint DAO actually ran. No setpoint line: ESS was in external control (DAO's bypass, battery idle).", "Wat er gebeurde, wat dess-oxide ervoor had gepland, en het setpoint dat DAO echt draaide. Geen setpointlijn: ESS stond op externe sturing (de bypass van DAO, accu stil).")) }
+            p.muted { (l.t("What happened, what dess-oxide planned for it, and the setpoint ESS actually ran (DAO's, while DAO is in control). No setpoint line: ESS was in external control (bypass, the battery idle).", "Wat er gebeurde, wat dess-oxide ervoor had gepland, en het setpoint dat ESS echt draaide (dat van DAO, zolang DAO stuurt). Geen setpointlijn: ESS stond op externe sturing (bypass, accu stil).")) }
             (grid.render(&shared.tz))
             (load.render(&shared.tz))
             (forecast_errors(l, history))
+            (price_history(shared, &slots, &window, prices, now))
+        }
+    }
+}
+
+/// The slots of the last 24 hours, up to the current one.
+fn last_day(now: Timestamp) -> Vec<Slot> {
+    let first = Slot::containing(now - SignedDuration::from_hours(24));
+    std::iter::successors(Some(first), |s| Some(s.next()))
+        .take_while(|s| s.start() <= now)
+        .collect()
+}
+
+/// The past buy prices against their forecasts, and how far off those were.
+fn price_history(
+    shared: &Shared,
+    slots: &[Timestamp],
+    window: &[Slot],
+    prices: &PastPrices,
+    now: Timestamp,
+) -> Markup {
+    let l = shared.lang();
+    let price = Chart {
+        slots,
+        series: vec![
+            Series::new(
+                l.t("buy price", "leveringsprijs"),
+                "s-buy",
+                Kind::Step,
+                window.iter().map(|s| prices.actual.get(s).copied()),
+            ),
+            Series::new(
+                l.t("forecast before publication", "verwachting vóór publicatie"),
+                "s-price-forecast",
+                Kind::Step,
+                window.iter().map(|s| prices.forecast.get(s).copied()),
+            )
+            .dashed(),
+        ],
+        unit: "€/kWh",
+        height: 160.0,
+        now: Some(now),
+        shade_from: None,
+        y_range: None,
+        lang: l,
+    };
+    html! {
+        (price.render(&shared.tz))
+        (price_errors(l, prices))
+    }
+}
+
+/// How far the price forecasts were off once the real prices came out.
+fn price_errors(l: Lang, prices: &PastPrices) -> Markup {
+    let errors: Vec<f64> = prices
+        .forecast
+        .iter()
+        .filter_map(|(slot, forecast)| Some((forecast - prices.actual.get(slot)?).abs()))
+        .collect();
+    html! {
+        p.muted {
+            (l.t("Each quarter hour's price as the last plan before the day-ahead auction expected it (the price model once it's in use, else the recent median), against the published price. ",
+                 "De prijs per kwartier zoals de laatste planning vóór de day-aheadveiling die verwachtte (het prijsmodel zodra dat in gebruik is, anders de recente mediaan), tegen de gepubliceerde prijs. "))
+            @if errors.is_empty() {
+                (l.t("No forecast for these hours: their prices were already out when the plans were made.", "Geen verwachting voor deze uren: hun prijzen waren al bekend toen de planningen werden gemaakt."))
+            } @else {
+                (l.t("Mean absolute error ", "Gemiddelde absolute fout "))
+                (format!("{:.1} ct/kWh", errors.iter().sum::<f64>() / errors.len() as f64 * 100.0))
+                (l.t(" over ", " over ")) (errors.len()) (l.t(" quarter hours, including taxes.", " kwartieren, inclusief belastingen."))
+            }
         }
     }
 }
@@ -1038,7 +1165,7 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
             p.muted { (l.t("Trained shortly after startup and nightly. A model is only used when it beats its baseline on held-out days.", "Getraind kort na het opstarten en elke nacht. Een model wordt pas gebruikt als het beter is dan zijn basislijn op achtergehouden dagen.")) }
             h3 { "PV" }
             @match pv {
-                None => p.muted { (l.t("Not trained yet: it needs two weeks of history with weather, and [[pv]] arrays to start from.", "Nog niet getraind: het heeft twee weken historie met weer nodig, en panelenvelden (pv) om mee te beginnen.")) },
+                None => p.muted { (l.t("Not trained yet: it needs two weeks of history with weather, and PV arrays (pv) in the options to start from.", "Nog niet getraind: het heeft twee weken historie met weer nodig, en panelenvelden (pv) om mee te beginnen.")) },
                 Some(model) => {
                     (model_summary(shared, model, "configured_validation_mae_kwh", l.t("the configured arrays", "de ingestelde panelenvelden")))
                     div.scroll {
@@ -1073,7 +1200,7 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
             @match heat_pump.as_ref().and_then(|m| crate::training::hp_model_from_json(&m.params).map(|hp| (m, hp))) {
                 None => p.muted { (l.t("Not trained yet: it needs two weeks of the heat pump meter's history (history.heat_pump).", "Nog niet getraind: het heeft twee weken historie van de warmtepompmeter nodig (history.heat_pump).")) },
                 Some((stored, hp)) => {
-                    (model_summary(shared, stored, "baseline_mae_kwh", l.t("last week's same hours", "dezelfde uren vorige week")))
+                    (model_summary(shared, stored, "baseline_mae_kwh", l.t("the same hour's average over the previous seven days", "het gemiddelde van hetzelfde uur over de zeven dagen ervoor")))
                     ul {
                         li { (l.t("Heating stops above about ", "Verwarmen stopt boven ongeveer ")) strong { (format!("{:.1} °C", hp.balance_c)) } (l.t(" outdoors, smoothed by the house's thermal lag.", " buiten, gedempt door de traagheid van het huis.")) }
                         li {
@@ -1097,8 +1224,24 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
             h3 { (l.t("Base load", "Basisverbruik")) }
             @match load {
                 None => p.muted { (l.t("Not trained yet: it needs two weeks of load history.", "Nog niet getraind: het heeft twee weken verbruikshistorie nodig.")) },
-                Some(model) => (model_summary(shared, model, "baseline_mae_kwh", l.t("the same hour on the same weekday over the last four weeks", "hetzelfde uur op dezelfde weekdag over de afgelopen vier weken"))),
+                Some(model) => (model_summary(shared, model, "baseline_mae_kwh", l.t("the same hour's average on the same weekday over the four weeks before", "het gemiddelde van hetzelfde uur op dezelfde weekdag over de vier weken ervoor"))),
             }
+        }
+    }
+}
+
+/// Where the plan's unpublished prices come from.
+fn plan_note(shared: &Shared) -> Markup {
+    let l = shared.lang();
+    html! {
+        p.muted {
+            (l.t("Prices in the shaded part aren't published yet: ", "De prijzen in het gearceerde deel zijn nog niet gepubliceerd: "))
+            @if shared.price_model.borrow().is_some() {
+                (l.t("the price model forecasts them (see Learned models).", "het prijsmodel voorspelt ze (zie Geleerde modellen)."))
+            } @else {
+                (l.t("they're estimated from the recent median (the price model isn't in use yet).", "ze zijn geschat uit de recente mediaan (het prijsmodel is nog niet in gebruik)."))
+            }
+            (l.t(" Only the current quarter hour is executed; the plan is redone every quarter hour.", " Alleen het huidige kwartier wordt uitgevoerd; de planning wordt elk kwartier opnieuw gemaakt."))
         }
     }
 }
@@ -1123,7 +1266,13 @@ fn price_model_section(shared: &Shared) -> Markup {
                 (format!("{:.2} ct/kWh", ct("validation_mae_eur_mwh", m)))
                 (l.t(", against ", ", tegen ")) (format!("{:.2} ct/kWh", ct("baseline_mae_eur_mwh", m)))
                 (l.t(" for the recent median: ", " voor de recente mediaan: "))
-                @if m.promoted { strong { (l.t("in use", "in gebruik")) } } @else { (l.t("not better yet, so not used", "nog niet beter, dus niet in gebruik")) }
+                @if !m.promoted {
+                    (l.t("not better yet, so not used", "nog niet beter, dus niet in gebruik"))
+                } @else if shared.price_model.borrow().is_some() {
+                    strong { (l.t("in use", "in gebruik")) }
+                } @else {
+                    (l.t("in use again once it has retrained after the restart (a few minutes)", "weer in gebruik zodra het na de herstart opnieuw getraind is (een paar minuten)"))
+                }
                 "."
             },
         }
@@ -1165,9 +1314,12 @@ fn hot_water_section(shared: &Shared) -> Markup {
         @match &model {
             Some(m) => p {
                 (l.t("From ", "Uit ")) (m.days) (l.t(" days with OpenAmber's mode: ", " dagen met de modus van OpenAmber: ")) strong { (format!("{:.1} kWh", m.base_kwh)) }
-                (l.t(" a day at 15 °C and warmer", " per dag bij 15 °C en warmer"))
-                @if m.per_degree_kwh > 0.0 { ", " (format!("{:+.2}", m.per_degree_kwh)) (l.t(" kWh per degree colder", " kWh per graad kouder")) }
-                (l.t(", mostly around ", ", meestal rond ")) (hot_water_peak(&m.profile)) (l.t(" (daily error ", " (fout per dag ")) (format!("{:.2}", m.daily_mae)) " kWh)."
+                @if m.per_degree_kwh > 0.0 {
+                    (l.t(" a day at 15 °C and warmer, ", " per dag bij 15 °C en warmer, ")) (format!("{:+.2}", m.per_degree_kwh)) (l.t(" kWh per degree colder", " kWh per graad kouder"))
+                } @else {
+                    (l.t(" a day (no effect of the outdoor temperature yet)", " per dag (nog geen invloed van de buitentemperatuur)"))
+                }
+                (l.t(", mostly around ", ", meestal rond ")) (hot_water_peak(&m.profile)) (l.t(" (off by ", " (gemiddeld ")) (format!("{:.2}", m.daily_mae)) (l.t(" kWh a day on the days it learned from).", " kWh per dag ernaast op de dagen waaruit het leerde)."))
                 @if m.legionella_kwh > 0.0 { (l.t(" A legionella run takes ", " Een legionellarun kost ")) (format!("{:.1} kWh", m.legionella_kwh)) "." }
                 (l.t(" Heating is learned without it, and it's forecast on its own.", " Verwarmen wordt zonder tapwater geleerd, en tapwater wordt apart voorspeld."))
             },
@@ -1199,7 +1351,13 @@ fn hot_water_section(shared: &Shared) -> Markup {
 /// model needs its meter, the base load all of the sensors in the same hour.
 fn history_coverage(shared: &Shared) -> Markup {
     let l = shared.lang();
-    let coverage = lock(&shared.store).ha_coverage().unwrap_or_default();
+    let (coverage, glitches) = {
+        let store = lock(&shared.store);
+        (
+            store.ha_coverage().unwrap_or_default(),
+            store.ha_glitches().unwrap_or_default(),
+        )
+    };
     let roles = shared.config.history.entities();
     if coverage.is_empty() || roles.is_empty() {
         return html! {};
@@ -1209,7 +1367,7 @@ fn history_coverage(shared: &Shared) -> Markup {
             summary { (l.t("History imported from Home Assistant", "Historie geïmporteerd uit Home Assistant")) }
             div.scroll {
                 table {
-                    thead { tr { th { "sensor" } th { (l.t("from", "vanaf")) } th { (l.t("until", "tot")) } th { (l.t("hours", "uren")) } } }
+                    thead { tr { th { "sensor" } th { (l.t("from", "vanaf")) } th { (l.t("until", "tot")) } th { (l.t("hours", "uren")) } th { (l.t("glitches", "storingen")) } } }
                     tbody {
                         @for (role, entity) in &roles {
                             @let found = coverage.iter().find(|c| c.0 == *entity);
@@ -1220,8 +1378,9 @@ fn history_coverage(shared: &Shared) -> Markup {
                                         td { (local(shared, *first, "%Y-%m-%d")) }
                                         td { (local(shared, *last, "%Y-%m-%d")) }
                                         td { (hours) }
+                                        td { (glitches.get(*entity).copied().unwrap_or(0)) }
                                     }
-                                    None => { td colspan="3" { (l.t("nothing imported", "niets geïmporteerd")) } }
+                                    None => { td colspan="4" { (l.t("nothing imported", "niets geïmporteerd")) } }
                                 }
                             }
                         }
@@ -1230,7 +1389,8 @@ fn history_coverage(shared: &Shared) -> Markup {
             }
             p.muted {
                 (l.t("Weather is archived from 2024-07-01. The heat pump model trains on the hours with its meter and weather; ", "Het weer is gearchiveerd vanaf 2024-07-01. Het warmtepompmodel traint op de uren met zijn meter en weer; "))
-                (l.t("the base load on the hours where every sensor has a value (or dess-oxide recorded the house itself).", "het basisverbruik op de uren waarin elke sensor een waarde heeft (of waarin dess-oxide het huis zelf heeft gemeten)."))
+                (l.t("the base load on the hours where every sensor has a value (or dess-oxide recorded the house itself). ", "het basisverbruik op de uren waarin elke sensor een waarde heeft (of waarin dess-oxide het huis zelf heeft gemeten). "))
+                (l.t("Glitches are hours where a sensor went down or moved more than 100 kWh (a counter reset in Home Assistant's statistics): they're left out.", "Storingen zijn uren waarin een sensor terugliep of meer dan 100 kWh verzette (een teller die in de statistieken van Home Assistant opnieuw begon): die worden overgeslagen."))
             }
         }
     }
@@ -1247,7 +1407,11 @@ fn model_summary(
     html! {
         p {
             (l.t("Trained ", "Getraind ")) (local(shared, model.trained_at, "%a %d %b %H:%M")) (l.t(" on ", " op ")) (model.metrics["hours"]) (l.t(" hours. Held-out error ", " uur. Fout op achtergehouden dagen "))
-            (format!("{:.3}", number("validation_mae_kwh"))) (l.t(" kWh/h, against ", " kWh/u, tegen ")) (format!("{:.3}", number(baseline_key)))
+            (format!("{:.3}", number("validation_mae_kwh"))) (l.t(" kWh/h", " kWh/u"))
+            @if let Some(mean) = model.metrics["mean_kwh"].as_f64() {
+                (l.t(" (those hours averaged ", " (die uren waren gemiddeld ")) (format!("{mean:.3}")) ")"
+            }
+            (l.t(", against ", ", tegen ")) (format!("{:.3}", number(baseline_key)))
             (l.t(" for ", " voor ")) (baseline) ": "
             @if model.promoted { strong { (l.t("in use", "in gebruik")) } } @else { (l.t("not better yet, so not used", "nog niet beter, dus niet in gebruik")) }
             "."
@@ -1264,14 +1428,16 @@ fn hot_water_peak(profile: &[f64; 24]) -> String {
     format!("{hour:02}:00")
 }
 
-/// The inverter/charger losses the planner uses: learned or the prior.
+/// The battery and the inverter/charger losses the planner uses: learned or
+/// the prior.
 fn battery_section(
     l: Lang,
-    battery: &dess_core::battery::BatteryModel,
+    view: &PlanView,
     losses: Option<&LearnedLosses>,
     capacity: Option<&CapacityFit>,
-    (bypass_learned, cells_measured): (bool, bool),
+    (bypass_learned, cells): (bool, Option<crate::planning::CellRoundTrip>),
 ) -> Markup {
+    let battery = &view.battery;
     let kwh = |wh: f64| format!("{:.1} kWh", wh / 1000.0);
     let learned = |side: bool| {
         losses.is_some_and(|l| {
@@ -1290,27 +1456,33 @@ fn battery_section(
         let dc = p + battery.discharge_loss.linear * p + battery.discharge_loss.quadratic * p * p;
         p / dc * 100.0
     };
+    let max_soc = view.settings.max_soc;
+    let usable = (max_soc - view.min_soc).max(0.0) / 100.0 * battery.capacity.0;
+    let stretches = capacity.filter(|c| c.usable_wh().is_some());
+    let cells_loss = (1.0 - battery.cell_efficiency) * 100.0;
     html! {
         h3 { (l.t("Battery and inverters", "Accu en omvormers")) }
         p {
-            (l.t("Usable capacity ", "Bruikbare capaciteit ")) strong { (kwh(battery.capacity.0)) }
-            @match capacity.filter(|c| c.usable_wh().is_some()) {
+            (l.t("Capacity ", "Capaciteit ")) strong { (kwh(battery.capacity.0)) } (l.t(" from 0 to 100 % SoC", " van 0 tot 100 % SoC"))
+            @match stretches {
                 Some(c) => {
                     (l.t(", learned from ", ", geleerd uit ")) (c.stretches) (l.t(" long charge or discharge stretches", " lange laad- of ontlaadreeksen"))
                     @if let (Some(charge), Some(discharge)) = (c.charge_wh, c.discharge_wh) {
-                        (l.t(" (charging ", " (laden ")) (kwh(charge)) (l.t(", discharging ", ", ontladen ")) (kwh(discharge))
-                        @if let Some(rt) = c.round_trip() { (l.t(": the cells' own round trip is ", ": het eigen rondrendement van de cellen is ")) (format!("{:.1} %", rt * 100.0)) }
-                        ")"
+                        (l.t(" (charging ", " (laden ")) (kwh(charge)) (l.t(", discharging ", ", ontladen ")) (kwh(discharge)) (l.t(" per 100 %)", " per 100 %)"))
                     }
-                    (l.t(".", "."))
+                    ". "
                 }
-                None => (l.t(", from the GX device until it has seen a 30 % stretch each way.", ", van het GX-apparaat totdat er in beide richtingen een reeks van 30 % is gezien.")),
+                None => (l.t(", from the GX device until it has seen a 30 % stretch each way. ", ", van het GX-apparaat totdat er in beide richtingen een reeks van 30 % is gezien. ")),
             }
+            (l.t("Above ESS's minimum SoC of ", "Boven de minimum-SoC van ESS (")) (format!("{:.0} %", view.min_soc)) (l.t("", ")"))
+            @if max_soc < 100.0 { (l.t(" and up to the ", " en tot het maximum van ")) (format!("{max_soc:.0} %")) (l.t(" maximum", "")) }
+            (l.t(", the plan can use ", " kan de planning er ")) strong { (kwh(usable)) }
+            (l.t(" of it; what's below the minimum stays for a power cut.", " van gebruiken; wat onder het minimum zit, blijft over voor een stroomstoring."))
         }
         p {
             (l.t("Charging curve: ", "Laadcurve: ")) (if learned(true) { l.t("learned", "geleerd") } else { l.t("prior (not enough steady data yet)", "aanname (nog niet genoeg stabiele gegevens)") })
-            (l.t("; discharging: ", "; ontladen: ")) (if learned(false) { l.t("learned", "geleerd") } else { l.t("prior", "aanname") })
-            (l.t(". Standby ", ". Stand-by ")) (format!("{:.0} W", battery.standby.0))
+            (l.t("; discharging: ", "; ontladen: ")) (if learned(false) { l.t("learned", "geleerd") } else { l.t("prior (not enough steady data yet)", "aanname (nog niet genoeg stabiele gegevens)") })
+            (l.t(". Standby while ESS regulates: ", ". Stand-by terwijl ESS regelt: ")) (format!("{:.0} W", battery.standby.0))
             (if losses.is_some_and(|l| l.standby.is_some()) { l.t(" (learned)", " (geleerd)") } else { l.t(" (prior)", " (aanname)") }) "."
             @if let Some(bypass) = battery.bypass_draw {
                 (l.t(" In bypass (ESS in external control, the battery idle) the inverters draw ", " In bypass (ESS op externe sturing, accu stil) gebruiken de omvormers "))
@@ -1333,14 +1505,19 @@ fn battery_section(
             }
         }
         p.muted {
-            (l.t("Conversion efficiency without the standby draw, which the planner counts separately. On top of it, the cells themselves keep ",
-                 "Omzettingsrendement zonder het stand-byverbruik, dat de planner apart meerekent. Daarbovenop houden de cellen zelf "))
-            (format!("{:.1} %", battery.cell_efficiency * 100.0))
-            (l.t(" each way", " per richting vast"))
-            @if cells_measured {
-                (l.t(" (measured: energy out over energy in).", " (gemeten: energie eruit gedeeld door energie erin)."))
-            } @else {
-                (l.t(" (typical for LFP, until measured).", " (gebruikelijk voor LFP, tot het gemeten is)."))
+            (l.t("The inverters' conversion between AC and the battery's terminals, without the standby draw, which the planner counts separately. ",
+                 "De omzetting van de omvormers tussen AC en de polen van de accu, zonder het stand-byverbruik, dat de planner apart meerekent. "))
+            (l.t("On top of it the cells themselves lose ", "Daarbovenop verliezen de cellen zelf "))
+            (format!("{cells_loss:.1} %")) (l.t(" each way (", " per richting ("))
+            (format!("{:.1} %", battery.cell_efficiency.powi(2) * 100.0)) (l.t(" round trip)", " rondrendement)"))
+            @match (cells, stretches.and_then(CapacityFit::round_trip)) {
+                (Some(c), _) => {
+                    (l.t(", measured from the BMS's energy counters: ", ", gemeten met de energietellers van de BMS: "))
+                    (format!("{:.0} kWh", c.charged_kwh)) (l.t(" charged since ", " geladen sinds ")) (date_label(l, c.since.to_zoned(jiff::tz::TimeZone::UTC).date()))
+                    (l.t(", from their long-run trends, so what the battery held at the start and end doesn't matter.", ", uit hun trend op lange termijn, dus wat er aan het begin en eind in de accu zat maakt niet uit."))
+                }
+                (None, Some(_)) => (l.t(", measured from the charge and discharge stretches.", ", gemeten uit de laad- en ontlaadreeksen.")),
+                (None, None) => (l.t(", typical for LFP until measured.", ", gebruikelijk voor LFP tot het gemeten is.")),
             }
         }
     }
@@ -1446,14 +1623,15 @@ fn decimal_commas(page: &str) -> String {
     out
 }
 
-/// Whether the bypass draw and the cells' round trip are measured yet.
-fn battery_learned(shared: &Shared, capacity: Option<&CapacityFit>) -> (bool, bool) {
+/// Whether the bypass draw is measured yet, and the cells' round trip from
+/// the BMS's counters.
+fn battery_learned(shared: &Shared) -> (bool, Option<crate::planning::CellRoundTrip>) {
     let store = lock(&shared.store);
     let cells = crate::planning::cell_round_trip(&store, &shared.config.history, Timestamp::now())
-        .ok()
-        .flatten()
-        .is_some()
-        || capacity.and_then(CapacityFit::round_trip).is_some();
+        .unwrap_or_else(|error| {
+            error!(%error, "measuring the cells' round trip");
+            None
+        });
     (
         crate::planning::learned_bypass_draw(&store).is_some(),
         cells,
@@ -1621,6 +1799,7 @@ figcaption { font-size: 12px; color: var(--muted); padding: 2px 6px; display: fl
 .line { fill: none; stroke-width: 2; stroke-linejoin: round; }
 .bar { stroke: none; opacity: .75; }
 .s-buy { color: var(--buy); stroke: var(--buy); } .s-sell { color: var(--sell); stroke: var(--sell); }
+.s-price-forecast { color: var(--buy); stroke: var(--buy); }
 .s-pv { color: var(--pv); stroke: var(--pv); } .s-pv-forecast { color: var(--pv); stroke: var(--pv); }
 .s-load { color: var(--load); stroke: var(--load); } .s-forecast { color: var(--forecast); stroke: var(--forecast); }
 .s-bat { color: var(--bat); fill: var(--bat); } .s-grid { color: var(--grid); stroke: var(--grid); }

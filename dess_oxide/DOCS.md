@@ -1,8 +1,8 @@
 # dess-oxide
 
 dess-oxide plans a Victron ESS against Dutch 15-minute day-ahead prices.
-The design is in
-[docs/PLAN.md](https://github.com/georgeboot/dess-oxide/blob/main/docs/PLAN.md).
+How it works is in
+[docs/DESIGN.md](https://github.com/georgeboot/dess-oxide/blob/main/docs/DESIGN.md).
 
 ## What this version does
 
@@ -51,9 +51,14 @@ on here.
   - house load from a **learned base-load model plus a learned heat pump
     model**. The heat pump model includes frost losses in humid air. Until
     they beat the naive forecast, load comes from history.
-- **Learns the battery**: the inverter and battery losses, and the usable
-  capacity from long charge and discharge stretches. It also keeps a finer
-  state of charge than a BMS that reports whole percent.
+- **Learns the battery**: the inverters' losses and standby draw, the
+  capacity from long charge and discharge stretches, and the cells' own
+  round trip from the BMS's energy counters. It also keeps a finer state of
+  charge than a BMS that reports whole percent.
+- **Keeps a backup reserve**: the plan never goes below ESS's own "minimum
+  SoC (unless grid fails)", set on the Cerbo under Settings → ESS. ESS
+  ignores that minimum in a power cut, so what's below it is there for
+  backup. `battery.max_soc` caps the other end.
 - **Plans** the cheapest battery schedule for the next 48 hours or more, at
   every quarter hour and whenever prices or forecasts change. Every plan is
   stored.
@@ -66,9 +71,10 @@ on here.
 - **Shows** it all on the **dess-oxide** page in the sidebar:
   - the plan;
   - the last 24 hours, comparing what happened with what dess-oxide planned
-    and the setpoint your current system actually ran;
-  - forecast accuracy over the last week, by how far ahead each forecast
-    was made;
+    and the setpoint your current system actually ran, and the prices with
+    what was forecast for them before they were published;
+  - forecast accuracy over the last week, per day and by how far ahead each
+    forecast was made;
   - what today, yesterday, the last week and this month cost, and what
     they would have cost without the battery. While DAO runs the system,
     that's DAO's result, so it's the yardstick for the handover;
@@ -139,7 +145,9 @@ ned_api_key: ""             # optional: a free key from ned.nl, for better price
 copies these sensors' hourly statistics from Home Assistant: up to three
 years at first, then every six hours. House load is derived as
 `import − export + pv −` the inverters' AC in `+` their AC out. This only
-reads from HA.
+reads from HA. Hours where a sensor went down or jumped more than 100 kWh
+(a counter reset in HA's statistics) are left out; the page counts them per
+sensor under "History imported from Home Assistant".
 
 A meter that reports two tariff registers (T1 and T2, as Dutch P1 meters
 do) can be given as one comma-separated line, e.g.
@@ -207,7 +215,9 @@ Netherlands and Germany, temperature, the time of day and week, holidays,
 and the recent price level. It learns from the last half year of EPEX NL
 prices (from EnergyZero) and Open-Meteo's weather forecasts, retrains
 nightly, and is only used while it beats the old estimate (the recent
-median of the same hour) on held-out days. On half a year of history it
+median of the same hour) on held-out days. On the page, the plan's shaded
+part is where prices are forecast, and the last 24 hours show how far off
+the forecast was. On half a year of history it
 roughly halves the error: 1.6 ct/kWh against 3.4. With **`ned_api_key`**
 (free from [ned.nl](https://ned.nl/nl/handleiding-api)) it also uses NED's
 forecasts of Dutch wind and solar production, which brings it to about

@@ -1,4 +1,4 @@
-//! Optional Home Assistant entities (`ha_entities: true`, PLAN.md §17.2): a
+//! Optional Home Assistant entities (`ha_entities: true`, docs/DESIGN.md §12.2): a
 //! few states for automations, set through HA's REST API.
 //!
 //! They stay quiet on purpose: a state is sent when it changes, and repeated

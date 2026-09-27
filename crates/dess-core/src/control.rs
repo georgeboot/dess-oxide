@@ -1,5 +1,5 @@
 //! The per-second decision: the plan's policy applied to what is actually
-//! happening (PLAN.md §15.2).
+//! happening (docs/DESIGN.md §10.2).
 //!
 //! The plan's numbers are a forecast; its value function is the policy. Each
 //! second, for the rest of the current slot, we pick the battery power that

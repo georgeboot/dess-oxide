@@ -5,7 +5,7 @@
 //! is on. The backward pass computes the cost-to-go `V_t(E, relay)` for every
 //! state; the forward pass extracts the plan from the current SoC. Keeping the
 //! whole value function lets the executor apply the plan's policy to measured
-//! load and PV every second (PLAN.md §15.2).
+//! load and PV every second (docs/DESIGN.md §10.2).
 //!
 //! Minimum SoC and grid limits are soft (large penalties), so a plan always
 //! exists, even when starting below the floor or when loads exceed what the

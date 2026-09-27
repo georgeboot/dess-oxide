@@ -1,4 +1,4 @@
-//! Executing the plan (PLAN.md §15): a one-second loop that moves the ESS
+//! Executing the plan (docs/DESIGN.md §10): a one-second loop that moves the ESS
 //! grid setpoint and, per slot, the PV relay.
 //!
 //! It only acts when everything below holds, and otherwise releases control

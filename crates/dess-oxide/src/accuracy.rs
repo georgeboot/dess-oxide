@@ -1,4 +1,4 @@
-//! Forecasts against what happened, per day (PLAN.md §12.7): what the last
+//! Forecasts against what happened, per day (docs/DESIGN.md §7.8): what the last
 //! plan before midnight expected for the day, and what the recordings show.
 //! Base load and heat pump are split where the heat pump model made the
 //! forecast and its meter's hourly statistics are in.
@@ -73,6 +73,7 @@ pub fn daily(
             .ha_hourly(&[entity], from.start())?
             .into_iter()
             .filter_map(|(hour, values)| Some((hour, *values.get(entity)?)))
+            .filter(|(_, kwh)| !crate::planning::implausible(*kwh))
             .collect(),
         None => HashMap::new(),
     };

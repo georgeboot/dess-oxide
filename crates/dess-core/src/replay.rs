@@ -1,6 +1,6 @@
-//! Replays recorded history through the planner and the policy (PLAN.md
-//! §18): what dess-oxide would have done, and what it would have cost, with
-//! the load, PV and prices that actually happened.
+//! Replays recorded history through the planner and the policy
+//! (docs/DESIGN.md §7.8): what dess-oxide would have done, and what it
+//! would have cost, with the load, PV and prices that actually happened.
 //!
 //! Each slot is planned from the forecasts dess-oxide had at its start, then
 //! run at the slot's measured load and PV the way the per-second policy

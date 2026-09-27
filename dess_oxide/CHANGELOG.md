@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.20.1
+
+Every field on the page checked against where it comes from. Fixed:
+
+- **Capacity:** the battery section said "usable" for the whole battery.
+  It now shows the capacity (0–100 %) and how much of it the plan can use
+  above ESS's minimum SoC (and below `max_soc`); what's below the minimum
+  stays for a power cut.
+- **The cells' round trip** divided the BMS's "out" counter by its "in"
+  counter. That's off by however much more or less the battery held at the
+  end of the year than at the start, and it counted a sensor's hours even
+  where the other had none. It now uses the ratio of the two counters'
+  long-run trends over the span both cover, which doesn't care where the
+  record starts or ends. The page says what it's measured over, and gives
+  the loss per direction and the round trip.
+- **"Expected over the horizon"** subtracted the value of all energy left
+  in the battery at the end, the reserve included, so it read several euros
+  low. Now **"Grid cost ahead"**: what the plan expects to pay the grid, and
+  where the battery ends up.
+- **Break-even prices** on the stored-energy card now include the wear
+  cost, as the planner does.
+- **Glitches in Home Assistant's statistics** (a counter reset counted as
+  its whole total in one hour) went into the base load and heat pump
+  training and the baselines they're compared with. Hours where a sensor
+  went down or moved more than 100 kWh are now left out, and the history
+  table counts them per sensor.
+- **Price model after a restart:** it said "in use" while it was still
+  retraining (its trees aren't stored); it now says so until it's back.
+- The heat pump's baseline is the same hour's average over the previous
+  seven days (the page said "last week's same hours"); both house models
+  now show what the held-out hours averaged, so the errors have a scale.
+- Hot water no longer says "at 15 °C and warmer" when it found no effect of
+  the temperature, and says its daily error is on the days it learned from.
+- The current quarter hour says "bypass" when the plan holds the battery.
+
+New:
+
+- **Prices in the last 24 hours:** the published buy price against what the
+  last plan before publication forecast, with the mean error. The plan's
+  note says where the shaded (unpublished) prices come from.
+
+The design document is now `docs/DESIGN.md`: how dess-oxide works as built,
+and the short list of what's left.
+
 ## 0.20.0
 
 - **Price forecast:** prices that aren't published yet are now forecast

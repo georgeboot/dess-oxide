@@ -605,6 +605,7 @@ async fn train_house(shared: &Arc<Shared>) {
         hours: fit.hours,
         validation_mae: fit.validation_mae,
         baseline_mae: fit.baseline_mae,
+        mean_kwh: fit.mean_kwh,
         promoted: fit.improves(),
         model: fit.model,
     });
@@ -621,6 +622,7 @@ async fn train_house(shared: &Arc<Shared>) {
         hours: fit.hours,
         validation_mae: fit.validation_mae,
         baseline_mae: fit.baseline_mae,
+        mean_kwh: fit.mean_kwh,
         promoted: fit.improves(),
         model: fit.model,
     });
@@ -655,6 +657,7 @@ struct Fitted<M> {
     hours: usize,
     validation_mae: f64,
     baseline_mae: f64,
+    mean_kwh: f64,
     promoted: bool,
 }
 
@@ -678,8 +681,12 @@ fn publish_fit<M>(
         promoted = fit.promoted,
         "trained the {label} model"
     );
-    let metrics =
-        crate::training::baseline_metrics(fit.hours, fit.validation_mae, fit.baseline_mae);
+    let metrics = crate::training::baseline_metrics(
+        fit.hours,
+        fit.validation_mae,
+        fit.baseline_mae,
+        fit.mean_kwh,
+    );
     if let Err(error) = store.save_model(name, now, &fit.params, &metrics, fit.promoted) {
         error!(%error, "storing the {label} model");
     }
@@ -884,7 +891,8 @@ fn replan(venus: &Venus, shared: &Shared) {
                     grid_kw = format!("{:+.2}", first.grid.0 / 1000.0),
                     pv_on = first.pv_on,
                     horizon_slots = view.plan.slots.len(),
-                    expected_eur = format!("{:.2}", view.plan.expected_cost),
+                    grid_cost_eur =
+                        format!("{:.2}", view.plan.slots.iter().map(|s| s.cost).sum::<f64>()),
                     "planned (shadow)"
                 );
             }

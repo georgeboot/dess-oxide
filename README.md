@@ -5,26 +5,28 @@ for Victron ESS systems.
 
 It plans the battery against Dutch 15-minute day-ahead prices, using
 forecasts of PV, house load and heat pump demand that it learns from the
-system's own history. It talks to the Cerbo GX directly over the Cerbo's
-local MQTT, and ships as a Home Assistant app. The full design is in
-[docs/PLAN.md](docs/PLAN.md).
+system's own history, and forecasts the prices that aren't published yet.
+It talks to the Cerbo GX directly over the Cerbo's local MQTT, and ships as
+a Home Assistant app. How it works is in [docs/DESIGN.md](docs/DESIGN.md);
+installing and configuring it in [dess_oxide/DOCS.md](dess_oxide/DOCS.md).
 
-**Status: M3–M4, running in shadow mode next to DAO.** It records, learns
-its models (PV, heat pump, base load, battery losses and capacity), plans,
-and shows it all on its own page, including a nightly replay of the last
-week against what actually happened. Control (a 1 Hz setpoint loop, the PV
+**Status: complete, running as a dry run next to DAO until the handover.**
+It records, learns its models (PV, heat pump, hot water, base load, prices,
+the battery's losses, capacity and round trip), plans, and shows it all on
+its own page, including a nightly replay of the last week against what
+actually happened. Control (a one-second setpoint loop, bypass, the PV
 relay, outage preparation, manual overrides) is built. It writes only when
 both locks are on: `dryrun: false` in the options and the switch on its
-page.
+page. What's left is listed at the end of the design.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `crates/dess-core` | Pure domain logic: slots, units, recording, efficiency and capacity learning, SoC estimation, tariff, price horizon, baseline forecasts, the DP planner, the per-second policy, the replay |
-| `crates/dess-models` | Learned models with burn: PV, heat pump, base load |
+| `crates/dess-core` | Pure domain logic: slots, units, recording, efficiency, capacity and cell round-trip learning, SoC estimation, tariff, price horizon, weather correction, baseline forecasts, the DP planner, the per-second policy, the replay |
+| `crates/dess-models` | Learned models: PV, heat pump and base load (burn), hot water (statistics), prices (gradient-boosted trees) |
 | `crates/dess-victron` | Client for the GX device's MQTT: typed readings, the `probe` report, and a separate write capability |
-| `crates/dess-oxide` | The binary: config, SQLite store, Nord Pool, Open-Meteo and Home Assistant clients, the service, control, the web page |
+| `crates/dess-oxide` | The binary: config, SQLite store, the Nord Pool, Open-Meteo, EnergyZero, NED and Home Assistant clients, the service, control, the web page |
 | `dess_oxide/` | The Home Assistant app definition |
 
 ## Usage

@@ -111,7 +111,7 @@ pub struct OpenAmberEntities {
     pub next_legionella: String,
 }
 
-/// An EV charger (PLAN.md §12.6). It isn't forecast: it's left out of the
+/// An EV charger (docs/DESIGN.md §7.6). It isn't forecast: it's left out of the
 /// house load, and while it charges the per-second control sees it.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
@@ -122,7 +122,7 @@ pub struct EvConfig {
 }
 
 /// A flexible run, such as the dishwasher: dess-oxide finds its cheapest
-/// start time in a nightly window (PLAN.md §14.4).
+/// start time in a nightly window (docs/DESIGN.md §9.3).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct CheapestStartConfig {

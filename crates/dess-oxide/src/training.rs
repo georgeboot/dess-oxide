@@ -67,6 +67,7 @@ pub fn pv_hours(
             .ha_hourly(&[entity], from.start())?
             .into_iter()
             .filter_map(|(hour, values)| values.get(entity).map(|kwh| (hour, *kwh)))
+            .filter(|(_, kwh)| !crate::planning::implausible(*kwh))
             .collect(),
         None => BTreeMap::new(),
     };
@@ -261,6 +262,7 @@ pub fn house_hours(
             .ha_hourly(&[entity], from.start())?
             .into_iter()
             .filter_map(|(hour, values)| values.get(entity).map(|kwh| (hour, *kwh)))
+            .filter(|(_, kwh)| !crate::planning::implausible(*kwh))
             .collect(),
         None => BTreeMap::new(),
     };
@@ -462,8 +464,18 @@ pub fn load_model_from_json(v: &serde_json::Value) -> Option<LoadModel> {
 }
 
 /// Metrics for a model with a naive baseline to beat.
-pub fn baseline_metrics(hours: usize, validation_mae: f64, baseline_mae: f64) -> serde_json::Value {
-    json!({ "hours": hours, "validation_mae_kwh": validation_mae, "baseline_mae_kwh": baseline_mae })
+pub fn baseline_metrics(
+    hours: usize,
+    validation_mae: f64,
+    baseline_mae: f64,
+    mean_kwh: f64,
+) -> serde_json::Value {
+    json!({
+        "hours": hours,
+        "validation_mae_kwh": validation_mae,
+        "baseline_mae_kwh": baseline_mae,
+        "mean_kwh": mean_kwh,
+    })
 }
 
 pub fn pv_model_json(model: &PvModel) -> serde_json::Value {

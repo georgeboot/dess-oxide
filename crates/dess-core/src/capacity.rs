@@ -1,5 +1,5 @@
 //! Usable battery capacity, learned from long one-way SoC stretches
-//! (PLAN.md §12.2): `C = ∫P_dc dt / ΔSoC`.
+//! (docs/DESIGN.md §7.2): `C = ∫P_dc dt / ΔSoC`.
 //!
 //! It's the capacity on the BMS's own SoC scale, which is what the planner
 //! needs to turn SoC into energy. Charge stretches come out larger than
@@ -107,6 +107,55 @@ pub fn fit_capacity(slots: &[SlotEnergy]) -> CapacityFit {
     }
 }
 
+/// Cycles of the battery a counter record needs before its round trip is
+/// trusted: fewer, and the swing inside the record hides the drift.
+const MIN_CYCLES: f64 = 20.0;
+
+/// The cells' round trip from hourly energy counters at the battery's
+/// terminals, `(kWh in, kWh out)` per hour in time order.
+///
+/// Dividing the energy out by the energy in is off by however much more or
+/// less the battery holds at the end than at the start, up to its whole
+/// capacity. But the stored energy has no trend: however long the record,
+/// it stays between empty and full. So over the long run energy goes out at
+/// the round trip's share of the rate it goes in, and that ratio of the two
+/// counters' trends (least squares over every hour, not just the ends) is
+/// the round trip. `None` until the battery has cycled enough for the swing
+/// within the record not to matter.
+pub fn round_trip_from_counters(hours: &[(f64, f64)]) -> Option<f64> {
+    let n = hours.len() as f64;
+    let (mut into, mut out) = (0.0, 0.0);
+    let (mut st, mut stt, mut si, mut sti, mut so, mut sto) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+    for (t, &(i, o)) in hours.iter().enumerate() {
+        let t = t as f64;
+        into += i;
+        out += o;
+        st += t;
+        stt += t * t;
+        si += into;
+        sti += t * into;
+        so += out;
+        sto += t * out;
+    }
+    let spread = stt - st * st / n;
+    let trend_in = (sti - st * si / n) / spread;
+    let trend_out = (sto - st * so / n) / spread;
+    if trend_in.is_nan() || trend_in <= 0.0 {
+        return None;
+    }
+    let round_trip = trend_out / trend_in;
+    // How far the stored energy swings at that round trip: the record has to
+    // hold many times that.
+    let each_way = round_trip.sqrt();
+    let (mut level, mut low, mut high) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for &(i, o) in hours {
+        level += i * each_way - o / each_way;
+        low = low.min(level);
+        high = high.max(level);
+    }
+    ((0.8..1.0).contains(&round_trip) && into >= MIN_CYCLES * (high - low)).then_some(round_trip)
+}
+
 fn median(values: &mut [f64]) -> Option<f64> {
     if values.is_empty() {
         return None;
@@ -158,6 +207,46 @@ mod tests {
         assert!((d - 30_000.0 / 1.02).abs() < 1.0, "{d}");
         assert!((fit.usable_wh().unwrap() - 30_000.0).abs() < 1.0);
         assert!((fit.round_trip().unwrap() - 1.0 / 1.02_f64.powi(2)).abs() < 1e-6);
+    }
+
+    /// A 30 kWh battery that loses 3 % each way (94.09 % round trip),
+    /// cycling unevenly for `days`, starting and ending half full.
+    fn counters(days: usize) -> Vec<(f64, f64)> {
+        let each_way: f64 = 0.97;
+        let mut stored = 15.0;
+        let mut hours = Vec::new();
+        for day in 0..days {
+            // Charge towards a different top each day, then discharge.
+            let top = 22.0 + 8.0 * ((day as f64) * 0.7).sin().abs();
+            let bottom = 3.0 + 4.0 * ((day as f64) * 1.3).cos().abs();
+            for _ in 0..12 {
+                let into = ((top - stored) / each_way).clamp(0.0, 3.0);
+                stored += into * each_way;
+                hours.push((into, 0.0));
+            }
+            for _ in 0..12 {
+                let out = ((stored - bottom) * each_way).clamp(0.0, 2.5);
+                stored -= out / each_way;
+                hours.push((0.0, out));
+            }
+        }
+        hours
+    }
+
+    #[test]
+    fn round_trip_from_the_counters_ignores_where_the_record_starts_and_ends() {
+        let hours = counters(60);
+        let rt = round_trip_from_counters(&hours).unwrap();
+        assert!((rt - 0.9409).abs() < 0.002, "{rt}");
+        // Start the record with the battery full: out over in is off by the
+        // energy it held, the trends aren't.
+        let cut = &hours[12..];
+        let naive = cut.iter().map(|h| h.1).sum::<f64>() / cut.iter().map(|h| h.0).sum::<f64>();
+        assert!((naive - 0.9409).abs() > 0.01, "{naive}");
+        let rt = round_trip_from_counters(cut).unwrap();
+        assert!((rt - 0.9409).abs() < 0.002, "{rt}");
+        // A few days aren't enough.
+        assert_eq!(round_trip_from_counters(&counters(5)), None);
     }
 
     #[test]

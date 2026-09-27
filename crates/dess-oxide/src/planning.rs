@@ -230,9 +230,10 @@ pub fn make_plan(
     let info = reading::battery_info(snapshot);
     let fit = learned_capacity(store, now)?;
     let mut battery = battery_model(&info, &learned_losses(store, now)?, fit.usable_wh())?;
-    // The cells' own round trip: from the BMS's counters over the last year,
-    // else from the charge and discharge stretches.
-    if let Some(round_trip) = cell_round_trip(store, &config.history, now)?.or(fit.round_trip()) {
+    // The cells' own round trip: from the BMS's counters, else from the
+    // charge and discharge stretches.
+    let counters = cell_round_trip(store, &config.history, now)?.map(|c| c.round_trip);
+    if let Some(round_trip) = counters.or(fit.round_trip()) {
         battery.cell_efficiency = round_trip.sqrt().clamp(0.9, 1.0);
     }
     if let Some(draw) = learned_bypass_draw(store) {
@@ -350,6 +351,12 @@ pub fn load_history(
         let sum = |sensors: &[&str]| -> Option<f64> {
             sensors.iter().map(|e| values.get(*e).copied()).sum()
         };
+        if entities
+            .iter()
+            .any(|e| values.get(*e).is_some_and(|&kwh| implausible(kwh)))
+        {
+            continue;
+        }
         let Some([imported, exported, pv, battery_in, battery_out, ev]) = roles
             .iter()
             .map(|sensors| sum(sensors))
@@ -362,7 +369,12 @@ pub fn load_history(
             Some(model) => ac_from_dc(model, battery_in, battery_out),
             None => (battery_in, battery_out),
         };
-        let load_kwh = (imported - exported + pv - battery_in + battery_out - ev).max(0.0);
+        let load_kwh = imported - exported + pv - battery_in + battery_out - ev;
+        // Clearly below zero, the sensors disagree about the hour.
+        if load_kwh < -0.2 {
+            continue;
+        }
+        let load_kwh = load_kwh.max(0.0);
         let Some(first) = Slot::from_start_unix(hour) else {
             continue;
         };
@@ -373,6 +385,16 @@ pub fn load_history(
         }
     }
     Ok(by_slot.into_iter().collect())
+}
+
+/// Most energy a meter can plausibly move in an hour, kWh. More, or less
+/// than nothing, is a counter reset or a glitch in Home Assistant's
+/// statistics, not energy that moved.
+const PLAUSIBLE_HOUR_KWH: f64 = 100.0;
+
+/// Whether an hour's reading from a Home Assistant energy sensor is a glitch.
+pub fn implausible(kwh: f64) -> bool {
+    !(-0.01..=PLAUSIBLE_HOUR_KWH).contains(&kwh)
 }
 
 /// The AC energy (kWh) into and out of the inverters in an hour that moved
@@ -456,29 +478,71 @@ pub fn learned_capacity(store: &Store, now: Timestamp) -> anyhow::Result<Capacit
     Ok(dess_core::capacity::fit_capacity(&store.slot_energy(from)?))
 }
 
-/// The battery's own round trip from its DC counters (energy out over energy
-/// in) over the last year: with thousands of kWh through it, the SoC's
-/// change over the window doesn't matter.
+/// The cells' own round trip, measured from the BMS's energy counters.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CellRoundTrip {
+    pub round_trip: f64,
+    /// Energy charged over the record, kWh.
+    pub charged_kwh: f64,
+    /// Where the record starts: the first hour every counter covers.
+    pub since: Timestamp,
+}
+
+/// The cells' round trip from the BMS's energy in and out counters, over
+/// all of their history (see [`dess_core::capacity::round_trip_from_counters`]).
 pub fn cell_round_trip(
     store: &Store,
     history: &HistoryConfig,
     now: Timestamp,
-) -> anyhow::Result<Option<f64>> {
+) -> anyhow::Result<Option<CellRoundTrip>> {
     let (into, out) = (history.of("battery_dc_in"), history.of("battery_dc_out"));
     if into.is_empty() || out.is_empty() {
         return Ok(None);
     }
-    let from = now - SignedDuration::from_hours(24 * 365);
-    let total = |sensors: &[&str]| -> anyhow::Result<f64> {
-        sensors
+    let sensors: Vec<&str> = into.iter().chain(&out).copied().collect();
+    let rows = store.ha_hourly(&sensors, now - SignedDuration::from_hours(24 * 365 * 3))?;
+    // Only the span every counter covers: outside it, energy went unmetered.
+    let covered = |forward: bool| -> Option<i64> {
+        let hours: Vec<i64> = sensors
             .iter()
-            .map(|e| Ok(store.ha_total(e, from, now)?.0))
-            .sum()
+            .map(|e| {
+                let has =
+                    |(_, v): &(&i64, &std::collections::HashMap<String, f64>)| v.contains_key(*e);
+                if forward {
+                    rows.iter().find(has).map(|(h, _)| *h)
+                } else {
+                    rows.iter().rev().find(has).map(|(h, _)| *h)
+                }
+            })
+            .collect::<Option<_>>()?;
+        if forward {
+            hours.into_iter().max()
+        } else {
+            hours.into_iter().min()
+        }
     };
-    let (charged, discharged) = (total(&into)?, total(&out)?);
-    Ok((charged >= 1000.0)
-        .then(|| discharged / charged)
-        .filter(|r| (0.8..=1.0).contains(r)))
+    let (Some(first), Some(last)) = (covered(true), covered(false)) else {
+        return Ok(None);
+    };
+    let mut hours = Vec::new();
+    for values in rows.range(first..=last).map(|(_, v)| v) {
+        // A missing hour's energy shows up in the counter's next one.
+        let sum = |sensors: &[&str]| -> f64 { sensors.iter().filter_map(|e| values.get(*e)).sum() };
+        if sensors
+            .iter()
+            .any(|e| values.get(*e).is_some_and(|&kwh| implausible(kwh)))
+        {
+            continue;
+        }
+        hours.push((sum(&into).max(0.0), sum(&out).max(0.0)));
+    }
+    Ok(
+        dess_core::capacity::round_trip_from_counters(&hours).map(|round_trip| CellRoundTrip {
+            round_trip,
+            charged_kwh: hours.iter().map(|h| h.0).sum(),
+            since: Timestamp::from_second(first).unwrap_or(now),
+        }),
+    )
 }
 
 /// Usable capacity: learned from long stretches, else from the GX device
@@ -594,6 +658,28 @@ struct LoadForecast {
     heat_pump: Option<Watts>,
 }
 
+/// The load history minus the heat pump's metered hours.
+fn without_heat_pump(
+    store: &Store,
+    entity: &str,
+    history: &[(Slot, Watts)],
+    now: Timestamp,
+) -> anyhow::Result<Vec<(Slot, Watts)>> {
+    let from = history.first().map_or(Slot::containing(now), |(s, _)| *s);
+    let hourly = store.ha_hourly(&[entity], from.start())?;
+    Ok(history
+        .iter()
+        .filter_map(|&(slot, total)| {
+            let hour = slot.start_unix().div_euclid(3600) * 3600;
+            let kwh = hourly
+                .get(&hour)?
+                .get(entity)
+                .filter(|k| !implausible(**k))?;
+            Some((slot, Watts((total.0 - kwh * 1000.0).max(0.0))))
+        })
+        .collect())
+}
+
 /// House load per slot. With a metered heat pump whose model is in use, the
 /// load is base load (the base-load model, or else history without the heat
 /// pump) plus the heat pump model. Otherwise it's the base-load model if in
@@ -643,16 +729,7 @@ fn house_load(
     // History without the heat pump, for base load where the model isn't in use.
     let baseline = match (heat_pump_entity, heat_pump_model) {
         (Some(entity), Some(_)) => {
-            let from = history.first().map_or(Slot::containing(now), |(s, _)| *s);
-            let hourly = store.ha_hourly(&[entity], from.start())?;
-            let base: Vec<(Slot, Watts)> = history
-                .iter()
-                .filter_map(|&(slot, total)| {
-                    let hour = slot.start_unix().div_euclid(3600) * 3600;
-                    let kwh = hourly.get(&hour)?.get(entity)?;
-                    Some((slot, Watts((total.0 - kwh * 1000.0).max(0.0))))
-                })
-                .collect();
+            let base = without_heat_pump(store, entity, history, now)?;
             forecast::baseline_load(&base, slots, tz, FALLBACK_LOAD)
         }
         _ => forecast::baseline_load(history, slots, tz, FALLBACK_LOAD),
@@ -1018,7 +1095,8 @@ mod tests {
             ..HistoryConfig::default()
         };
         let rt = cell_round_trip(&store, &history, now).unwrap().unwrap();
-        assert!((rt - 0.96).abs() < 1e-9);
+        assert!((rt.round_trip - 0.96).abs() < 1e-9);
+        assert!((rt.charged_kwh - 2000.0).abs() < 1e-9);
         // Too little through it yet: nothing.
         let few = HistoryConfig {
             battery_dc_in: Some("sensor.none".into()),
@@ -1102,6 +1180,19 @@ mod tests {
         // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour (no battery
         // model, so DC counts as AC).
         assert!(loads.iter().all(|(_, w)| (w.0 - 1600.0).abs() < 1e-9));
+
+        // A counter reset in the statistics makes the hour unusable too.
+        store
+            .save_ha_hourly(&[("sensor.pv".into(), hour, 5230.0)])
+            .unwrap();
+        assert!(
+            load_history(&store, &history, false, None, from)
+                .unwrap()
+                .is_empty()
+        );
+        store
+            .save_ha_hourly(&[("sensor.pv".into(), hour, 1.5)])
+            .unwrap();
 
         // A sensor without a value for the hour makes the hour unusable.
         store

@@ -168,8 +168,10 @@ pub struct HpFit {
     pub hours: usize,
     /// Mean absolute error on held-out days, kWh per hour.
     pub validation_mae: f64,
-    /// The same for "same hour, the past week's average".
+    /// The same for the same hour's average over the previous seven days.
     pub baseline_mae: f64,
+    /// What the held-out hours used on average, kWh, for scale.
+    pub mean_kwh: f64,
 }
 
 impl HpFit {
@@ -208,6 +210,7 @@ pub fn fit(hours: &[HpHour], iterations: usize) -> HpFit {
     );
     HpFit {
         baseline_mae: seasonal_naive_mae(&usable, &validation),
+        mean_kwh: mean(validation.iter().map(|h| h.target())),
         validation_mae,
         hours: usable.len(),
         model,

@@ -1,4 +1,4 @@
-//! A finer state of charge than the BMS reports (PLAN.md §12.2).
+//! A finer state of charge than the BMS reports (docs/DESIGN.md §7.2).
 //!
 //! Some BMSes report whole percent: 320 Wh steps on a 32 kWh battery, coarser
 //! than the planner's 100 Wh grid. Between reports we integrate battery DC
