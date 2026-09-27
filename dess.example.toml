@@ -1,0 +1,9 @@
+# Standalone configuration, for development against a real GX device:
+#   cp dess.example.toml dess.toml
+#   cargo run -- run --config dess.toml --data-dir data
+# The Home Assistant app uses the same schema in /data/options.json.
+
+[victron]
+host = "192.168.1.20"   # the GX device; "MQTT on LAN" must be enabled
+# port = 1883
+# portal_id = "0123456789ab"   # discovered automatically when not set

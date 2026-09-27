@@ -1,0 +1,17 @@
+[package]
+name = "dess-core"
+description = "Pure domain logic for dess-oxide: slots, units, recording and (later) tariff and planner"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+jiff.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true

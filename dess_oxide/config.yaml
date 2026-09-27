@@ -1,0 +1,22 @@
+# Home Assistant app definition. Keep `version` in sync with the workspace
+# version in Cargo.toml; the release workflow refuses tags that don't match.
+name: dess-oxide
+version: "0.1.0"
+slug: dess_oxide
+description: Plans and runs a Victron ESS against Dutch day-ahead prices. For now it only records, read-only.
+url: https://github.com/georgeboot/dess-oxide
+arch:
+  - aarch64
+  - amd64
+image: ghcr.io/georgeboot/dess-oxide
+init: false
+startup: application
+boot: auto
+options:
+  victron:
+    host: ""
+schema:
+  victron:
+    host: str
+    port: port?
+    portal_id: str?
