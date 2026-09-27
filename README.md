@@ -9,15 +9,22 @@ system's own history. It talks to the Cerbo GX directly over the Cerbo's
 local MQTT, and ships as a Home Assistant app. The full design is in
 [docs/PLAN.md](docs/PLAN.md).
 
-**Status: M1, shadow mode.** It records, fetches prices, forecasts and plans, and shows it all on its own page. It never writes to the Victron yet.
+**Status: M3–M4, running in shadow mode next to DAO.** It records, learns
+its models (PV, heat pump, base load, battery losses and capacity), plans,
+and shows it all on its own page, including a nightly replay of the last
+week against what actually happened. Control (a 1 Hz setpoint loop, the PV
+relay, outage preparation, manual overrides) is built. It writes only when
+both locks are on: `control: true` in the options and the switch on its
+page.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `crates/dess-core` | Pure domain logic: slots, units, recording, efficiency sampling, tariff, price horizon, baseline forecasts, the DP planner |
-| `crates/dess-victron` | Read-only client for the GX device's MQTT, typed readings, `probe` report |
-| `crates/dess-oxide` | The binary: config, SQLite store, Nord Pool and Open-Meteo clients, the service, the web page |
+| `crates/dess-core` | Pure domain logic: slots, units, recording, efficiency and capacity learning, SoC estimation, tariff, price horizon, baseline forecasts, the DP planner, the per-second policy, the replay |
+| `crates/dess-models` | Learned models with burn: PV, heat pump, base load |
+| `crates/dess-victron` | Client for the GX device's MQTT: typed readings, the `probe` report, and a separate write capability |
+| `crates/dess-oxide` | The binary: config, SQLite store, Nord Pool, Open-Meteo and Home Assistant clients, the service, control, the web page |
 | `dess_oxide/` | The Home Assistant app definition |
 
 ## Usage
@@ -36,8 +43,9 @@ cp dess.example.toml dess.toml   # then set the host, tariff, location and PV ar
 cargo run -- plan --config dess.toml --data-dir data
 ```
 
-Run the service in shadow mode: it records, plans every quarter hour, and
-serves its page on http://127.0.0.1:8099. Also read-only.
+Run the service: it records, plans every quarter hour, and serves its page
+on http://127.0.0.1:8099. Read-only unless the config has `control = true`
+and the page's switch is on.
 
 ```bash
 cargo run -- run --config dess.toml --data-dir data

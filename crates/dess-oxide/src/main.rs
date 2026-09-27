@@ -63,7 +63,8 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         rows: usize,
     },
-    /// Run the service: record the system's energy flows. Read-only for now.
+    /// Run the service: record, learn, plan and serve the page. It writes to
+    /// the GX device only with `control: true` and the page's switch on.
     Run {
         /// `options.json` (Home Assistant app) or a TOML file.
         #[arg(long, default_value = "dess.toml")]
