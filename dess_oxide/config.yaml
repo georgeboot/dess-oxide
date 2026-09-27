@@ -4,7 +4,7 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.17.0"
+version: "0.18.0"
 slug: dess_oxide
 description: Plans and (once you allow it) runs a Victron ESS against Dutch day-ahead prices.
 url: https://github.com/georgeboot/dess-oxide
@@ -30,7 +30,7 @@ options:
     max_export_kw: 17
   battery:
     wear_cost_eur_per_kwh: 0
-    reserve_soc: 0
+    max_soc: 100
   prices:
     area: NL
   tariff:
@@ -75,9 +75,8 @@ schema:
     max_import_kw: float
     max_export_kw: float
   battery:
-    capacity_kwh: float?
     wear_cost_eur_per_kwh: float
-    reserve_soc: float(0,100)
+    max_soc: float(10,100)?
   prices:
     area: str
   tariff:

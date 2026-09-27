@@ -546,6 +546,9 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
         return html! {};
     };
     let battery = first.battery_ac.0 / 1000.0;
+    let soc = shared.soc(Timestamp::now()).unwrap_or(view.soc);
+    let capacity_kwh = view.battery.capacity.0 / 1000.0;
+    let above_reserve = ((soc - view.min_soc) / 100.0 * capacity_kwh).max(0.0);
     // The plan's value of stored energy, as break-even prices after losses.
     let value = first.stored_energy_value.0;
     let efficiency = |ac: f64| view.battery.dc_for_ac(dess_core::Watts(ac)).0 / ac;
@@ -560,7 +563,18 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
     };
     html! {
         section.cards {
-            div.card { span.label { (l.t("Battery", "Accu")) } span.value { (format!("{:.1} %", shared.soc(Timestamp::now()).unwrap_or(view.soc))) } span.sub { (format!("{:.1} kWh", view.battery.capacity.0 / 1000.0)) (l.t(" usable", " bruikbaar")) } }
+            div.card {
+                span.label { (l.t("Battery", "Accu")) }
+                span.value { (format!("{soc:.1} %")) }
+                span.sub {
+                    (format!("{:.1} kWh", above_reserve)) (l.t(" to use above the ", " te gebruiken boven de "))
+                    (format!("{:.0} %", view.min_soc)) (l.t(" reserve", " reserve"))
+                    @if view.settings.max_soc < 100.0 {
+                        (l.t(", charged up to ", ", geladen tot ")) (format!("{:.0} %", view.settings.max_soc))
+                    }
+                    " (" (format!("{:.1} kWh", capacity_kwh)) (l.t(" in all)", " in totaal)"))
+                }
+            }
             div.card { span.label { (l.t("This quarter hour", "Dit kwartier")) } span.value { (format!("{battery:+.1} kW")) } span.sub { (action) (l.t(", grid ", ", net ")) (format!("{:+.1} kW", first.grid.0 / 1000.0)) } }
             div.card {
                 span.label { (l.t("Price now", "Prijs nu")) }
@@ -1260,9 +1274,9 @@ fn battery_section(
                         @if let Some(rt) = c.round_trip() { (l.t(": the cells' own round trip is ", ": het eigen rondrendement van de cellen is ")) (format!("{:.1} %", rt * 100.0)) }
                         ")"
                     }
-                    (l.t(", unless set in the options.", ", tenzij ingesteld in de opties."))
+                    (l.t(".", "."))
                 }
-                None => (l.t(", from the options or the GX device until it has seen a 30 % stretch each way.", ", uit de opties of het GX-apparaat totdat er in beide richtingen een reeks van 30 % is gezien.")),
+                None => (l.t(", from the GX device until it has seen a 30 % stretch each way.", ", van het GX-apparaat totdat er in beide richtingen een reeks van 30 % is gezien.")),
             }
         }
         p {

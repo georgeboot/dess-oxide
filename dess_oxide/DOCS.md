@@ -97,7 +97,7 @@ grid:
   max_export_kw: 17
 battery:
   wear_cost_eur_per_kwh: 0
-  reserve_soc: 0            # kept on top of ESS's minimum SoC
+  max_soc: 100              # the highest SoC to plan for
 prices:
   area: NL
 tariff:                     # each component takes effect on its date

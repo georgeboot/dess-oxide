@@ -50,8 +50,10 @@ pub struct PlannerSettings {
     pub relay_switch_cost: f64,
     /// Value of energy still stored at the end of the horizon.
     pub terminal_value: EurPerKwh,
-    /// Penalty per kWh below a slot's minimum SoC.
+    /// Penalty per kWh below a slot's minimum SoC, or above the maximum.
     pub shortfall_penalty: EurPerKwh,
+    /// Highest SoC (%) to plan for; above it is penalised like a shortfall.
+    pub max_soc: f64,
     /// Penalty per kWh of import or export beyond the grid limits.
     pub grid_excess_penalty: EurPerKwh,
 }
@@ -67,6 +69,7 @@ impl Default for PlannerSettings {
             relay_switch_cost: 0.01,
             terminal_value: EurPerKwh::ZERO,
             shortfall_penalty: EurPerKwh(10.0),
+            max_soc: 100.0,
             grid_excess_penalty: EurPerKwh(10.0),
         }
     }
@@ -295,9 +298,14 @@ impl<'a> Problem<'a> {
             let hours = self.hours[t];
             let moves = self.moves(t);
             let relays: &[usize] = if forecast.islanded { &[1] } else { switchable };
-            // The lowest level that still meets the slot's minimum SoC.
+            // The lowest level that still meets the slot's minimum SoC, and
+            // the highest that stays under the maximum.
             let floor_level = ((forecast.min_soc_end / 100.0 * self.capacity) / self.step)
                 .ceil()
+                .max(0.0) as usize;
+            let ceiling_level = ((settings.max_soc.clamp(0.0, 100.0) / 100.0 * self.capacity)
+                / self.step)
+                .floor()
                 .max(0.0) as usize;
             // The stage cost depends on the move, not on the starting level.
             let stage: Vec<[f64; 2]> = moves
@@ -333,7 +341,10 @@ impl<'a> Problem<'a> {
                             else {
                                 continue;
                             };
-                            let shortfall_wh = floor_level.saturating_sub(next) as f64 * self.step;
+                            let shortfall_wh = (floor_level.saturating_sub(next)
+                                + next.saturating_sub(ceiling_level))
+                                as f64
+                                * self.step;
                             let total = costs[relay]
                                 + switch
                                 + settings.shortfall_penalty.0 * shortfall_wh / 1000.0
@@ -573,6 +584,26 @@ mod tests {
         }
         let p = run(&slots, 0.0, &settings());
         assert!(p.slots.iter().all(|s| !s.bypass));
+    }
+
+    #[test]
+    fn stays_under_the_maximum_soc() {
+        // Free power now and dear later: it would fill up, but only to 80 %.
+        let slots = forecasts(
+            &[0.01, 0.01, 0.01, 0.01, 0.60, 0.60, 0.60, 0.60],
+            500.0,
+            0.0,
+        );
+        let capped = PlannerSettings {
+            max_soc: 80.0,
+            ..settings()
+        };
+        let p = run(&slots, 50.0, &capped);
+        let highest = p.slots.iter().map(|s| s.soc_end).fold(0.0, f64::max);
+        assert!(highest <= 80.0 + 1e-6 && highest > 70.0, "{highest}");
+        // Starting above it, the plan comes down.
+        let p = run(&forecasts(&[0.25; 8], 500.0, 0.0), 95.0, &capped);
+        assert!(p.slots[0].soc_end < 95.0);
     }
 
     #[test]

@@ -265,13 +265,19 @@ impl Default for GridConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct BatteryConfig {
-    /// Usable capacity. Defaults to Venus's Dynamic ESS capacity setting, or
-    /// the BMS's installed Ah at nominal LFP voltage.
-    pub capacity_kwh: Option<f64>,
-    /// Cost per kWh moved in or out of the battery.
+    /// Cost per kWh moved in or out of the battery. (The capacity comes from
+    /// the GX device, then from long charge and discharge stretches.)
     pub wear_cost_eur_per_kwh: f64,
-    /// Always keep at least this much for outages, on top of ESS's minimum SoC.
-    pub reserve_soc: f64,
+    /// The highest SoC (%) to plan for. (The lowest is ESS's own "minimum
+    /// SoC (unless grid fails)" on the GX device: a reserve kept while the
+    /// grid is up and used in a power cut.)
+    pub max_soc: Option<f64>,
+}
+
+impl BatteryConfig {
+    pub fn max_soc(&self) -> f64 {
+        self.max_soc.unwrap_or(100.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -398,8 +404,8 @@ impl Config {
         {
             bail!("victron.pv_relay must be 1 or 2");
         }
-        if !(0.0..=100.0).contains(&self.battery.reserve_soc) {
-            bail!("battery.reserve_soc must be between 0 and 100");
+        if !(10.0..=100.0).contains(&self.battery.max_soc()) {
+            bail!("battery.max_soc must be between 10 and 100");
         }
         for (i, array) in self.pv.iter().enumerate() {
             if array.kwp <= 0.0
@@ -470,7 +476,19 @@ mod tests {
                     "bool" => false.into(),
                     "str" => "192.168.1.20".into(),
                     "port" => 1883.into(),
-                    _ if kind.starts_with("float") => 1.0.into(),
+                    // A range's middle, else 1.
+                    _ if kind.starts_with("float") => kind
+                        .strip_prefix("float(")
+                        .and_then(|r| r.strip_suffix(')'))
+                        .and_then(|r| r.split_once(','))
+                        .and_then(|(a, b)| {
+                            Some(f64::midpoint(
+                                a.parse::<f64>().ok()?,
+                                b.parse::<f64>().ok()?,
+                            ))
+                        })
+                        .unwrap_or(1.0)
+                        .into(),
                     _ if kind.starts_with("int") => 1.into(),
                     _ if kind.starts_with("list(") => {
                         kind[5..].split(['|', ')']).next().unwrap().into()

@@ -139,7 +139,8 @@ impl Stage<'_> {
             let (import, export) = (grid.max(0.0), (-grid).max(0.0));
             let excess = (import - settings.max_import.0).max(0.0)
                 + (export - settings.max_export.0).max(0.0);
-            let shortfall = (self.floor - end).max(0.0);
+            let ceiling = settings.max_soc.clamp(0.0, 100.0) / 100.0 * capacity;
+            let shortfall = (self.floor - end).max(0.0) + (end - ceiling).max(0.0);
             (prices.buy.0 * import - prices.sell.0 * export) * hours / 1000.0
                 + settings.wear_cost.0 * dc.abs() * hours / 1000.0
                 + settings.grid_excess_penalty.0 * excess * hours / 1000.0

@@ -302,9 +302,8 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
             fresh(&venus, snapshot, now)?;
             // The plan's capacity includes the learned one.
             let planned = shared.plan.borrow().as_ref().map(|v| v.battery.capacity.0);
-            let capacity = planned.or_else(|| {
-                planning::capacity_wh(&reading::battery_info(snapshot), &shared.config, None)
-            });
+            let capacity =
+                planned.or_else(|| planning::capacity_wh(&reading::battery_info(snapshot), None));
             let sample = reading::sample(snapshot, now).map_err(|e| e.to_string())?;
             let ess = (
                 snapshot.number(dess_victron::writer::ESS_MODE),

@@ -183,7 +183,7 @@ grid:
   max_export_kw: 17
 battery:
   wear_cost_eur_per_kwh: 0.0     # optional
-  reserve_soc: 0                 # optional: always keep this much for outages
+  max_soc: 100                   # optional: the highest SoC to plan for (the reserve is ESS's minimum SoC on the GX device)
 pv:                              # optional: starting point and sanity check; learned from history anyway
   - { kwp: 5.59, tilt: 33, azimuth: 193 }   # compass degrees, 180 = south (DAO's 0 = south)
   - { kwp: 3.44, tilt: 9,  azimuth: 193 }
@@ -223,7 +223,7 @@ Location (lat/lon/elevation) and time zone come from HA's core config. Where eac
 |---|---|
 | `charge_stages`, `discharge_stages`, `dc_to_bat_*`, `bat_to_dc_*`, `minimum_power` | learned (§12.2) |
 | `capacity` | learned from SoC vs DC energy; the BMS's installed capacity is the prior |
-| `lower_limit`, `optimal_lower_level` | Victron's ESS minimum SoC (read) plus `reserve_soc` |
+| `lower_limit`, `optimal_lower_level` | Victron's ESS "Minimum SoC (unless grid fails)" (read): kept while the grid is up, used in a power cut |
 | `min/max_soc_einde_opt` | gone; the price tail values stored energy (§14.2) |
 | `yield_factor`, `ml_prediction`, `xgboost` | learned PV model (§12.3) |
 | `baseload`, `use_calc_baseload`, `baseload_calc_periode` | learned load model (§12.4) |
@@ -412,7 +412,7 @@ Learned from the ~1 s Victron samples:
 - **Steady-state filter:** keep samples where power is stable within ±3 % for at least 20 s. Leave out transitions and charge-stage changes. Samples are aggregated into `efficiency_bins`.
 - **Loss model per direction:** `loss(P) = a + b·|P| + c·P²`, where `a` is idle loss, `b` covers switching and linear losses, and `c` is resistive. This gives the planner a smooth, physically shaped efficiency curve.
 - **SoC estimator (built):** George's JK-BMS reports whole percent (320 Wh steps) and its coulomb counter drifts between full charges. We keep our own estimate: integrate battery DC power, keep it within the reported value's rounding band, and re-anchor at each BMS step (the midpoint of the two values). The planner's 100 Wh grid and the 1 Hz loop need it. Fractional reports pass through.
-- **Usable capacity (built):** over long one-way stretches (ΔSoC ≥ 30 %, charging stops counting near 100 % where the BMS may resync), `C = ∫P_dc dt / ΔSoC`, the median per direction. The planner uses the geometric mean of the two; their ratio is the battery's own DC round-trip efficiency. Tracking capacity fade comes for free. A configured `capacity_kwh` still wins.
+- **Usable capacity (built):** over long one-way stretches (ΔSoC ≥ 30 %, charging stops counting near 100 % where the BMS may resync), `C = ∫P_dc dt / ΔSoC`, the median per direction. The planner uses the geometric mean of the two; their ratio is the battery's own DC round-trip efficiency. Tracking capacity fade comes for free. Until then, the GX device's capacity (Dynamic ESS setting, or the BMS's Ah); there's no option to override it.
 - **Power limits:** the live DVCC/BMS charge and discharge current limits are read live from the Cerbo. For future slots, the planner uses a learned curve of maximum charge power vs SoC (the taper near full).
 - **Prior until enough data:** a loss curve fitted to George's DAO stage table (71 % at 300 W charge, which is mostly idle loss from three units) and 32 kWh.
 
@@ -540,7 +540,7 @@ sell(t) = (spot + markup_sell + energy_tax) × (1 + vat)   while net metering ap
   3. `grid = load + hp + ev − pv·u + P_ac + idle`
   4. Reject the transition if it breaks the grid import/export limits or the inverter limits.
 - **Stage cost:** `buy·grid⁺ − sell·grid⁻ + wear·|P_dc|·Δt`, plus a small penalty for relay toggles.
-- **Bounds:** per-slot lower bound `E_min(t) = max(ESS minimum SoC, reserve_soc, outage reserve trajectory)`.
+- **Bounds:** per-slot lower bound `E_min(t) = max(ESS minimum SoC, outage reserve trajectory)`, about 5 % inside an expected outage (the reserve is for it); upper bound `max_soc`. Both soft (penalised).
 - **Solve:** a backward pass computes the value function V_t(E), and a forward pass extracts the plan. About 200 slots × 642 states × ~60 transitions ≈ 8M evaluations, which takes milliseconds.
 - **Outputs per slot:** battery AC power, SoC trajectory, grid power, relay state and cost. Also the value function V_t(E) and its slope λ_t = ∂V/∂E, the marginal value of stored energy. The executor uses V every second to decide whether the battery or the grid covers forecast errors (§15.2). λ also drives the explanations and the cheapest-start sensor.
 

@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.18.0
+
+- **The reserve is ESS's own minimum SoC** on the GX device ("Minimum SoC
+  (unless grid fails)"): kept while the grid is up, used by the inverters
+  in a power cut. dess-oxide plans above it; `battery.reserve_soc` is no
+  longer used.
+- **Expected outages use the reserve:** in the window you set on the page,
+  the plan may go down to about 5 %.
+- **`battery.max_soc`:** the highest SoC to plan for (default 100 %).
+- **The battery card** shows the energy above the reserve, instead of the
+  whole capacity as "usable".
+- **No `battery.capacity_kwh` anymore:** the capacity comes from the GX
+  device (its Dynamic ESS capacity setting, or the BMS's installed Ah) and
+  is then learned from long charge and discharge stretches.
+
 ## 0.17.0
 
 - **`net_exporter` is gone:** until net metering ends (1 January 2027)

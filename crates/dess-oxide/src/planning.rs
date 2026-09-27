@@ -227,7 +227,7 @@ pub fn make_plan(
     };
     let info = reading::battery_info(snapshot);
     let learned = learned_capacity(store, now)?.usable_wh();
-    let mut battery = battery_model(&info, config, &learned_losses(store, now)?, learned)?;
+    let mut battery = battery_model(&info, &learned_losses(store, now)?, learned)?;
     if let Some(draw) = learned_bypass_draw(store) {
         battery.bypass_draw = Some(Watts(draw));
     }
@@ -258,14 +258,14 @@ pub fn make_plan(
         heat_pump = loads.iter().map(|l| l.heat_pump).collect();
         Ok(loads.into_iter().map(|l| l.total).collect())
     };
-    let min_soc = min_soc(&info, config);
+    let min_soc = min_soc(&info);
     let forecasts = slot_forecasts(
         now,
         &prices,
         tariff,
         loads,
         inputs.pv,
-        min_soc,
+        (min_soc, OUTAGE_MIN_SOC.min(min_soc)),
         inputs.outage,
     )?;
     let mut forecasts = forecasts;
@@ -449,24 +449,20 @@ pub fn learned_capacity(store: &Store, now: Timestamp) -> anyhow::Result<Capacit
     Ok(dess_core::capacity::fit_capacity(&store.slot_energy(from)?))
 }
 
-/// Usable capacity: configured, else learned, else from the GX device.
-pub fn capacity_wh(info: &BatteryInfo, config: &Config, learned: Option<f64>) -> Option<f64> {
-    config
-        .battery
-        .capacity_kwh
-        .map(|kwh| kwh * 1000.0)
-        .or(learned)
-        .or(info.capacity_wh)
+/// Usable capacity: learned from long stretches, else from the GX device
+/// (its Dynamic ESS capacity setting, or the BMS's installed Ah).
+pub fn capacity_wh(info: &BatteryInfo, learned: Option<f64>) -> Option<f64> {
+    learned.or(info.capacity_wh)
 }
 
 pub fn battery_model(
     info: &BatteryInfo,
-    config: &Config,
     learned: &LearnedLosses,
     learned_capacity: Option<f64>,
 ) -> anyhow::Result<BatteryModel> {
-    let capacity_wh = capacity_wh(info, config, learned_capacity)
-        .context("battery capacity unknown: set battery.capacity_kwh")?;
+    let capacity_wh = capacity_wh(info, learned_capacity).context(
+        "battery capacity unknown: the GX device reports none (set it under Settings → ESS → Dynamic ESS)",
+    )?;
     let units = info.inverter_units;
     let voltage = info.voltage.unwrap_or(51.2);
     // MultiPlus-II 48/5000: 70 A charger and 4 kW continuous per unit.
@@ -510,7 +506,7 @@ pub fn slot_forecasts(
     tariff: &Tariff,
     loads: impl FnOnce(&[Slot]) -> anyhow::Result<Vec<Watts>>,
     pv: &BTreeMap<Slot, Watts>,
-    min_soc: f64,
+    (min_soc, outage_min_soc): (f64, f64),
     outage: Option<(Timestamp, Timestamp)>,
 ) -> anyhow::Result<Vec<SlotForecast>> {
     let first = Slot::containing(now);
@@ -542,7 +538,7 @@ pub fn slot_forecasts(
                     pv
                 },
                 prices: tariff.prices(price.slot, price.spot)?,
-                min_soc_end: min_soc,
+                min_soc_end: if islanded { outage_min_soc } else { min_soc },
                 estimated_price: price.estimated,
                 islanded,
             })
@@ -767,6 +763,7 @@ pub fn planner_settings(config: &Config, forecasts: &[SlotForecast]) -> PlannerS
         wear_cost: EurPerKwh(config.battery.wear_cost_eur_per_kwh),
         pv_switchable: config.victron.pv_relay.is_some(),
         terminal_value: EurPerKwh(0.8 * median_buy.max(0.0)),
+        max_soc: config.battery.max_soc(),
         ..PlannerSettings::default()
     }
 }
@@ -812,12 +809,16 @@ pub fn render(plan: &Plan, forecasts: &[SlotForecast], tz: &TimeZone, rows: usiz
     out
 }
 
-/// The SoC floor for planning: ESS's minimum and the configured reserve.
-pub fn min_soc(info: &BatteryInfo, config: &Config) -> f64 {
-    info.active_min_soc
-        .unwrap_or(10.0)
-        .max(config.battery.reserve_soc)
+/// The SoC floor for planning, the reserve: ESS's own "minimum SoC (unless grid fails)" (or the BatteryLife
+/// active limit). Kept while the grid is up; in a power cut the inverters
+/// use it, as ESS's minimum doesn't apply then.
+pub fn min_soc(info: &BatteryInfo) -> f64 {
+    info.active_min_soc.unwrap_or(10.0)
 }
+
+/// During an expected outage the reserve is there to be used, down to about
+/// where the battery's own low limits would stop the inverters.
+const OUTAGE_MIN_SOC: f64 = 5.0;
 
 /// Where the system is: from the config, or Home Assistant's location.
 pub async fn resolve_location(
