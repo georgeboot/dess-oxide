@@ -62,7 +62,8 @@ cargo run -- run --config dess.toml --data-dir data
 1. Bump `version` in `Cargo.toml` and `dess_oxide/config.yaml`, and add a
    `dess_oxide/CHANGELOG.md` entry.
 2. Commit, tag `v<version>`, and push **only the tag**. The release workflow
-   checks, builds and publishes the images.
+   checks, builds and publishes the images, then creates the GitHub release
+   with the changelog section as notes (`scripts/release-notes.sh`).
 3. Push `main` after the release succeeds.
 
 Home Assistant reads the app definition from `main`, so this order means it

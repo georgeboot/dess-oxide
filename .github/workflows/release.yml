@@ -1,5 +1,6 @@
-# Builds the Home Assistant app image natively per architecture and publishes
-# a multi-arch manifest as ghcr.io/<owner>/dess-oxide:<version>.
+# Builds the Home Assistant app image natively per architecture, publishes
+# a multi-arch manifest as ghcr.io/<owner>/dess-oxide:<version>, and then a
+# GitHub release with the version's changelog section as its notes.
 # Trigger: push a tag `v<version>` matching dess_oxide/config.yaml.
 # Push the tag *before* main: HA reads the app definition from main, so it
 # must never announce a version whose image isn't published yet.
@@ -89,3 +90,17 @@ jobs:
           version="${GITHUB_REF_NAME#v}"
           docker buildx imagetools create -t "$IMAGE:$version" -t "$IMAGE:latest" \
             $(printf "$IMAGE@sha256:%s " *)
+
+  github-release:
+    needs: manifest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Create the GitHub release from the changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          scripts/release-notes.sh "${GITHUB_REF_NAME#v}" > notes.md
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "$GITHUB_REF_NAME" --notes-file notes.md
