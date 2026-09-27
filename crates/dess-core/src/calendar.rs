@@ -3,7 +3,10 @@
 use jiff::civil::{Date, Weekday, date};
 
 /// Easter Sunday (anonymous Gregorian algorithm).
-#[allow(clippy::many_single_char_names, reason = "the names of the published algorithm")]
+#[allow(
+    clippy::many_single_char_names,
+    reason = "the names of the published algorithm"
+)]
 pub fn easter(year: i16) -> Date {
     let y = i32::from(year);
     let a = y % 19;

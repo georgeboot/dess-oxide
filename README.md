@@ -65,6 +65,8 @@ options in `dess_oxide/config.yaml` without a version bump.
 
 ```bash
 cargo fmt --all
-cargo clippy --all-targets -- -D warnings
-cargo test
+scripts/check.sh   # exactly what CI and releases check: fmt, clippy, tests
 ```
+
+The toolchain is pinned in `rust-toolchain.toml`; bump it together with the
+Dockerfile's `rust` image.
