@@ -25,6 +25,9 @@ control back to plain ESS whenever:
 - the grid is down;
 - the app stops.
 
+While in control, the page can override the plan until midnight: hold the
+battery, charge, discharge, or plain self-consumption.
+
 - **Records** the system once a second from the Cerbo GX's local MQTT. It
   stores 15-minute energy totals and steady-state efficiency samples in
   `/data/dess.db`.
@@ -54,7 +57,10 @@ control back to plain ESS whenever:
   - the last 24 hours, comparing what happened with what dess-oxide planned
     and the setpoint your current system actually ran;
   - forecast accuracy over the last week, by how far ahead each forecast
-    was made.
+    was made;
+  - what today, yesterday, the last week and this month cost, and what
+    they would have cost without the battery. While DAO runs the system,
+    that's DAO's result, so it's the yardstick for the handover.
 
 It creates no Home Assistant entities unless you turn on `ha_entities`.
 

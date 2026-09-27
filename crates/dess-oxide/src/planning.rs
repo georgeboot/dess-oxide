@@ -23,7 +23,7 @@ use tracing::{debug, warn};
 
 use crate::config::{CheapestStartConfig, Config, HistoryConfig, LocationConfig, RelayAction};
 use crate::nordpool::NordPool;
-use crate::store::Store;
+use crate::store::{SlotFlows, Store};
 use dess_models::features::HourWeather;
 use dess_models::heatpump::HpModel;
 use dess_models::load::LoadModel;
@@ -331,6 +331,35 @@ pub fn load_history(
     Ok(by_slot.into_iter().collect())
 }
 
+/// What recorded slots cost at the tariff's prices, and what they would have
+/// cost without the battery: the same load and PV, netted per slot.
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+pub struct Money {
+    pub actual: f64,
+    pub without_battery: f64,
+    /// Hours recorded (with prices).
+    pub hours: f64,
+}
+
+pub fn money(flows: &[SlotFlows], spot: &BTreeMap<Slot, EurPerKwh>, tariff: &Tariff) -> Money {
+    let kwh = |wh: WattHours| wh.0 / 1000.0;
+    let mut money = Money::default();
+    for f in flows {
+        let Some(prices) = spot
+            .get(&f.slot)
+            .and_then(|&s| tariff.prices(f.slot, s).ok())
+        else {
+            continue;
+        };
+        let (buy, sell) = (prices.buy.0, prices.sell.0);
+        money.actual += kwh(f.import) * buy - kwh(f.export) * sell;
+        let net = kwh(f.load) - kwh(f.pv);
+        money.without_battery += net.max(0.0) * buy - (-net).max(0.0) * sell;
+        money.hours += f.covered_seconds / 3600.0;
+    }
+    money
+}
+
 /// Losses learned from the last half year of steady-state samples.
 pub fn learned_losses(store: &Store, now: Timestamp) -> anyhow::Result<LearnedLosses> {
     let today = now.as_second().div_euclid(86_400);
@@ -617,6 +646,30 @@ pub fn pv_from_weather(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn money_compares_with_no_battery() {
+        let config: Config = toml::from_str(include_str!("../../../dess.example.toml")).unwrap();
+        let tariff = config.tariff.unwrap().to_tariff().unwrap();
+        let slot = Slot::containing("2026-09-27T20:00:00Z".parse().unwrap());
+        let spot = BTreeMap::from([(slot, EurPerKwh(0.10))]);
+        let buy = tariff.prices(slot, EurPerKwh(0.10)).unwrap().buy.0;
+        // 2 kWh load, 0.5 kWh PV; the battery covered 0.5 kWh of it.
+        let flows = [SlotFlows {
+            slot,
+            covered_seconds: 900.0,
+            import: WattHours(1000.0),
+            export: WattHours(0.0),
+            load: WattHours(2000.0),
+            pv: WattHours(500.0),
+        }];
+        let m = money(&flows, &spot, &tariff);
+        assert!((m.actual - buy).abs() < 1e-9);
+        assert!((m.without_battery - 1.5 * buy).abs() < 1e-9);
+        assert!((m.hours - 0.25).abs() < 1e-9);
+        // No price, no money.
+        assert_eq!(money(&flows, &BTreeMap::new(), &tariff), Money::default());
+    }
 
     #[test]
     fn hourly_history_fills_gaps_but_recorded_slots_win() {

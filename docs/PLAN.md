@@ -785,10 +785,11 @@ These are off by default, enabled with an app option. They're for automations th
 
 **M3: Control.**
 - [x] executor with fail-safe, relay curtailment
-- [ ] manual overrides (hold / charge / discharge)
+- [x] manual overrides (hold / charge / discharge / self-consumption, until midnight)
 - [x] outage mode with the Victron minimum-SoC backstop
 - [x] the "another controller is active" interlock and the two-lock enable
-- [ ] shadow-mode comparison against DAO (forecasts, decisions, cost), then handover at George's site (§18)
+- [x] shadow-mode comparison against DAO: forecast accuracy by lead time, DAO's setpoint next to the plan, and cost against no battery per day, week and month
+- [ ] handover at George's site (§18)
 
 **M4: Brother's site and polish.**
 - [x] EV awareness

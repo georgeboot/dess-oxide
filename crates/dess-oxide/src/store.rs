@@ -9,7 +9,7 @@ use dess_core::efficiency::BinStats;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
 use dess_core::weather::Weather;
-use dess_core::{EurPerKwh, Slot, Watts};
+use dess_core::{EurPerKwh, Slot, WattHours, Watts};
 use rusqlite::{Connection, params};
 
 /// Schema migrations, applied in order; `PRAGMA user_version` counts how many ran.
@@ -152,6 +152,18 @@ pub struct HistorySlot {
     pub planned_grid: Option<Watts>,
     pub forecast_load: Option<Watts>,
     pub forecast_pv: Option<Watts>,
+}
+
+/// Energy totals for one recorded slot.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SlotFlows {
+    pub slot: Slot,
+    pub covered_seconds: f64,
+    pub import: WattHours,
+    pub export: WattHours,
+    /// All loads, the EV included.
+    pub load: WattHours,
+    pub pv: WattHours,
 }
 
 /// Forecast errors for one range of lead times.
@@ -662,6 +674,39 @@ impl Store {
             },
         )?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Energy through the grid meter, and all loads and PV, per recorded
+    /// slot since `from` (at least a minute covered).
+    pub fn flows(&self, from: Slot) -> anyhow::Result<Vec<SlotFlows>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, covered_seconds, grid_import_wh, grid_export_wh,
+                    load_out_wh + load_in_wh, pv_ac_wh + pv_dc_wh
+             FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds > 60
+             ORDER BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                SlotFlows {
+                    slot: from,
+                    covered_seconds: row.get(1)?,
+                    import: WattHours(row.get(2)?),
+                    export: WattHours(row.get(3)?),
+                    load: WattHours(row.get(4)?),
+                    pv: WattHours(row.get(5)?),
+                },
+            ))
+        })?;
+        let mut flows = Vec::new();
+        for row in rows {
+            let (start, mut slot_flows) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                slot_flows.slot = slot;
+                flows.push(slot_flows);
+            }
+        }
+        Ok(flows)
     }
 
     /// Battery DC energy and SoC per fully covered slot since `from`.

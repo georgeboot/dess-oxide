@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::chart::{Chart, Kind, Series};
+use crate::planning::Money;
 use crate::planning::{PlanView, lock};
 use crate::run::Shared;
 use crate::store::{ErrorStats, HistorySlot, LeadAccuracy, StoredModel};
@@ -43,6 +44,7 @@ pub async fn serve(listen: SocketAddr, shared: Arc<Shared>, mut stop: watch::Rec
         .route("/api/plan", get(plan_json))
         .route("/api/control", axum::routing::post(set_control))
         .route("/api/outage", axum::routing::post(set_outage))
+        .route("/api/override", axum::routing::post(set_override))
         .layer(middleware::from_fn(ingress_only))
         .with_state(shared);
     let result = axum::serve(
@@ -91,6 +93,47 @@ async fn set_control(
     }
     info!(on, "control switched on the page");
     // Back to the page, under Home Assistant's ingress path when there is one.
+    let base = headers
+        .get("x-ingress-path")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    axum::response::Redirect::to(&format!("{base}/")).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct OverrideForm {
+    /// An [`Override`](crate::control::Override) key, or "auto".
+    mode: String,
+}
+
+/// Sets a manual override until midnight, or clears it.
+async fn set_override(
+    State(shared): State<Arc<Shared>>,
+    headers: axum::http::HeaderMap,
+    axum::Form(form): axum::Form<OverrideForm>,
+) -> Response {
+    use crate::control::{OVERRIDE_MODE, OVERRIDE_UNTIL, Override};
+    let result = tokio::task::block_in_place(|| {
+        let store = lock(&shared.store);
+        match Override::from_key(&form.mode) {
+            None => store.set_setting(OVERRIDE_UNTIL, ""),
+            Some(mode) => {
+                let midnight = Timestamp::now()
+                    .to_zoned(shared.tz.clone())
+                    .date()
+                    .tomorrow()?
+                    .to_zoned(shared.tz.clone())?
+                    .timestamp();
+                store.set_setting(OVERRIDE_MODE, mode.key())?;
+                store.set_setting(OVERRIDE_UNTIL, &midnight.to_string())
+            }
+        }
+    });
+    if let Err(error) = result {
+        error!(%error, "saving the override");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    info!(mode = form.mode, "manual override set on the page");
     let base = headers
         .get("x-ingress-path")
         .and_then(|v| v.to_str().ok())
@@ -197,7 +240,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
         error!(%error, "reading history");
         Vec::new()
     });
-    let (models, (losses, capacity), accuracy) = tokio::task::block_in_place(|| {
+    let (models, (losses, capacity), (accuracy, money)) = tokio::task::block_in_place(|| {
         let store = lock(&shared.store);
         let models = ["pv", "heat_pump", "load"].map(|name| {
             store.model(name).unwrap_or_else(|error| {
@@ -219,7 +262,11 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             crate::planning::learned_losses(&store, now).ok(),
             crate::planning::learned_capacity(&store, now).ok(),
         );
-        (models, battery, accuracy)
+        let money = money_by_period(&shared, &store, now).unwrap_or_else(|error| {
+            error!(%error, "reading costs");
+            Vec::new()
+        });
+        (models, battery, (accuracy, money))
     });
     Html(
         render(
@@ -228,6 +275,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             &Recorded {
                 history: &history,
                 accuracy: &accuracy,
+                money: &money,
             },
             &models,
             (losses.as_ref(), capacity.as_ref()),
@@ -241,6 +289,42 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
 struct Recorded<'a> {
     history: &'a [HistorySlot],
     accuracy: &'a [LeadAccuracy],
+    money: &'a [(&'static str, Money)],
+}
+
+/// Costs for today, yesterday, the last 7 days and this month.
+fn money_by_period(
+    shared: &Shared,
+    store: &crate::store::Store,
+    now: Timestamp,
+) -> anyhow::Result<Vec<(&'static str, Money)>> {
+    let Some(tariff) = &shared.tariff else {
+        return Ok(Vec::new());
+    };
+    let today = now.to_zoned(shared.tz.clone()).date();
+    let start = |date: jiff::civil::Date| -> anyhow::Result<Timestamp> {
+        Ok(date.to_zoned(shared.tz.clone())?.timestamp())
+    };
+    let periods = [
+        ("today", start(today)?, now),
+        ("yesterday", start(today.yesterday()?)?, start(today)?),
+        ("last 7 days", now - SignedDuration::from_hours(24 * 7), now),
+        ("this month", start(today.first_of_month())?, now),
+    ];
+    let from = Slot::containing(periods.iter().map(|p| p.1).min().unwrap_or(now));
+    let flows = store.flows(from)?;
+    let spot = store.prices(from, Slot::containing(now).next())?;
+    Ok(periods
+        .into_iter()
+        .map(|(label, from, until)| {
+            let in_period: Vec<_> = flows
+                .iter()
+                .filter(|f| f.slot.start() >= from && f.slot.start() < until)
+                .copied()
+                .collect();
+            (label, crate::planning::money(&in_period, &spot, tariff))
+        })
+        .collect())
 }
 
 fn render(
@@ -284,6 +368,7 @@ fn render(
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
                 }
                 (history_section(shared, recorded.history, now))
+                (money_section(recorded.money))
                 (accuracy_section(recorded.accuracy))
                 (models_section(shared, models))
                 @if let Some(view) = view { (battery_section(&view.battery, losses, capacity)) }
@@ -316,8 +401,9 @@ fn render(
 }
 
 fn control_card(shared: &Shared) -> Markup {
-    use crate::control::ControlStatus;
+    use crate::control::{ControlStatus, Override};
     let switched_on = crate::control::switched_on(shared);
+    let active = crate::control::active_override(&lock(&shared.store), Timestamp::now());
     let switch = |on: bool, label: &str| {
         html! {
             form.inline method="post" action="api/control" {
@@ -344,6 +430,22 @@ fn control_card(shared: &Shared) -> Markup {
                     ", battery " (format!("{:+.1} kW", decision.battery_ac.0 / 1000.0))
                     ", PV " (if decision.pv_on { "on" } else { "off" }) ". "
                     (switch(false, "Switch control off"))
+                }
+            }
+            @if shared.config.control {
+                form.inline method="post" action="api/override" {
+                    " Until midnight: "
+                    select name="mode" {
+                        option value="auto" selected[active.is_none()] { "follow the plan" }
+                        @for mode in Override::ALL {
+                            option value=(mode.key()) selected[active == Some(mode)] { (mode.label()) }
+                        }
+                    }
+                    " "
+                    button type="submit" { "Set" }
+                }
+                @if let Some(mode) = active {
+                    " " strong { "Override: " (mode.label()) "." }
                 }
             }
         }
@@ -608,6 +710,47 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
             (load.render(&shared.tz))
             (forecast_errors(history))
         }
+    }
+}
+
+fn money_section(money: &[(&'static str, Money)]) -> Markup {
+    if money.iter().all(|(_, m)| m.hours == 0.0) {
+        return html! {};
+    }
+    html! {
+        section {
+            h2 { "Money" }
+            p.muted {
+                "What was imported at the buy price minus what was exported at the sell price, from the recordings. "
+                "Without the battery: the same load and PV each quarter hour. "
+                "While DAO is in control, this is DAO's result."
+            }
+            div.scroll {
+                table {
+                    thead { tr { th { "" } th { "cost" } th { "without the battery" } th { "saved" } th { "recorded" } } }
+                    tbody {
+                        @for (label, m) in money {
+                            tr {
+                                td { (label) }
+                                td { (eur(m.actual)) }
+                                td { (eur(m.without_battery)) }
+                                td { (eur(m.without_battery - m.actual)) }
+                                td { (format!("{:.1} h", m.hours)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Euros with the sign in front: "−€1.20".
+fn eur(value: f64) -> String {
+    if value < -0.005 {
+        format!("−€{:.2}", -value)
+    } else {
+        format!("€{:.2}", value.max(0.0))
     }
 }
 

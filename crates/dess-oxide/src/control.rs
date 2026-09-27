@@ -41,6 +41,90 @@ const MAX_PLAN_AGE: SignedDuration = SignedDuration::from_mins(20);
 /// After another writer touches the setpoint, stay away this long.
 const FOREIGN_QUIET: SignedDuration = SignedDuration::from_mins(5);
 
+/// A manual override from the page. It lasts until midnight.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Override {
+    /// Leave the battery alone; the grid covers everything.
+    Hold,
+    /// Charge at full power.
+    Charge,
+    /// Discharge at full power, exporting what the house doesn't use.
+    Discharge,
+    /// Cover the house from the battery and store surplus PV, like plain ESS.
+    SelfConsumption,
+}
+
+pub const OVERRIDE_MODE: &str = "override_mode";
+pub const OVERRIDE_UNTIL: &str = "override_until";
+
+impl Override {
+    pub const ALL: [Self; 4] = [
+        Self::Hold,
+        Self::Charge,
+        Self::Discharge,
+        Self::SelfConsumption,
+    ];
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Hold => "hold",
+            Self::Charge => "charge",
+            Self::Discharge => "discharge",
+            Self::SelfConsumption => "self_consumption",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Hold => "hold the battery",
+            Self::Charge => "charge",
+            Self::Discharge => "discharge",
+            Self::SelfConsumption => "self-consumption",
+        }
+    }
+
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|o| o.key() == key)
+    }
+
+    /// The battery AC power it asks for (positive = charging), within the
+    /// battery's range and SoC limits.
+    pub fn battery_power(
+        self,
+        measured: Measured,
+        battery: &dess_core::battery::BatteryModel,
+        min_soc_pct: f64,
+    ) -> f64 {
+        let can_charge = if measured.soc_pct < 100.0 {
+            battery.max_charge_ac.0
+        } else {
+            0.0
+        };
+        let can_discharge = if measured.soc_pct > min_soc_pct {
+            battery.max_discharge_ac.0
+        } else {
+            0.0
+        };
+        match self {
+            Self::Hold => 0.0,
+            Self::Charge => can_charge,
+            Self::Discharge => -can_discharge,
+            Self::SelfConsumption => {
+                (measured.pv.0 - measured.load.0).clamp(-can_discharge, can_charge)
+            }
+        }
+    }
+}
+
+/// The manual override in effect, if any.
+pub fn active_override(store: &crate::store::Store, now: Timestamp) -> Option<Override> {
+    let until: Timestamp = store.setting(OVERRIDE_UNTIL).ok()??.parse().ok()?;
+    if now >= until {
+        return None;
+    }
+    Override::from_key(&store.setting(OVERRIDE_MODE).ok()??)
+}
+
 /// What the page shows about control.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum ControlStatus {
@@ -236,6 +320,11 @@ fn evaluate(
         measured,
     )
     .ok_or("the plan doesn't cover now")?;
+    if let Some(mode) = active_override(&lock(&shared.store), now) {
+        let battery_ac = mode.battery_power(measured, &view.battery, view.min_soc);
+        decision.battery_ac = Watts(battery_ac);
+        decision.setpoint = Watts(measured.load.0 - measured.pv.0 + battery_ac);
+    }
     let limit = |w: f64| w.clamp(-view.settings.max_export.0, view.settings.max_import.0);
     decision.setpoint = Watts(limit(decision.setpoint.0));
     Ok(decision)
@@ -372,6 +461,32 @@ mod tests {
             "not above ESS's own minimum"
         );
         assert_eq!(backstop_target(None, Some(60.0), at(-1), 50.0, 5.0), None);
+    }
+
+    #[test]
+    fn overrides_stay_within_the_battery() {
+        let battery = dess_core::battery::BatteryModel::multiplus_ii_prior(
+            dess_core::WattHours(10_000.0),
+            3,
+            Watts(9000.0),
+            Watts(12_000.0),
+        );
+        let measured = |soc_pct| Measured {
+            load: Watts(1500.0),
+            pv: Watts(500.0),
+            soc_pct,
+        };
+        let power = |mode: Override, soc| mode.battery_power(measured(soc), &battery, 20.0);
+        assert_eq!(power(Override::Hold, 50.0), 0.0);
+        assert!(power(Override::Charge, 50.0) > 0.0);
+        assert_eq!(power(Override::Charge, 100.0), 0.0);
+        assert!(power(Override::Discharge, 50.0) < 0.0);
+        assert_eq!(power(Override::Discharge, 20.0), 0.0);
+        assert_eq!(power(Override::SelfConsumption, 50.0), -1000.0);
+        assert_eq!(power(Override::SelfConsumption, 15.0), 0.0);
+        for mode in Override::ALL {
+            assert_eq!(Override::from_key(mode.key()), Some(mode));
+        }
     }
 
     #[test]

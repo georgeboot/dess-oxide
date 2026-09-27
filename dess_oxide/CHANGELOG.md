@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.9.0
+
+- **Money:** what today, yesterday, the last 7 days and this month cost,
+  and what they would have cost without the battery. While DAO is in
+  control, that's DAO's result: compare it with dess-oxide's after the
+  handover.
+- **Manual override** (with control on): hold the battery, charge,
+  discharge or plain self-consumption, until midnight.
+
 ## 0.8.0
 
 - **Forecast accuracy by lead time:** the page compares the last week's
