@@ -26,6 +26,7 @@ use dess_core::soc::SocEstimator;
 use dess_core::tariff::Tariff;
 use dess_core::weather::Weather;
 use dess_models::heatpump::HpModel;
+use dess_models::hot_water::HotWaterModel;
 use dess_models::load::LoadModel;
 use dess_models::pv::PvModel;
 use dess_victron::probe::{ProbeReport, Severity};
@@ -65,6 +66,8 @@ pub struct Shared {
     /// The learned heat pump and base-load models, when they beat their baselines.
     pub hp_model: watch::Sender<Option<Arc<HpModel>>>,
     pub load_model: watch::Sender<Option<Arc<LoadModel>>>,
+    /// Hot water, when OpenAmber's mode history is long enough.
+    pub hot_water_model: watch::Sender<Option<Arc<HotWaterModel>>>,
     pub status: Mutex<Status>,
     pub control: Mutex<crate::control::ControlStatus>,
     /// Bumped to make the planner run now (e.g. after an outage change).
@@ -75,6 +78,8 @@ pub struct Shared {
     pub soc: Mutex<Option<(Timestamp, f64)>>,
     /// The last week, replayed with dess-oxide's policy (made nightly).
     pub comparison: Mutex<Option<crate::comparison::Comparison>>,
+    /// When OpenAmber runs its next legionella cycle.
+    pub next_legionella: Mutex<Option<Timestamp>>,
 }
 
 /// What the page shows about the service itself.
@@ -178,12 +183,14 @@ impl Shared {
             pv_model: watch::Sender::new(None),
             hp_model: watch::Sender::new(None),
             load_model: watch::Sender::new(None),
+            hot_water_model: watch::Sender::new(None),
             status: Mutex::new(Status::default()),
             control: Mutex::new(crate::control::ControlStatus::default()),
             replan_now: watch::Sender::new(0),
             cheapest_start: watch::Sender::new(None),
             soc: Mutex::new(None),
             comparison: Mutex::new(None),
+            next_legionella: Mutex::new(None),
         })
     }
 }
@@ -215,6 +222,11 @@ fn spawn_tasks(
         stopped.clone(),
     )));
     tasks.push(tokio::spawn(fetch_weather(
+        Arc::clone(shared),
+        client.clone(),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(crate::openamber::run(
         Arc::clone(shared),
         client.clone(),
         stopped.clone(),
@@ -396,6 +408,9 @@ async fn train(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     if let Some(model) = stored.load {
         shared.load_model.send_replace(Some(Arc::new(model)));
     }
+    if let Some(model) = stored.hot_water {
+        shared.hot_water_model.send_replace(Some(Arc::new(model)));
+    }
     let mut wait = Duration::from_secs(10 * 60);
     loop {
         tokio::select! {
@@ -489,10 +504,15 @@ async fn train_house(shared: &Arc<Shared>) {
     let for_fit = Arc::clone(shared);
     let result = tokio::task::spawn_blocking(move || {
         let store = lock(&for_fit.store);
-        crate::training::train_house(&store, &for_fit.config, &for_fit.tz, now)
+        let battery = for_fit.plan.borrow().as_ref().map(|v| v.battery.clone());
+        crate::training::train_house(&store, &for_fit.config, battery.as_ref(), &for_fit.tz, now)
     })
     .await;
-    let (heat_pump, load) = match result {
+    let crate::training::HouseFits {
+        heat_pump,
+        load,
+        hot_water,
+    } = match result {
         Ok(Ok(fits)) => fits,
         Ok(Err(error)) => return warn!("training the house models: {error:#}"),
         Err(error) => return error!(%error, "house training panicked"),
@@ -523,6 +543,27 @@ async fn train_house(shared: &Arc<Shared>) {
         model: fit.model,
     });
     publish_fit(&store, now, "load", "base load", load, &shared.load_model);
+    if let Some(model) = hot_water {
+        info!(
+            days = model.days,
+            base_kwh = format!("{:.2}", model.base_kwh),
+            per_degree_kwh = format!("{:.3}", model.per_degree_kwh),
+            legionella_kwh = format!("{:.2}", model.legionella_kwh),
+            "trained the hot water model"
+        );
+        let metrics = serde_json::json!({ "days": model.days, "daily_mae_kwh": model.daily_mae });
+        let saved = store.save_model(
+            "hot_water",
+            now,
+            &crate::training::hot_water_model_json(&model),
+            &metrics,
+            true,
+        );
+        if let Err(error) = saved {
+            error!(%error, "storing the hot water model");
+        }
+        shared.hot_water_model.send_replace(Some(Arc::new(model)));
+    }
 }
 
 /// A fitted model with a baseline to beat.
@@ -653,6 +694,7 @@ async fn plan_loop(
     let mut model = shared.pv_model.subscribe();
     let mut hp_model = shared.hp_model.subscribe();
     let mut load_model = shared.load_model.subscribe();
+    let mut hot_water_model = shared.hot_water_model.subscribe();
     let mut replan_now = shared.replan_now.subscribe();
     loop {
         replan(&venus, &shared);
@@ -665,6 +707,7 @@ async fn plan_loop(
             _ = model.changed() => true,
             _ = hp_model.changed() => true,
             _ = load_model.changed() => true,
+            _ = hot_water_model.changed() => true,
             _ = replan_now.changed() => true,
             () = stopped(&mut stop) => return,
         };
@@ -680,6 +723,7 @@ async fn plan_loop(
             model.mark_unchanged();
             hp_model.mark_unchanged();
             load_model.mark_unchanged();
+            hot_water_model.mark_unchanged();
             replan_now.mark_unchanged();
         }
     }
@@ -690,10 +734,11 @@ fn replan(venus: &Venus, shared: &Shared) {
     let now = Timestamp::now();
     let snapshot = venus.snapshot();
     let weather = shared.weather.borrow().clone();
-    let (pv_model, hp_model, load_model) = (
+    let (pv_model, hp_model, load_model, hot_water_model) = (
         shared.pv_model.borrow().clone(),
         shared.hp_model.borrow().clone(),
         shared.load_model.borrow().clone(),
+        shared.hot_water_model.borrow().clone(),
     );
     let pv = match *shared.location.borrow() {
         Some(location) => {
@@ -708,9 +753,11 @@ fn replan(venus: &Venus, shared: &Shared) {
         models: planning::Models {
             heat_pump: hp_model.as_deref(),
             load: load_model.as_deref(),
+            hot_water: hot_water_model.as_deref(),
         },
         outage,
         soc: shared.soc(now),
+        next_legionella: *shared.next_legionella.lock().expect("lock poisoned"),
     };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)

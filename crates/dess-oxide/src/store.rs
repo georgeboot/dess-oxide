@@ -6,6 +6,7 @@ use std::path::Path;
 use anyhow::Context;
 use dess_core::capacity::SlotEnergy;
 use dess_core::efficiency::BinStats;
+use dess_core::heat_pump_modes::ModeSlot;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
 use dess_core::weather::Weather;
@@ -125,6 +126,17 @@ const MIGRATIONS: &[&str] = &[
     r"
     -- The heat pump's part of load_w, when its model made it.
     ALTER TABLE plans ADD COLUMN hp_w REAL;
+",
+    r"
+    -- The heat pump's metered energy per slot, split by OpenAmber's mode.
+    CREATE TABLE heat_pump_modes (
+        slot_start       INTEGER PRIMARY KEY,
+        covered_seconds  REAL NOT NULL, -- metered
+        labelled_seconds REAL NOT NULL, -- metered with a known mode
+        total_wh         REAL NOT NULL,
+        hot_water_wh     REAL NOT NULL,
+        legionella_wh    REAL NOT NULL  -- part of hot_water_wh
+    ) STRICT;
 ",
 ];
 
@@ -864,6 +876,63 @@ impl Store {
             });
         }
         Ok(plans)
+    }
+
+    /// Stores split heat pump energy, replacing those slots.
+    pub fn save_heat_pump_modes(&mut self, slots: &[ModeSlot]) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO heat_pump_modes VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )?;
+            for s in slots {
+                insert.execute(params![
+                    s.slot.start_unix(),
+                    s.covered_seconds,
+                    s.labelled_seconds,
+                    s.total_wh,
+                    s.hot_water_wh,
+                    s.legionella_wh,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Split heat pump energy per slot since `from`.
+    pub fn heat_pump_modes(&self, from: Slot) -> anyhow::Result<Vec<ModeSlot>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, covered_seconds, labelled_seconds, total_wh, hot_water_wh, legionella_wh
+             FROM heat_pump_modes WHERE slot_start >= ?1 ORDER BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                [
+                    row.get::<_, f64>(1)?,
+                    row.get::<_, f64>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, f64>(5)?,
+                ],
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (start, [covered, labelled, total, hot_water, legionella]) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                out.push(ModeSlot {
+                    slot,
+                    covered_seconds: covered,
+                    labelled_seconds: labelled,
+                    total_wh: total,
+                    hot_water_wh: hot_water,
+                    legionella_wh: legionella,
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// Battery DC energy and SoC per fully covered slot since `from`.

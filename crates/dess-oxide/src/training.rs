@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 
 use dess_core::Slot;
+use dess_core::battery::BatteryModel;
 use dess_core::calendar;
 use dess_core::weather::Weather;
 use dess_models::features::{self, HourWeather};
 use dess_models::heatpump::{self, HpFit, HpHour, HpModel};
+use dess_models::hot_water::{self, HotWaterDay, HotWaterModel};
 use dess_models::load::{self, Dense, LoadFit, LoadHour, LoadModel};
 use dess_models::pv::{self, Array, FitReport, Hour, PvModel, Quarter};
 use jiff::Timestamp;
@@ -142,6 +144,7 @@ pub struct StoredModels {
     pub pv: Option<PvModel>,
     pub heat_pump: Option<HpModel>,
     pub load: Option<LoadModel>,
+    pub hot_water: Option<HotWaterModel>,
 }
 
 impl StoredModels {
@@ -164,6 +167,7 @@ impl StoredModels {
             pv: promoted(store, "pv", pv_model_from_json),
             heat_pump: promoted(store, "heat_pump", hp_model_from_json),
             load: promoted(store, "load", load_model_from_json),
+            hot_water: promoted(store, "hot_water", hot_water_model_from_json),
         }
     }
 
@@ -171,6 +175,7 @@ impl StoredModels {
         crate::planning::Models {
             heat_pump: self.heat_pump.as_ref(),
             load: self.load.as_ref(),
+            hot_water: self.hot_water.as_ref(),
         }
     }
 }
@@ -181,11 +186,50 @@ impl StoredModels {
 pub struct HouseHours {
     pub load: Vec<LoadHour>,
     pub heat_pump: Vec<HpHour>,
+    /// Days with OpenAmber's mode known all day.
+    pub hot_water: Vec<HotWaterDay>,
+}
+
+type HotWaterDays = BTreeMap<jiff::civil::Date, ([f64; 24], f64, usize)>;
+
+/// Hot water per hour (hours with the mode known throughout) and, per day,
+/// hot water by local hour without legionella, legionella, and labelled
+/// slots, from the split heat pump energy.
+fn hot_water_labels(
+    store: &Store,
+    tz: &TimeZone,
+    from: Slot,
+) -> anyhow::Result<(BTreeMap<i64, f64>, HotWaterDays)> {
+    let mut hours: BTreeMap<i64, (f64, u8)> = BTreeMap::new();
+    let mut days: HotWaterDays = BTreeMap::new();
+    for s in store.heat_pump_modes(from)? {
+        if !s.fully_labelled() {
+            continue;
+        }
+        let hour = hours
+            .entry(s.slot.start_unix().div_euclid(3600) * 3600)
+            .or_default();
+        hour.0 += s.hot_water_wh / 1000.0;
+        hour.1 += 1;
+        let local = s.slot.start().to_zoned(tz.clone());
+        let day = days.entry(local.date()).or_insert(([0.0; 24], 0.0, 0));
+        day.0[usize::from(local.hour().unsigned_abs())] +=
+            (s.hot_water_wh - s.legionella_wh) / 1000.0;
+        day.1 += s.legionella_wh / 1000.0;
+        day.2 += 1;
+    }
+    let hours = hours
+        .into_iter()
+        .filter(|(_, (_, slots))| *slots == 4)
+        .map(|(hour, (kwh, _))| (hour, kwh))
+        .collect();
+    Ok((hours, days))
 }
 
 pub fn house_hours(
     store: &Store,
     config: &Config,
+    battery: Option<&BatteryModel>,
     tz: &TimeZone,
     now: Timestamp,
 ) -> anyhow::Result<HouseHours> {
@@ -199,7 +243,7 @@ pub fn house_hours(
     // Total house load per hour, where all four slots are known.
     let mut totals: BTreeMap<i64, (f64, u8)> = BTreeMap::new();
     for (slot, watts) in
-        crate::planning::load_history(store, &config.history, config.ev.on_input, from)?
+        crate::planning::load_history(store, &config.history, config.ev.on_input, battery, from)?
     {
         let entry = totals
             .entry(slot.start_unix().div_euclid(3600) * 3600)
@@ -221,15 +265,25 @@ pub fn house_hours(
         None => BTreeMap::new(),
     };
 
+    let (hot_water_hours, hot_water_days) = match config.openamber() {
+        Some(_) => hot_water_labels(store, tz, from)?,
+        None => Default::default(),
+    };
+    let mut day_temperatures: BTreeMap<jiff::civil::Date, (f64, u32)> = BTreeMap::new();
+
     let mut out = HouseHours::default();
     for w in weather {
         let local = Timestamp::from_second(w.hour)?.to_zoned(tz.clone());
         let local_hour = local.hour().unsigned_abs();
+        let day = day_temperatures.entry(local.date()).or_default();
+        day.0 += w.temperature;
+        day.1 += 1;
         if let Some(&kwh) = heat_pump.get(&w.hour) {
             out.heat_pump.push(HpHour {
                 weather: w,
                 local_hour,
                 energy_kwh: kwh,
+                hot_water_kwh: hot_water_hours.get(&w.hour).copied(),
             });
         }
         let Some(&(total, 4)) = totals.get(&w.hour) else {
@@ -252,6 +306,20 @@ pub fn house_hours(
             });
         }
     }
+    // Days labelled nearly throughout (a few slots of gap are fine).
+    out.hot_water = hot_water_days
+        .into_iter()
+        .filter(|(_, (_, _, slots))| *slots >= 88)
+        .filter_map(|(date, (by_hour, legionella, _))| {
+            let (sum, n) = day_temperatures.get(&date)?;
+            (*n >= 20).then(|| HotWaterDay {
+                date,
+                mean_temperature: sum / f64::from(*n),
+                by_hour,
+                legionella_kwh: legionella,
+            })
+        })
+        .collect();
     Ok(out)
 }
 
@@ -259,14 +327,54 @@ pub fn house_hours(
 pub fn train_house(
     store: &Store,
     config: &Config,
+    battery: Option<&BatteryModel>,
     tz: &TimeZone,
     now: Timestamp,
-) -> anyhow::Result<(Option<HpFit>, Option<LoadFit>)> {
-    let hours = house_hours(store, config, tz, now)?;
+) -> anyhow::Result<HouseFits> {
+    let hours = house_hours(store, config, battery, tz, now)?;
     let heat_pump =
         (hours.heat_pump.len() >= MIN_HOURS).then(|| heatpump::fit(&hours.heat_pump, 1500));
     let load = (hours.load.len() >= MIN_HOURS).then(|| load::fit(&hours.load, 1500));
-    Ok((heat_pump, load))
+    let hot_water = hot_water::fit(&hours.hot_water);
+    Ok(HouseFits {
+        heat_pump,
+        load,
+        hot_water,
+    })
+}
+
+pub struct HouseFits {
+    pub heat_pump: Option<HpFit>,
+    pub load: Option<LoadFit>,
+    /// With OpenAmber and a week of its days.
+    pub hot_water: Option<HotWaterModel>,
+}
+
+pub fn hot_water_model_json(m: &HotWaterModel) -> serde_json::Value {
+    json!({
+        "base_kwh": m.base_kwh,
+        "per_degree_kwh": m.per_degree_kwh,
+        "profile": m.profile,
+        "legionella_kwh": m.legionella_kwh,
+        "days": m.days,
+        "daily_mae": m.daily_mae,
+    })
+}
+
+pub fn hot_water_model_from_json(v: &serde_json::Value) -> Option<HotWaterModel> {
+    let profile: Vec<f64> = v["profile"]
+        .as_array()?
+        .iter()
+        .map(serde_json::Value::as_f64)
+        .collect::<Option<_>>()?;
+    Some(HotWaterModel {
+        base_kwh: v["base_kwh"].as_f64()?,
+        per_degree_kwh: v["per_degree_kwh"].as_f64()?,
+        profile: profile.try_into().ok()?,
+        legionella_kwh: v["legionella_kwh"].as_f64()?,
+        days: usize::try_from(v["days"].as_u64()?).ok()?,
+        daily_mae: v["daily_mae"].as_f64()?,
+    })
 }
 
 /// The weather features the house models need for a given hour.
@@ -291,6 +399,7 @@ pub fn hp_model_json(m: &HpModel) -> serde_json::Value {
         "frost_factor": m.frost_factor,
         "coil_delta_k": m.coil_delta_k,
         "hot_water_kwh": m.hot_water_kwh,
+        "standby_kwh": m.standby_kwh,
     })
 }
 
@@ -314,6 +423,8 @@ pub fn hp_model_from_json(v: &serde_json::Value) -> Option<HpModel> {
         frost_factor: number("frost_factor")?,
         coil_delta_k: number("coil_delta_k")?,
         hot_water_kwh: array("hot_water_kwh")?.try_into().ok()?,
+        // Models from before 0.13 had standby in the hour-of-day term.
+        standby_kwh: number("standby_kwh").unwrap_or(0.0),
     })
 }
 

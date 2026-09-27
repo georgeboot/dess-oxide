@@ -5,8 +5,14 @@
 //! heat   = softplus(UA · (T_bal − T_eff) · (1 + w · wind) − g · GHI_smoothed)
 //! COP    = 1 + softplus(c₀ + c₁ · T_out)                colder is less efficient
 //! frost  = relu(e_air − e_ice(T_out − ΔT_coil)) · [coil below 0 °C]
-//! use    = heat / COP · (1 + k · frost) + hot_water[hour of day]
+//! use    = heat / COP · (1 + k · frost) + standby + hot_water[hour of day]
 //! ```
+//!
+//! Where OpenAmber's mode says how much of an hour was hot water, that part
+//! is taken out of the target and the hour-of-day hot water term is left
+//! out: heating is then learned from heating alone, and hot water gets its
+//! own model ([`crate::hot_water`]). The hour-of-day term remains for hours
+//! without that (before OpenAmber), and for sites without it.
 //!
 //! The frost term is why a humid 0 °C day can cost more than a clear −8 °C
 //! one: the outdoor coil runs a few degrees below the air, and ice builds
@@ -32,6 +38,16 @@ pub struct HpHour {
     /// 0–23, local time.
     pub local_hour: u8,
     pub energy_kwh: f64,
+    /// Of that, hot water, when the mode is known for the whole hour.
+    pub hot_water_kwh: Option<f64>,
+}
+
+impl HpHour {
+    /// What the model learns: heating (and standby) where the hot water is
+    /// known, else everything.
+    fn target(&self) -> f64 {
+        self.energy_kwh - self.hot_water_kwh.unwrap_or(0.0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -52,8 +68,10 @@ pub struct HpModel {
     pub frost_factor: f64,
     /// How much colder than the air the outdoor coil runs, K.
     pub coil_delta_k: f64,
-    /// Hot water and standby, kWh per local hour of the day.
+    /// Hot water by hour of the day, for hours without OpenAmber's mode.
     pub hot_water_kwh: [f64; 24],
+    /// The heat pump's own draw, kWh per hour.
+    pub standby_kwh: f64,
 }
 
 /// Saturation vapour pressure over water, hPa (Magnus).
@@ -83,9 +101,9 @@ impl HpModel {
         softplus(self.ua_kw_per_k * (self.balance_c - celsius), 2.0) / self.cop(celsius)
     }
 
-    /// Hot water and standby over a day, kWh.
+    /// Hot water by hour of the day, and standby, over a day, kWh.
     pub fn hot_water_daily_kwh(&self) -> f64 {
-        self.hot_water_kwh.iter().sum()
+        self.hot_water_kwh.iter().sum::<f64>() + 24.0 * self.standby_kwh
     }
 
     fn cop(&self, celsius: f64) -> f64 {
@@ -105,11 +123,18 @@ impl HpModel {
             frost_factor: 0.02,
             coil_delta_k: 6.0,
             hot_water_kwh: [0.1; 24],
+            standby_kwh: 0.03,
         }
     }
 
-    /// Electricity use in an hour, kWh.
+    /// Electricity use in an hour, kWh, with hot water by hour of the day.
     pub fn hour_kwh(&self, w: &HourWeather, local_hour: u8) -> f64 {
+        self.heating_kwh(w) + self.hot_water_kwh[usize::from(local_hour % 24)]
+    }
+
+    /// Electricity for heating and standby in an hour, kWh: everything but
+    /// hot water, for when hot water is forecast separately.
+    pub fn heating_kwh(&self, w: &HourWeather) -> f64 {
         let effective: f64 = self
             .lag_weights
             .iter()
@@ -125,8 +150,15 @@ impl HpModel {
         let coil = w.temperature - self.coil_delta_k;
         let air = w.humidity / 100.0 * vapour_pressure_water(w.temperature);
         let frost = (air - vapour_pressure_ice(coil)).max(0.0) * sigmoid(-2.0 * coil);
-        heat / cop * (1.0 + self.frost_factor * frost)
-            + self.hot_water_kwh[usize::from(local_hour % 24)]
+        heat / cop * (1.0 + self.frost_factor * frost) + self.standby_kwh
+    }
+
+    fn predict(&self, h: &HpHour) -> f64 {
+        if h.hot_water_kwh.is_some() {
+            self.heating_kwh(&h.weather)
+        } else {
+            self.hour_kwh(&h.weather, h.local_hour)
+        }
     }
 }
 
@@ -172,7 +204,7 @@ pub fn fit(hours: &[HpHour], iterations: usize) -> HpFit {
     let validation_mae = mean(
         validation
             .iter()
-            .map(|h| (model.hour_kwh(&h.weather, h.local_hour) - h.energy_kwh).abs()),
+            .map(|h| (model.predict(h) - h.target()).abs()),
     );
     HpFit {
         baseline_mae: seasonal_naive_mae(&usable, &validation),
@@ -191,13 +223,13 @@ fn mean(values: impl Iterator<Item = f64>) -> f64 {
 /// seven days.
 fn seasonal_naive_mae(all: &[&HpHour], validation: &[&HpHour]) -> f64 {
     let by_hour: std::collections::HashMap<i64, f64> =
-        all.iter().map(|h| (h.weather.hour, h.energy_kwh)).collect();
+        all.iter().map(|h| (h.weather.hour, h.target())).collect();
     mean(validation.iter().filter_map(|h| {
         let past: Vec<f64> = (1..=7)
             .filter_map(|d| by_hour.get(&(h.weather.hour - d * 86_400)).copied())
             .collect();
         (!past.is_empty())
-            .then(|| (past.iter().sum::<f64>() / past.len() as f64 - h.energy_kwh).abs())
+            .then(|| (past.iter().sum::<f64>() / past.len() as f64 - h.target()).abs())
     }))
 }
 
@@ -212,6 +244,7 @@ struct Net<B: Backend> {
     raw_frost: Param<Tensor<B, 1>>,
     raw_coil: Param<Tensor<B, 1>>,
     raw_hot_water: Param<Tensor<B, 1>>,
+    raw_standby: Param<Tensor<B, 1>>,
 }
 
 struct Batch<B: Backend> {
@@ -221,6 +254,8 @@ struct Batch<B: Backend> {
     smoothed_ghi: Tensor<B, 1>,
     vapour_air: Tensor<B, 1>,
     hour_one_hot: Tensor<B, 2>,
+    /// 1 where the hour's hot water isn't known (the hour-of-day term applies).
+    unlabelled: Tensor<B, 1>,
     target: Tensor<B, 1>,
 }
 
@@ -248,7 +283,8 @@ impl<B: Backend> Batch<B> {
                 h.weather.humidity / 100.0 * vapour_pressure_water(h.weather.temperature)
             }),
             hour_one_hot: Tensor::from_data(TensorData::new(one_hot, [n, 24]), device),
-            target: column(&|h| h.energy_kwh),
+            unlabelled: column(&|h| if h.hot_water_kwh.is_some() { 0.0 } else { 1.0 }),
+            target: column(&|h| h.target()),
         }
     }
 }
@@ -278,6 +314,7 @@ impl<B: Backend> Net<B> {
                     .map(|&k| inverse_softplus(k))
                     .collect(),
             ),
+            raw_standby: param(vec![inverse_softplus(m.standby_kwh)]),
         }
     }
 
@@ -310,7 +347,8 @@ impl<B: Backend> Net<B> {
             .clone()
             .matmul(activation::softplus(self.raw_hot_water.val(), 1.0).reshape([24, 1]))
             .reshape([n]);
-        heat / cop * (frost_factor * frost + 1.0) + hot_water
+        let standby = activation::softplus(scalar(&self.raw_standby), 1.0);
+        heat / cop * (frost_factor * frost + 1.0) + standby + hot_water * x.unlabelled.clone()
     }
 
     fn to_model(&self) -> HpModel {
@@ -331,6 +369,7 @@ impl<B: Backend> Net<B> {
             frost_factor: one(activation::softplus(self.raw_frost.val(), 1.0)),
             coil_delta_k: one(activation::softplus(self.raw_coil.val(), 1.0)),
             hot_water_kwh: std::array::from_fn(|i| hot_water[i]),
+            standby_kwh: one(activation::softplus(self.raw_standby.val(), 1.0)),
         }
     }
 }
@@ -384,7 +423,8 @@ mod tests {
             cop_c1: 0.08,
             frost_factor: 0.08,
             coil_delta_k: 5.0,
-            hot_water_kwh: std::array::from_fn(|h| if h == 13 { 1.5 } else { 0.05 }),
+            hot_water_kwh: std::array::from_fn(|h| if h == 13 { 1.5 } else { 0.0 }),
+            standby_kwh: 0.05,
         }
     }
 
@@ -438,6 +478,7 @@ mod tests {
                     weather: w,
                     local_hour,
                     energy_kwh,
+                    hot_water_kwh: None,
                 }
             })
             .collect();
@@ -447,6 +488,55 @@ mod tests {
         assert!(
             fit.model.hot_water_kwh[13] > 1.0,
             "finds the hot water run at 13:00"
+        );
+    }
+
+    #[test]
+    fn heating_is_learned_without_the_known_hot_water() {
+        // The second half of the winter has OpenAmber: its hot water is known
+        // and differs from the hour-of-day pattern (more of it, at 15:00).
+        let truth = truth();
+        let all = winter();
+        let half = all.len() / 2;
+        let hours: Vec<HpHour> = all
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| {
+                let local_hour = ((w.hour / 3600) % 24) as u8;
+                if i < half {
+                    let energy_kwh = truth.hour_kwh(&w, local_hour);
+                    HpHour {
+                        weather: w,
+                        local_hour,
+                        energy_kwh,
+                        hot_water_kwh: None,
+                    }
+                } else {
+                    let hot_water = if local_hour == 15 { 2.5 } else { 0.0 };
+                    let energy_kwh = truth.heating_kwh(&w) + hot_water;
+                    HpHour {
+                        weather: w,
+                        local_hour,
+                        energy_kwh,
+                        hot_water_kwh: Some(hot_water),
+                    }
+                }
+            })
+            .collect();
+        let fit = fit(&hours, 1500);
+        assert!(fit.validation_mae < 0.1, "{fit:?}");
+        // Heating alone matches, and the old 13:00 run stays in the old term.
+        for celsius in [-5.0, 0.0, 5.0] {
+            let (learned, real) = (fit.model.heating_kw(celsius), truth.heating_kw(celsius));
+            assert!(
+                (learned - real).abs() < 0.15 * real + 0.05,
+                "{celsius} °C: {learned} vs {real}"
+            );
+        }
+        assert!(
+            fit.model.hot_water_kwh[15] < 0.3,
+            "{:?}",
+            fit.model.hot_water_kwh
         );
     }
 }

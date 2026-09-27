@@ -26,6 +26,7 @@ use crate::nordpool::NordPool;
 use crate::store::{SlotFlows, Store};
 use dess_models::features::HourWeather;
 use dess_models::heatpump::HpModel;
+use dess_models::hot_water::HotWaterModel;
 use dess_models::load::LoadModel;
 
 /// Days of price history used to estimate prices beyond the published ones.
@@ -187,6 +188,8 @@ pub struct PlanView {
 pub struct Models<'a> {
     pub heat_pump: Option<&'a HpModel>,
     pub load: Option<&'a LoadModel>,
+    /// Hot water, forecast apart from heating (OpenAmber).
+    pub hot_water: Option<&'a HotWaterModel>,
 }
 
 /// What the plan is made from, besides the GX snapshot and the store.
@@ -200,6 +203,8 @@ pub struct ForecastInputs<'a> {
     pub outage: Option<(Timestamp, Timestamp)>,
     /// A finer SoC than the BMS reports, if the recorder has one (%).
     pub soc: Option<f64>,
+    /// When OpenAmber's next legionella run is due.
+    pub next_legionella: Option<Timestamp>,
 }
 
 /// During an expected outage, plan for more load and less PV than forecast,
@@ -229,7 +234,13 @@ pub fn make_plan(
         lookback,
         Slot::containing(now + SignedDuration::from_hours(72)),
     )?;
-    let history = load_history(store, &config.history, config.ev.on_input, lookback)?;
+    let history = load_history(
+        store,
+        &config.history,
+        config.ev.on_input,
+        Some(&battery),
+        lookback,
+    )?;
     let mut heat_pump = Vec::new();
     let loads = |slots: &[Slot]| {
         let loads = house_load(
@@ -287,10 +298,15 @@ pub fn make_plan(
 /// Mean house load per slot since `from`, without the EV: recorded slots,
 /// plus hours from Home Assistant's statistics where nothing was recorded
 /// (each hour's mean spread over its four slots).
+///
+/// The battery's part comes from its AC sensors, or from its DC counters
+/// (the BMS's) through `battery`'s loss curves and standby draw; DC wins
+/// when both are set. Without a model, DC counts as AC.
 pub fn load_history(
     store: &Store,
     history: &HistoryConfig,
     ev_on_input: bool,
+    battery: Option<&BatteryModel>,
     from: Slot,
 ) -> anyhow::Result<Vec<(Slot, Watts)>> {
     let mut by_slot: BTreeMap<Slot, Watts> = store
@@ -307,7 +323,18 @@ pub fn load_history(
     let (Some(import), Some(export)) = (entity("grid_import"), entity("grid_export")) else {
         return Ok(by_slot.into_iter().collect());
     };
-    let optional = ["pv", "battery_in", "battery_out", "ev"].map(entity);
+    let dc = entity("battery_dc_in").is_some() && entity("battery_dc_out").is_some();
+    let (battery_in, battery_out) = if dc {
+        ("battery_dc_in", "battery_dc_out")
+    } else {
+        ("battery_in", "battery_out")
+    };
+    // Without the battery's flows the derived load would be wrong whenever
+    // the battery moved: then only dess-oxide's own recordings count.
+    if entity(battery_in).is_none() || entity(battery_out).is_none() {
+        return Ok(by_slot.into_iter().collect());
+    }
+    let optional = ["pv", battery_in, battery_out, "ev"].map(entity);
     let mut entities = vec![import.as_str(), export.as_str()];
     entities.extend(optional.iter().flatten().map(String::as_str));
     for (hour, values) in store.ha_hourly(&entities, from.start())? {
@@ -324,6 +351,10 @@ pub fn load_history(
             continue;
         }
         let [pv, battery_in, battery_out, ev] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
+        let (battery_in, battery_out) = match battery.filter(|_| dc) {
+            Some(model) => ac_from_dc(model, battery_in, battery_out),
+            None => (battery_in, battery_out),
+        };
         let load_kwh = (imported - exported + pv - battery_in + battery_out - ev).max(0.0);
         let Some(first) = Slot::from_start_unix(hour) else {
             continue;
@@ -335,6 +366,18 @@ pub fn load_history(
         }
     }
     Ok(by_slot.into_iter().collect())
+}
+
+/// The AC energy (kWh) into and out of the inverters in an hour that moved
+/// `dc_in` and `dc_out` kWh at the battery, each at a steady power over the
+/// hour. The standby draw is AC in.
+fn ac_from_dc(battery: &BatteryModel, dc_in: f64, dc_out: f64) -> (f64, f64) {
+    let into = battery
+        .charge_loss
+        .ac_for_charging(dc_in * 1000.0)
+        .map_or(dc_in, |w| w / 1000.0);
+    let out = battery.discharge_loss.ac_from_discharging(dc_out * 1000.0) / 1000.0;
+    (into + battery.standby.0 / 1000.0, out)
 }
 
 /// What recorded slots cost at the tariff's prices, and what they would have
@@ -568,10 +611,27 @@ fn house_load(
             .into_iter()
             .map(|h| (h.hour, h))
             .collect();
+    let hot_water = match inputs
+        .models
+        .hot_water
+        .filter(|_| heat_pump_model.is_some())
+    {
+        Some(model) => Some(hot_water_forecast(
+            model,
+            slots,
+            &hours,
+            store,
+            tz,
+            now,
+            inputs.next_legionella,
+        )?),
+        None => None,
+    };
     Ok(slots
         .iter()
         .zip(baseline)
-        .map(|(slot, base_history)| {
+        .enumerate()
+        .map(|(i, (slot, base_history))| {
             let features = hours
                 .get(&(slot.start_unix().div_euclid(3600) * 3600))
                 .and_then(|w| Some((w, crate::training::house_features(w, tz)?)));
@@ -584,13 +644,90 @@ fn house_load(
             let base = load_model.map_or(base_history.0, |m| {
                 m.hour_kwh(w, hour, weekday, holiday) * 1000.0
             });
-            let heat_pump = heat_pump_model.map(|m| Watts(m.hour_kwh(w, hour) * 1000.0));
+            let heat_pump = heat_pump_model.map(|m| match &hot_water {
+                Some(hot_water) => Watts(m.heating_kwh(w) * 1000.0 + hot_water[i]),
+                None => Watts(m.hour_kwh(w, hour) * 1000.0),
+            });
             LoadForecast {
                 total: Watts(base + heat_pump.map_or(0.0, |h| h.0)),
                 heat_pump,
             }
         })
         .collect())
+}
+
+/// Hot water per slot, W: each local day's expected energy (from its mean
+/// temperature) spread over the learned hours of the day. For today, only
+/// what's left after what already ran. Plus the next legionella run, at
+/// its announced time, at about 2 kW.
+fn hot_water_forecast(
+    model: &HotWaterModel,
+    slots: &[Slot],
+    hours: &std::collections::HashMap<i64, HourWeather>,
+    store: &Store,
+    tz: &TimeZone,
+    now: Timestamp,
+    next_legionella: Option<Timestamp>,
+) -> anyhow::Result<Vec<f64>> {
+    let local = |slot: &Slot| slot.start().to_zoned(tz.clone());
+    let mut temperatures: BTreeMap<jiff::civil::Date, (f64, u32)> = BTreeMap::new();
+    for w in hours.values() {
+        let date = Timestamp::from_second(w.hour)?.to_zoned(tz.clone()).date();
+        let entry = temperatures.entry(date).or_default();
+        entry.0 += w.temperature;
+        entry.1 += 1;
+    }
+    let daily = |date: jiff::civil::Date| {
+        let mean = temperatures
+            .get(&date)
+            .map_or(10.0, |(sum, n)| sum / f64::from(*n));
+        model.daily_kwh(mean)
+    };
+    let weight = |slot: &Slot| model.profile[usize::from(local(slot).hour().unsigned_abs())] / 4.0;
+
+    let today = now.to_zoned(tz.clone()).date();
+    let done_today: f64 = store
+        .heat_pump_modes(Slot::containing(today.to_zoned(tz.clone())?.timestamp()))?
+        .iter()
+        .map(|s| (s.hot_water_wh - s.legionella_wh) / 1000.0)
+        .sum();
+    let left_today = (daily(today) - done_today).max(0.0);
+    let today_weight: f64 = slots
+        .iter()
+        .filter(|s| local(s).date() == today)
+        .map(weight)
+        .sum();
+
+    let mut watts: Vec<f64> = slots
+        .iter()
+        .map(|slot| {
+            let date = local(slot).date();
+            let kwh = if date == today {
+                if today_weight > 1e-9 {
+                    left_today * weight(slot) / today_weight
+                } else {
+                    0.0
+                }
+            } else {
+                daily(date) * weight(slot)
+            };
+            kwh * 4000.0
+        })
+        .collect();
+
+    if let Some(start) = next_legionella.filter(|_| model.legionella_kwh > 0.0) {
+        const SLOT_KWH: f64 = 0.5; // about 2 kW
+        let mut left = model.legionella_kwh;
+        for (slot, w) in slots.iter().zip(&mut watts) {
+            if slot.end() <= start || left <= 0.0 {
+                continue;
+            }
+            let kwh = left.min(SLOT_KWH);
+            *w += kwh * 4000.0;
+            left -= kwh;
+        }
+    }
+    Ok(watts)
 }
 
 /// Planner settings from the config. Energy left at the end of the horizon is
@@ -714,6 +851,78 @@ mod tests {
     use super::*;
 
     #[test]
+    fn hot_water_is_what_is_left_today_plus_legionella() {
+        use dess_core::heat_pump_modes::ModeSlot;
+        let mut store = Store::in_memory().unwrap();
+        let tz = TimeZone::UTC;
+        let now: Timestamp = "2026-09-27T12:00:00Z".parse().unwrap();
+        // 2 kWh a day, all of it 11:00–13:00 (half each hour).
+        let mut profile = [0.0; 24];
+        profile[11] = 0.5;
+        profile[12] = 0.5;
+        let model = HotWaterModel {
+            base_kwh: 2.0,
+            per_degree_kwh: 0.0,
+            profile,
+            legionella_kwh: 1.0,
+            days: 10,
+            daily_mae: 0.0,
+        };
+        // 1.5 kWh already ran this morning.
+        let morning = Slot::containing("2026-09-27T11:00:00Z".parse().unwrap());
+        store
+            .save_heat_pump_modes(&[ModeSlot {
+                slot: morning,
+                covered_seconds: 900.0,
+                labelled_seconds: 900.0,
+                total_wh: 1500.0,
+                hot_water_wh: 1500.0,
+                legionella_wh: 0.0,
+            }])
+            .unwrap();
+        let slots: Vec<Slot> =
+            std::iter::successors(Some(Slot::containing(now)), |s| Some(s.next()))
+                .take(4 * 36)
+                .collect();
+        let legionella: Timestamp = "2026-09-28T15:00:00Z".parse().unwrap();
+        let watts = hot_water_forecast(
+            &model,
+            &slots,
+            &std::collections::HashMap::new(),
+            &store,
+            &tz,
+            now,
+            Some(legionella),
+        )
+        .unwrap();
+        let kwh = |from: usize, to: usize| watts[from..to].iter().sum::<f64>() / 4000.0;
+        // Today: the 0.5 kWh left, in 12:00–13:00.
+        assert!((kwh(0, 4) - 0.5).abs() < 1e-9, "{:?}", &watts[..8]);
+        assert!(kwh(4, 48).abs() < 1e-9);
+        // Tomorrow: 2 kWh at 11–13 plus the 1 kWh legionella run from 15:00.
+        let tomorrow = 48; // slots from 00:00 on the 28th
+        assert!((kwh(tomorrow + 44, tomorrow + 52) - 2.0).abs() < 1e-9);
+        assert!((kwh(tomorrow + 60, tomorrow + 62) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn dc_counters_become_ac_with_the_losses() {
+        let battery = BatteryModel::multiplus_ii_prior(
+            WattHours(30_000.0),
+            3,
+            Watts(10_000.0),
+            Watts(12_000.0),
+        );
+        // 3 kWh into the cells took more than 3 kWh of AC; 2 kWh out gave less.
+        let (into, out) = ac_from_dc(&battery, 3.0, 0.0);
+        assert!(into > 3.0 + battery.standby.0 / 1000.0, "{into}");
+        assert_eq!(out, 0.0);
+        let (into, out) = ac_from_dc(&battery, 0.0, 2.0);
+        assert!((into - battery.standby.0 / 1000.0).abs() < 1e-9);
+        assert!(out < 2.0 && out > 1.8, "{out}");
+    }
+
+    #[test]
     fn money_compares_with_no_battery() {
         let config: Config = toml::from_str(include_str!("../../../dess.example.toml")).unwrap();
         let tariff = config.tariff.unwrap().to_tariff().unwrap();
@@ -764,9 +973,10 @@ mod tests {
             battery_out: Some("sensor.bat_out".into()),
             heat_pump: None,
             ev: None,
+            ..HistoryConfig::default()
         };
         let from = Slot::containing("2026-09-26T00:00:00Z".parse().unwrap());
-        let loads = load_history(&store, &history, false, from).unwrap();
+        let loads = load_history(&store, &history, false, None, from).unwrap();
         assert_eq!(loads.len(), 4);
         // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour.
         assert!(loads.iter().all(|(_, w)| (w.0 - 1600.0).abs() < 1e-9));
@@ -780,7 +990,9 @@ mod tests {
             )])
             .unwrap();
         assert_eq!(
-            load_history(&store, &history, false, from).unwrap().len(),
+            load_history(&store, &history, false, None, from)
+                .unwrap()
+                .len(),
             4
         );
     }

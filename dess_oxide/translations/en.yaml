@@ -29,3 +29,10 @@ configuration:
       the Victron's loads on input are the EV. It's then left out of the
       house load forecast (set history.ev to leave it out of the imported
       history too).
+  openamber_device:
+    name: OpenAmber device
+    description: >-
+      The ESPHome device name of an OpenAmber heat pump controller (its
+      entities start with it, e.g. "openamber"). dess-oxide then splits the
+      heat pump's energy into heating and hot water, and forecasts both.
+      Needs history.heat_pump. Leave empty without OpenAmber.

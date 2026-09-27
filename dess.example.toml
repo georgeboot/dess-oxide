@@ -49,8 +49,8 @@ vat_on_export = false
 grid_import = "sensor.p1_meter_energy_import"
 grid_export = "sensor.p1_meter_energy_export"
 pv = "sensor.pv_omvormer_energie"
-battery_in = "sensor.accu_ac_laadenergie"
-battery_out = "sensor.accu_ac_ontlaadenergie"
+battery_dc_in = "sensor.batterij_energie_in"     # the BMS's DC counters, turned into AC
+battery_dc_out = "sensor.batterij_energie_uit"   # with the learned losses
 heat_pump = "sensor.kwh_meter_warmtepomp_energy_import"
 
 # Standalone only (the app uses the Supervisor): where Home Assistant is.

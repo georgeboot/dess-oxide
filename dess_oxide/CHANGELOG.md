@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.13.0
+
+- **Battery history from the BMS's DC counters:** set `history.battery_dc_in`
+  and `battery_dc_out` (e.g. the BMS's kWh counters) instead of AC sensors.
+  Each hour's DC energy is turned into AC with the losses dess-oxide learned
+  from the inverters, plus their standby draw. They win over the AC pair.
+- **Fix:** without battery sensors, the house load from Home Assistant's
+  history left the battery out. Now only dess-oxide's own recordings are
+  used then.
+- **OpenAmber:** set `openamber_device` (e.g. `openamber`) to split the heat
+  pump's energy into heating, hot water and legionella runs, from
+  OpenAmber's control loop state and the meter's history. Heating is then
+  learned from heating alone, and hot water gets its own forecast: energy
+  per day against the outdoor temperature, at the hours it usually runs,
+  and legionella runs at the announced time. The page shows the split per
+  day. The split history starts with what Home Assistant's recorder still
+  has (10 days by default) and grows from there.
+- The heat pump model has a separate standby draw.
+
 ## 0.12.0
 
 - **Fix: the heat pump model is used on its own.** Before, a heat pump model

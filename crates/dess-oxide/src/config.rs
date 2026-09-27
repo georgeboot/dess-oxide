@@ -52,6 +52,22 @@ pub struct Config {
     pub ha_entities: bool,
     #[serde(default)]
     pub ev: EvConfig,
+    /// OpenAmber's ESPHome device name (its entity ids start with it), to
+    /// split the heat pump's energy into heating and hot water. Needs
+    /// `history.heat_pump`. Empty: no OpenAmber.
+    #[serde(default)]
+    pub openamber_device: String,
+}
+
+/// The OpenAmber entities dess-oxide reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenAmberEntities {
+    /// "Control loop state MAIN": "DHW" while heating water.
+    pub mode: String,
+    /// "Legionellacyclus actief".
+    pub legionella: String,
+    /// "Volgende legionellapreventie".
+    pub next_legionella: String,
 }
 
 /// An EV charger (PLAN.md §12.6). It isn't forecast: it's left out of the
@@ -103,6 +119,11 @@ pub struct HistoryConfig {
     pub battery_in: Option<String>,
     /// AC energy out of the battery system.
     pub battery_out: Option<String>,
+    /// DC energy into the battery, e.g. the BMS's counter. With
+    /// `battery_dc_out`, used instead of the AC pair, converted with the
+    /// learned losses.
+    pub battery_dc_in: Option<String>,
+    pub battery_dc_out: Option<String>,
     pub heat_pump: Option<String>,
     /// The EV charger, left out of the house load.
     pub ev: Option<String>,
@@ -127,6 +148,8 @@ impl HistoryConfig {
             ("pv", &self.pv),
             ("battery_in", &self.battery_in),
             ("battery_out", &self.battery_out),
+            ("battery_dc_in", &self.battery_dc_in),
+            ("battery_dc_out", &self.battery_dc_out),
             ("heat_pump", &self.heat_pump),
             ("ev", &self.ev),
         ]
@@ -276,6 +299,21 @@ fn default_time_zone() -> String {
 }
 
 impl Config {
+    /// OpenAmber's entities, when it's configured with a heat pump meter.
+    pub fn openamber(&self) -> Option<OpenAmberEntities> {
+        let device = self.openamber_device.trim();
+        let metered = self
+            .history
+            .heat_pump
+            .as_deref()
+            .is_some_and(|e| !e.is_empty());
+        (!device.is_empty() && metered).then(|| OpenAmberEntities {
+            mode: format!("sensor.{device}_control_loop_state_main"),
+            legionella: format!("binary_sensor.{device}_legionellacyclus_actief"),
+            next_legionella: format!("datetime.{device}_volgende_legionellapreventie"),
+        })
+    }
+
     /// Whether dess-oxide may write to the GX device at all (`dryrun: false`).
     pub fn writes_allowed(&self) -> bool {
         !self.dryrun

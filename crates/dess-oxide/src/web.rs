@@ -938,16 +938,84 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                             (format!("{:.0}", hp.wind_factor * 100.0)) " % per m/s."
                         }
                         li { "Frost: +" (format!("{:.1}", hp.frost_factor * 100.0)) " % use per hPa of frost potential." }
-                        li { "Hot water and standby: " (format!("{:.1}", hp.hot_water_daily_kwh())) " kWh a day, most around " (hot_water_peak(&hp.hot_water_kwh)) ". Learned from the total by time of day: nothing tells it which hours were hot water." }
+                        li { "Standby: " (format!("{:.0} W", hp.standby_kwh * 1000.0)) "." }
+                        @if shared.config.openamber().is_none() {
+                            li { "Hot water: " (format!("{:.1}", hp.hot_water_kwh.iter().sum::<f64>())) " kWh a day, most around " (hot_water_peak(&hp.hot_water_kwh)) ". Learned from the total by time of day: nothing tells it which hours were hot water." }
+                        }
                     }
                     p.muted { "All of this is electricity: without a heat meter (such as a flow meter on OpenAmber) the heat output and the COP aren't known." }
                 }
             }
+            (hot_water_section(shared))
             (history_coverage(shared))
             h3 { "Base load" }
             @match load {
                 None => p.muted { "Not trained yet: it needs two weeks of load history." },
                 Some(model) => (model_summary(shared, model, "baseline_mae_kwh", "the same hour on the same weekday over the last four weeks")),
+            }
+        }
+    }
+}
+
+/// Hot water from OpenAmber's mode: the model, and the measured split per day.
+fn hot_water_section(shared: &Shared) -> Markup {
+    if shared.config.openamber().is_none() {
+        return html! {};
+    }
+    let now = Timestamp::now();
+    let today = now.to_zoned(shared.tz.clone()).date();
+    let first = today.checked_sub(jiff::ToSpan::days(6)).unwrap_or(today);
+    let from = first
+        .to_zoned(shared.tz.clone())
+        .map_or(Slot::containing(now), |z| Slot::containing(z.timestamp()));
+    let slots = lock(&shared.store)
+        .heat_pump_modes(from)
+        .unwrap_or_default();
+    // Per day: heating, hot water, legionella, and hours with the mode known.
+    let mut days: std::collections::BTreeMap<jiff::civil::Date, [f64; 4]> =
+        std::collections::BTreeMap::new();
+    for s in &slots {
+        let day = days
+            .entry(s.slot.start().to_zoned(shared.tz.clone()).date())
+            .or_default();
+        let known = s.labelled_seconds / s.covered_seconds.max(1.0);
+        day[0] += (s.total_wh * known - s.hot_water_wh) / 1000.0;
+        day[1] += (s.hot_water_wh - s.legionella_wh) / 1000.0;
+        day[2] += s.legionella_wh / 1000.0;
+        day[3] += s.labelled_seconds / 3600.0;
+    }
+    let model = shared.hot_water_model.borrow().clone();
+    let next = *shared.next_legionella.lock().expect("lock poisoned");
+    html! {
+        h3 { "Hot water (OpenAmber)" }
+        @match &model {
+            Some(m) => p {
+                "From " (m.days) " days with OpenAmber's mode: " strong { (format!("{:.1} kWh", m.base_kwh)) }
+                " a day at 15 °C and warmer"
+                @if m.per_degree_kwh > 0.0 { ", " (format!("{:+.2}", m.per_degree_kwh)) " kWh per degree colder" }
+                ", mostly around " (hot_water_peak(&m.profile)) " (daily error " (format!("{:.2}", m.daily_mae)) " kWh)."
+                @if m.legionella_kwh > 0.0 { " A legionella run takes " (format!("{:.1} kWh", m.legionella_kwh)) "." }
+                " Heating is learned without it, and it's forecast on its own."
+            },
+            None => p.muted { "Hot water gets its own forecast after a week of days with OpenAmber's mode (the recorder's history counts)." },
+        }
+        @if let Some(at) = next { p.muted { "Next legionella run: " (local(shared, at, "%a %d %b %H:%M")) "." } }
+        @if !days.is_empty() {
+            div.scroll {
+                table {
+                    thead { tr { th { "day" } th { "heating" } th { "hot water" } th { "legionella" } th { "mode known" } } }
+                    tbody {
+                        @for (date, [heating, hot_water, legionella, hours]) in days.iter().rev() {
+                            tr {
+                                td { (date.strftime("%a %d %b")) }
+                                td { (format!("{heating:.1} kWh")) }
+                                td { (format!("{hot_water:.1} kWh")) }
+                                td { @if *legionella > 0.005 { (format!("{legionella:.1} kWh")) } @else { "–" } }
+                                td { (format!("{hours:.0} h")) }
+                            }
+                        }
+                    }
+                }
             }
         }
     }

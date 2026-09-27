@@ -782,7 +782,8 @@ These are off by default, enabled with an app option. They're for automations th
 - [x] promotion gate against baselines on held-out days; learned values on the page
 - [x] usable capacity and SoC estimator (the JK-BMS reports whole percent)
 - [x] forecast accuracy per lead time (0–6 h, 6–24 h, 24–48 h, from the stored plans)
-- [ ] OpenAmber's DHW schedule as a feature
+- [x] OpenAmber: heat pump energy split into heating, hot water and legionella from its MAIN state and the meter's state history (imported hourly, kept beyond the recorder's retention); heating learned from heating alone; hot water forecast separately (daily energy vs temperature, the recent hourly profile, legionella at the announced time)
+- [x] battery history from the BMS's DC counters, converted with the learned losses
 
 **M3: Control.**
 - [x] executor with fail-safe, relay curtailment

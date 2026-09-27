@@ -158,6 +158,77 @@ impl Connection {
     }
 }
 
+/// The state history of `entity_ids` in `[start, end)`, starting with each
+/// one's state at `start`: `entity → [(changed at, state)]`.
+pub async fn state_history(
+    connection: &mut Connection,
+    entity_ids: &[&str],
+    start: Timestamp,
+    end: Timestamp,
+) -> anyhow::Result<std::collections::HashMap<String, Vec<(Timestamp, String)>>> {
+    let result = connection
+        .call(json!({
+            "type": "history/history_during_period",
+            "start_time": start.to_string(),
+            "end_time": end.to_string(),
+            "entity_ids": entity_ids,
+            "include_start_time_state": true,
+            "significant_changes_only": false,
+            "minimal_response": true,
+            "no_attributes": true,
+        }))
+        .await?;
+    parse_history(&result)
+}
+
+fn parse_history(
+    result: &Value,
+) -> anyhow::Result<std::collections::HashMap<String, Vec<(Timestamp, String)>>> {
+    let Some(by_id) = result.as_object() else {
+        bail!("unexpected history result: {result}");
+    };
+    let mut out = std::collections::HashMap::new();
+    for (id, states) in by_id {
+        let mut changes = Vec::new();
+        for state in states.as_array().into_iter().flatten() {
+            // Compressed states: "s" is the state, "lc" when it last changed
+            // (left out when it equals "lu", the last update), in seconds.
+            let (Some(value), Some(at)) = (
+                state["s"].as_str(),
+                state["lc"].as_f64().or_else(|| state["lu"].as_f64()),
+            ) else {
+                continue;
+            };
+            changes.push((
+                Timestamp::from_millisecond((at * 1000.0) as i64)?,
+                value.to_owned(),
+            ));
+        }
+        changes.sort_by_key(|(at, _)| *at);
+        out.insert(id.clone(), changes);
+    }
+    Ok(out)
+}
+
+/// An entity's current state, if it has one.
+pub async fn state(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    entity_id: &str,
+) -> anyhow::Result<Option<String>> {
+    let response = client
+        .get(format!("{}/states/{entity_id}", endpoint.rest))
+        .bearer_auth(&endpoint.token)
+        .send()
+        .await
+        .with_context(|| format!("reading {entity_id}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let body: Value = response.error_for_status()?.json().await?;
+    Ok(body["state"].as_str().map(str::to_owned))
+}
+
 /// Hourly change of energy statistics (kWh) in `[start, end)`.
 pub async fn hourly_energy(
     connection: &mut Connection,
@@ -205,6 +276,26 @@ fn parse_hourly(result: &Value) -> anyhow::Result<Vec<(String, Timestamp, f64)>>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_compressed_history() {
+        let result = json!({
+            "sensor.mode": [
+                { "s": "DHW", "a": {}, "lu": 1_790_000_000.5_f64 },
+                { "s": "Heat/Cool", "lu": 1_790_000_600.0_f64 },
+            ],
+            "sensor.energy": [
+                { "s": "12.5", "lc": 1_790_000_000.0_f64, "lu": 1_790_000_010.0_f64 },
+            ],
+        });
+        let history = parse_history(&result).unwrap();
+        assert_eq!(history["sensor.mode"].len(), 2);
+        assert_eq!(history["sensor.mode"][1].1, "Heat/Cool");
+        assert_eq!(
+            history["sensor.energy"][0].0,
+            Timestamp::from_second(1_790_000_000).unwrap()
+        );
+    }
 
     #[test]
     fn parses_statistics() {

@@ -104,8 +104,10 @@ history:                    # optional: HA energy sensors (cumulative kWh)
   grid_import: sensor.p1_meter_energy_import
   grid_export: sensor.p1_meter_energy_export
   pv: sensor.pv_inverter_energy
-  battery_in: sensor.battery_ac_charge_energy
-  battery_out: sensor.battery_ac_discharge_energy
+  battery_dc_in: sensor.bms_energy_in     # the BMS's counters (DC), or:
+  battery_dc_out: sensor.bms_energy_out
+  # battery_in: sensor.battery_ac_charge_energy   # AC side, if you have it
+  # battery_out: sensor.battery_ac_discharge_energy
   heat_pump: sensor.heat_pump_energy
   ev: sensor.ev_charger_energy   # optional: left out of the house load
 cheapest_start:             # a flexible run, such as the dishwasher
@@ -116,12 +118,19 @@ cheapest_start:             # a flexible run, such as the dishwasher
 ha_entities: false          # publish a few entities for automations
 ev:
   on_input: false           # the charger is between the grid meter and the Victrons
+openamber_device: ""        # e.g. openamber: split the heat pump into heating and hot water
 ```
 
 **`history`** gives the forecasts real history on day one. dess-oxide
 copies these sensors' hourly statistics from Home Assistant: up to three
 years at first, then every six hours. House load is derived as
 `import − export + pv − battery_in + battery_out`. This only reads from HA.
+
+For the battery, the BMS's DC counters (`battery_dc_in`, `battery_dc_out`)
+are usually the better choice: they tend to go back further than AC
+sensors. dess-oxide turns each hour's DC energy into AC with the losses it
+learned from the inverters, plus their standby draw. If both pairs are set,
+DC wins.
 
 **`cheapest_start`** is DAO's `machines`, simplified: the page shows when
 to start a run of `hours` using `kwh` so it's cheapest, within the night
@@ -147,6 +156,17 @@ automation:
         target:
           entity_id: button.dishwasher_start
 ```
+
+**`openamber_device`**: with an OpenAmber heat pump controller (and
+`history.heat_pump` set), its ESPHome device name, e.g. `openamber`.
+dess-oxide then reads OpenAmber's control loop state (MAIN), its legionella
+flag and the heat pump meter from Home Assistant's history, and splits the
+heat pump's energy into heating and hot water per quarter hour. The recorder
+keeps states for 10 days by default; dess-oxide keeps its own copy, so this
+history grows from the day you set it. Heating is then learned from heating
+alone. Hot water gets its own forecast: energy per day against the outdoor
+temperature, at the hours it usually runs (your schedule), and legionella
+runs at the time OpenAmber announces. The page shows the split per day.
 
 **`ev.on_input`**: if the charger sits between the grid meter and the
 Victrons, what the Victron sees as loads on its input is the EV. It's then

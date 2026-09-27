@@ -10,6 +10,7 @@ pub mod capacity;
 pub mod control;
 pub mod efficiency;
 pub mod forecast;
+pub mod heat_pump_modes;
 pub mod planner;
 pub mod prices;
 pub mod record;

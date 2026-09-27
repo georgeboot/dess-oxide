@@ -6,6 +6,7 @@ mod control;
 mod entities;
 mod homeassistant;
 mod nordpool;
+mod openamber;
 mod openmeteo;
 mod planning;
 mod run;
@@ -213,6 +214,7 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
                 models: models.as_models(),
                 outage: planning::outage_window(&planning::lock(&store), now),
                 soc: None,
+                next_legionella: None,
             },
         )
     })?;
