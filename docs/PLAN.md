@@ -625,7 +625,7 @@ A volatile override stays in force until it is released or the Cerbo reboots. Vi
 
 | Situation | Behaviour |
 |---|---|
-| Fresh install | shadow mode: plan and publish, no writes. Writing needs **two locks**: `control: true` in the app options (which no HA automation can flip) and the control toggle on the dess-oxide page |
+| Fresh install | shadow mode: plan and publish, no writes. Writing needs **two locks**: `dryrun: false` in the app options (a missing option means a dry run) (which no HA automation can flip) and the control toggle on the dess-oxide page |
 | Another controller writes the ESS setpoint | refuse to take control, and drop back to shadow if already active. This catches a DAO chain (or VRM DESS) that is still running. `probe` already detects these writes |
 | Control switched off, or SIGTERM (app update, HA restart, backup) | release the override, which means plain ESS; relay to PV on; restore minimum SoC |
 | Task panic | the supervisor restarts the task. A panic hook releases the override if the whole process goes down |
@@ -689,7 +689,7 @@ It's served through HA ingress, so it opens from the HA sidebar with HA's own lo
   - reserve SoC
   - a manual override (auto / self-consumption / hold / charge / discharge), which reverts at midnight
   - replan now
-  - control on/off. This works only when the app option `control: true` is also set: the two locks of §15.3.
+  - control on/off. This works only when the app option `dryrun: false` is also set: the two locks of §15.3.
 
 It's server-rendered by axum, with a vendored chart library and small forms for the controls. There's no JS build step. Control state is stored in SQLite, so it survives restarts.
 
@@ -730,7 +730,7 @@ These are off by default, enabled with an app option. They're for automations th
   3. A daily comparison goes to the dess-oxide page.
   4. Handover, once George is satisfied:
      - disable DAO's Victron automations,
-     - set `control: true` in the app options,
+     - set `dryrun: false` in the app options,
      - turn control on from the dess-oxide page.
 - **CI:** `cargo fmt --check`, `clippy -D warnings`, tests, the backtest gate, and the multi-arch image build.
 

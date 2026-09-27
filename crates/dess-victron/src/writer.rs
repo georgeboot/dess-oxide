@@ -1,6 +1,6 @@
 //! Writing to the GX device: a separate capability from reading.
 //!
-//! A [`Writer`] needs a [`WriteAccess`], and only the `control: true`
+//! A [`Writer`] needs a [`WriteAccess`], and only the `dryrun: false`
 //! configuration option creates one, so code without it can't write at all.
 //! Writes are limited to three paths, and each is confirmed by reading the
 //! value back from the GX device.
@@ -29,9 +29,9 @@ const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
 pub struct WriteAccess(());
 
 impl WriteAccess {
-    /// Only the `control: true` option grants write access.
-    pub fn from_config(control_enabled: bool) -> Option<Self> {
-        control_enabled.then_some(Self(()))
+    /// Only the `dryrun: false` option grants write access.
+    pub fn from_config(writes_allowed: bool) -> Option<Self> {
+        writes_allowed.then_some(Self(()))
     }
 }
 

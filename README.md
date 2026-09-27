@@ -14,7 +14,7 @@ its models (PV, heat pump, base load, battery losses and capacity), plans,
 and shows it all on its own page, including a nightly replay of the last
 week against what actually happened. Control (a 1 Hz setpoint loop, the PV
 relay, outage preparation, manual overrides) is built. It writes only when
-both locks are on: `control: true` in the options and the switch on its
+both locks are on: `dryrun: false` in the options and the switch on its
 page.
 
 ## Layout
@@ -44,7 +44,7 @@ cargo run -- plan --config dess.toml --data-dir data
 ```
 
 Run the service: it records, plans every quarter hour, and serves its page
-on http://127.0.0.1:8099. Read-only unless the config has `control = true`
+on http://127.0.0.1:8099. Read-only unless the config has `dryrun = false`
 and the page's switch is on.
 
 ```bash

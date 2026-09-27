@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.11.0
+
+- **`control` is now `dryrun`**, and inverted: dess-oxide never writes to
+  the Victron while `dryrun` is `true`, which is also what a missing option
+  means. To let it take control, set `dryrun: false` and switch control on
+  on its page. The old `control` option is ignored.
+- The page shows how far back each Home Assistant history sensor goes, so
+  it's clear what the models were trained on.
+
 ## 0.10.0
 
 - **The last week, replayed:** every night dess-oxide re-runs its own

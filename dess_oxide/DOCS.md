@@ -6,12 +6,13 @@ The design is in
 
 ## What this version does
 
-By default it runs in **shadow mode**: it plans, records and shows, but
+By default it runs as a **dry run**: it plans, records and shows, but
 **never writes anything to the Victron system**. It's meant to run next to
 your current setup (such as DAO) until you trust its plans.
 
 **Taking control** needs two locks:
-1. `control: true` in the options.
+1. `dryrun: false` in the options. It's a dry run when the option is
+   missing or `true`.
 2. The switch on the dess-oxide page.
 
 It then moves ESS's grid setpoint once a second (a volatile override, not

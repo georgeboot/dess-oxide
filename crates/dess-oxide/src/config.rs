@@ -18,10 +18,11 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     pub victron: VictronConfig,
-    /// Lets dess-oxide write to the GX device at all. The first of two locks;
-    /// the second is the switch on the dess-oxide page. Off by default.
-    #[serde(default)]
-    pub control: bool,
+    /// A dry run never writes to the GX device: it plans and shows only. On
+    /// unless set to `false`. Turning it off is the first of two locks; the
+    /// second is the switch on the dess-oxide page.
+    #[serde(default = "default_true")]
+    pub dryrun: bool,
     #[serde(default)]
     pub grid: GridConfig,
     #[serde(default)]
@@ -262,6 +263,10 @@ pub struct PvArrayConfig {
     pub azimuth: f64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 fn default_mqtt_port() -> u16 {
     1883
 }
@@ -271,6 +276,11 @@ fn default_time_zone() -> String {
 }
 
 impl Config {
+    /// Whether dess-oxide may write to the GX device at all (`dryrun: false`).
+    pub fn writes_allowed(&self) -> bool {
+        !self.dryrun
+    }
+
     pub fn load(path: &Path) -> anyhow::Result<Self> {
         let text =
             std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
@@ -431,6 +441,7 @@ mod tests {
         assert_eq!(run.earliest, Time::constant(21, 30, 0, 0));
         assert_eq!(run.finish_by, Time::constant(7, 0, 0, 0));
         assert!(!config.ha_entities);
+        assert!(config.dryrun, "a dry run unless set otherwise");
     }
 
     #[test]

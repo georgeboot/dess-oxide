@@ -469,6 +469,34 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Per imported entity: its first and last hour, and how many hours.
+    pub fn ha_coverage(
+        &self,
+    ) -> anyhow::Result<Vec<(String, jiff::Timestamp, jiff::Timestamp, usize)>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT entity, min(hour_start), max(hour_start), count(*) FROM ha_hourly GROUP BY entity",
+        )?;
+        let rows = query.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })?;
+        let mut coverage = Vec::new();
+        for row in rows {
+            let (entity, first, last, hours) = row?;
+            coverage.push((
+                entity,
+                jiff::Timestamp::from_second(first)?,
+                jiff::Timestamp::from_second(last)?,
+                usize::try_from(hours)?,
+            ));
+        }
+        Ok(coverage)
+    }
+
     /// Hourly kWh per entity since `from`: `hour → entity → kWh`.
     pub fn ha_hourly(
         &self,

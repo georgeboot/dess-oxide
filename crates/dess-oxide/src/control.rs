@@ -3,7 +3,7 @@
 //!
 //! It only acts when everything below holds, and otherwise releases control
 //! back to plain ESS:
-//! - both locks are on: `control: true` in the options (the only way to get
+//! - both locks are on: `dryrun: false` in the options (the only way to get
 //!   write access at all) and the switch on the dess-oxide page;
 //! - Victron's Dynamic ESS is off and ESS regulates the total of all phases;
 //! - nothing else wrote the ESS setpoint in the last five minutes (such as
@@ -128,7 +128,7 @@ pub fn active_override(store: &crate::store::Store, now: Timestamp) -> Option<Ov
 /// What the page shows about control.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub enum ControlStatus {
-    /// `control: false` in the options: dess-oxide can't write at all.
+    /// A dry run (the default): dess-oxide can't write at all.
     #[default]
     Shadow,
     /// Allowed, but not acting, and why.
@@ -167,7 +167,7 @@ pub fn switched_on(shared: &Shared) -> bool {
 }
 
 pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
-    let Some(access) = WriteAccess::from_config(shared.config.control) else {
+    let Some(access) = WriteAccess::from_config(shared.config.writes_allowed()) else {
         return;
     };
     let writer = venus.writer(access);

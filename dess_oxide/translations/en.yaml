@@ -1,4 +1,10 @@
 configuration:
+  dryrun:
+    name: Dry run
+    description: >-
+      On: dess-oxide plans and shows, but never writes to the Victron. Turn
+      it off, then switch control on on the dess-oxide page, to let it run
+      the system. Turn off DAO's automations first.
   victron:
     name: Victron GX device
     description: >-

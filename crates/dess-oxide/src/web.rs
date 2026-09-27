@@ -78,7 +78,7 @@ struct ControlForm {
     enabled: String,
 }
 
-/// The page switch. It only matters when `control: true` is set in the options.
+/// The page switch. It only matters with `dryrun: false` in the options.
 async fn set_control(
     State(shared): State<Arc<Shared>>,
     headers: axum::http::HeaderMap,
@@ -352,10 +352,10 @@ fn render(
             body {
                 header {
                     h1 { "dess-oxide" }
-                    @if shared.config.control {
-                        span.badge { "control allowed by the options" }
+                    @if shared.config.writes_allowed() {
+                        span.badge { "writes allowed by the options" }
                     } @else {
-                        span.badge { "shadow mode · never writes to the Victron" }
+                        span.badge { "dry run · never writes to the Victron" }
                     }
                 }
                 @if let Some(problem) = &status.problem {
@@ -419,9 +419,9 @@ fn control_card(shared: &Shared) -> Markup {
         section.control {
             @match shared.control_status() {
                 ControlStatus::Shadow => {
-                    strong { "Shadow mode." }
+                    strong { "Dry run." }
                     " dess-oxide plans but never writes to the Victron. To let it take control, set "
-                    code { "control: true" } " in the app's options, then switch it on here."
+                    code { "dryrun: false" } " in the app's options, then switch it on here."
                 }
                 ControlStatus::Idle(reason) => {
                     strong { "Not in control: " } (reason) ". "
@@ -435,7 +435,7 @@ fn control_card(shared: &Shared) -> Markup {
                     (switch(false, "Switch control off"))
                 }
             }
-            @if shared.config.control {
+            @if shared.config.writes_allowed() {
                 form.inline method="post" action="api/override" {
                     " Until midnight: "
                     select name="mode" {
@@ -881,10 +881,51 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                     }
                 }
             }
+            (history_coverage(shared))
             h3 { "Base load" }
             @match load {
                 None => p.muted { "Not trained yet: it needs two weeks of load history." },
                 Some(model) => (model_summary(shared, model, "baseline_mae_kwh", "the same hour on the same weekday over the last four weeks")),
+            }
+        }
+    }
+}
+
+/// How far back each Home Assistant sensor's statistics go: the heat pump
+/// model needs its meter, the base load all of the sensors in the same hour.
+fn history_coverage(shared: &Shared) -> Markup {
+    let coverage = lock(&shared.store).ha_coverage().unwrap_or_default();
+    let roles = shared.config.history.entities();
+    if coverage.is_empty() || roles.is_empty() {
+        return html! {};
+    }
+    html! {
+        details {
+            summary { "History imported from Home Assistant" }
+            div.scroll {
+                table {
+                    thead { tr { th { "sensor" } th { "from" } th { "until" } th { "hours" } } }
+                    tbody {
+                        @for (role, entity) in &roles {
+                            @let found = coverage.iter().find(|c| c.0 == *entity);
+                            tr {
+                                td { (role) " " span.muted { (entity) } }
+                                @match found {
+                                    Some((_, first, last, hours)) => {
+                                        td { (local(shared, *first, "%Y-%m-%d")) }
+                                        td { (local(shared, *last, "%Y-%m-%d")) }
+                                        td { (hours) }
+                                    }
+                                    None => { td colspan="3" { "nothing imported" } }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            p.muted {
+                "Weather is archived from 2024-07-01. The heat pump model trains on the hours with its meter and weather; "
+                "the base load on the hours where every sensor has a value (or dess-oxide recorded the house itself)."
             }
         }
     }

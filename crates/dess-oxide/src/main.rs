@@ -64,7 +64,7 @@ enum Command {
         rows: usize,
     },
     /// Run the service: record, learn, plan and serve the page. It writes to
-    /// the GX device only with `control: true` and the page's switch on.
+    /// the GX device only with `dryrun: false` and the page's switch on.
     Run {
         /// `options.json` (Home Assistant app) or a TOML file.
         #[arg(long, default_value = "dess.toml")]
