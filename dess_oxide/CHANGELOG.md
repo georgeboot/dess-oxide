@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.6.0
+
+- **Outage mode:** tell dess-oxide when you expect a power cut (start time
+  and hours) on its page. The plan charges in the cheapest slots beforehand
+  to cover the window's load with margins, and keeps PV on during it. It
+  replans right away when you set or cancel the window.
+- **Minimum SoC backstop:** with control on, ESS's own minimum SoC is raised
+  to the reserve from three hours before the window until its end, so the
+  Victron keeps the reserve even if dess-oxide stops. The original minimum
+  is restored afterwards.
+
 ## 0.5.0
 
 - **Heat pump model:** learns your heat pump's electricity use from its meter

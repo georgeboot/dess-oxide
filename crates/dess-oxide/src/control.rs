@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use dess_core::Watts;
 use dess_core::control::{self, Decision, Measured};
-use dess_victron::writer::{SETPOINT_OVERRIDE, SETPOINT_SETTING};
+use dess_victron::writer::{MINIMUM_SOC, SETPOINT_OVERRIDE, SETPOINT_SETTING};
 use dess_victron::{Snapshot, Venus, WriteAccess, Writer, reading};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
@@ -30,6 +30,12 @@ pub const SWITCH: &str = "control_enabled";
 /// Write the setpoint when it moves this much, or at least this often.
 const DEADBAND_W: f64 = 50.0;
 const REFRESH: Duration = Duration::from_secs(10);
+/// Before an expected outage, ESS's own minimum SoC is raised this long in
+/// advance to the planned reserve.
+const BACKSTOP_LEAD: SignedDuration = SignedDuration::from_hours(3);
+/// The setting that remembers ESS's minimum SoC while the backstop holds it.
+const MIN_SOC_BEFORE_OUTAGE: &str = "min_soc_before_outage";
+
 /// A plan older than this isn't trusted.
 const MAX_PLAN_AGE: SignedDuration = SignedDuration::from_mins(20);
 /// After another writer touches the setpoint, stay away this long.
@@ -45,6 +51,25 @@ pub enum ControlStatus {
     Idle(String),
     /// Acting.
     Active(Decision),
+}
+
+/// The minimum SoC ESS should hold as an outage backstop now, if any: from
+/// three hours before the window until its end, the plan's SoC at the start
+/// of the window (a few points less, never above the current SoC, never below
+/// ESS's own minimum).
+pub fn backstop_target(
+    window: Option<(Timestamp, Timestamp)>,
+    planned_start_soc: Option<f64>,
+    now: Timestamp,
+    current_soc: f64,
+    original_min: f64,
+) -> Option<f64> {
+    let (start, end) = window?;
+    if now < start - BACKSTOP_LEAD || now >= end {
+        return None;
+    }
+    let target = (planned_start_soc? - 3.0).min(current_soc).floor();
+    (target > original_min).then_some(target)
 }
 
 /// Whether the page switch is on.
@@ -74,6 +99,7 @@ pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiv
         let now = Timestamp::now();
         let snapshot = venus.snapshot();
         state.watch_for_foreign_writes(&snapshot, now);
+        backstop(&writer, &shared, &snapshot, now).await;
         match evaluate(&venus, &shared, &snapshot, &state, now) {
             Ok(decision) => {
                 if !state.active {
@@ -95,6 +121,64 @@ pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiv
     if state.active {
         info!("shutting down: releasing control to plain ESS");
         state.release(&writer, &shared).await;
+    }
+}
+
+/// Holds or releases the outage backstop on ESS's minimum SoC. Like the
+/// setpoint, it needs both locks (the option and the page switch), but none of
+/// the other interlocks: it must hold while the grid is down.
+async fn backstop(writer: &Writer<'_>, shared: &Shared, snapshot: &Snapshot, now: Timestamp) {
+    let Some(current_min) = snapshot.number(MINIMUM_SOC) else {
+        return;
+    };
+    let switched_on = switched_on(shared);
+    let (window, remembered) = {
+        let store = lock(&shared.store);
+        (
+            crate::planning::outage_window(&store, now).filter(|_| switched_on),
+            store
+                .setting(MIN_SOC_BEFORE_OUTAGE)
+                .ok()
+                .flatten()
+                .and_then(|v| v.parse::<f64>().ok()),
+        )
+    };
+    let original = remembered.unwrap_or(current_min);
+    let planned_start_soc = window.and_then(|(start, _)| {
+        let view = shared.plan.borrow().clone()?;
+        view.plan
+            .slots
+            .iter()
+            .find(|s| s.slot.end() > start)
+            .map(|s| s.soc_start)
+    });
+    let soc = snapshot.number("system/0/Dc/Battery/Soc").unwrap_or(0.0);
+    match backstop_target(window, planned_start_soc, now, soc, original) {
+        Some(target) if (target - current_min).abs() >= 2.0 => {
+            if remembered.is_none() {
+                let _ = lock(&shared.store)
+                    .set_setting(MIN_SOC_BEFORE_OUTAGE, &current_min.to_string());
+            }
+            match writer.set_minimum_soc(target).await {
+                Ok(()) => info!(target, "raised ESS's minimum SoC as an outage backstop"),
+                Err(error) => warn!(%error, "raising the minimum SoC"),
+            }
+        }
+        Some(_) => {}
+        None => {
+            if let Some(original) = remembered {
+                match writer.set_minimum_soc(original).await {
+                    Ok(()) => {
+                        info!(
+                            original,
+                            "restored ESS's minimum SoC after the outage window"
+                        );
+                        let _ = lock(&shared.store).set_setting(MIN_SOC_BEFORE_OUTAGE, "");
+                    }
+                    Err(error) => warn!(%error, "restoring the minimum SoC"),
+                }
+            }
+        }
     }
 }
 
@@ -251,6 +335,44 @@ fn relay_closed_for(pv_on: bool, energized: RelayAction) -> bool {
 mod tests {
     use super::*;
     use dess_victron::Value;
+
+    #[test]
+    fn the_backstop_holds_the_reserve_around_the_window() {
+        let start: Timestamp = "2026-09-28T06:00:00Z".parse().unwrap();
+        let end = start + SignedDuration::from_hours(4);
+        let window = Some((start, end));
+        let at = |h: i64| start + SignedDuration::from_hours(h);
+        assert_eq!(
+            backstop_target(window, Some(60.0), at(-4), 70.0, 5.0),
+            None,
+            "too early"
+        );
+        assert_eq!(
+            backstop_target(window, Some(60.0), at(-2), 70.0, 5.0),
+            Some(57.0)
+        );
+        assert_eq!(
+            backstop_target(window, Some(60.0), at(-2), 40.0, 5.0),
+            Some(40.0),
+            "never above the current SoC"
+        );
+        assert_eq!(
+            backstop_target(window, Some(60.0), at(2), 50.0, 5.0),
+            Some(50.0),
+            "holds during the outage"
+        );
+        assert_eq!(
+            backstop_target(window, Some(60.0), at(4), 50.0, 5.0),
+            None,
+            "over"
+        );
+        assert_eq!(
+            backstop_target(window, Some(6.0), at(-1), 50.0, 5.0),
+            None,
+            "not above ESS's own minimum"
+        );
+        assert_eq!(backstop_target(None, Some(60.0), at(-1), 50.0, 5.0), None);
+    }
 
     #[test]
     fn relay_follows_the_wiring() {

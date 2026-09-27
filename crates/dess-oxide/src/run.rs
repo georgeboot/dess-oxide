@@ -66,6 +66,8 @@ pub struct Shared {
     pub load_model: watch::Sender<Option<Arc<LoadModel>>>,
     pub status: Mutex<Status>,
     pub control: Mutex<crate::control::ControlStatus>,
+    /// Bumped to make the planner run now (e.g. after an outage change).
+    pub replan_now: watch::Sender<u64>,
 }
 
 /// What the page shows about the service itself.
@@ -95,30 +97,10 @@ impl Shared {
 pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow::Result<()> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
-    let store = Store::open(&data_dir.join("dess.db"))?;
-    let tariff = config
-        .tariff
-        .as_ref()
-        .map(crate::config::TariffConfig::to_tariff)
-        .transpose()?;
-    let tz = match &tariff {
-        Some(tariff) => tariff.time_zone.clone(),
-        None => TimeZone::get("Europe/Amsterdam")?,
-    };
-    let shared = Arc::new(Shared {
+    let shared = Arc::new(Shared::new(
         config,
-        tariff,
-        tz,
-        store: Mutex::new(store),
-        plan: watch::Sender::new(None),
-        weather: watch::Sender::new(Arc::new(BTreeMap::new())),
-        location: watch::Sender::new(None),
-        pv_model: watch::Sender::new(None),
-        hp_model: watch::Sender::new(None),
-        load_model: watch::Sender::new(None),
-        status: Mutex::new(Status::default()),
-        control: Mutex::new(crate::control::ControlStatus::default()),
-    });
+        Store::open(&data_dir.join("dess.db"))?,
+    )?);
     let (stop, stopped) = watch::channel(false);
     let web = tokio::spawn(web::serve(listen, Arc::clone(&shared), stopped.clone()));
 
@@ -145,44 +127,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
     wait_for_heartbeat(&venus, Duration::from_secs(10)).await;
     shared.update_status(|s| s.problem = None);
 
-    let mut tasks: Vec<JoinHandle<()>> = vec![
-        tokio::spawn(record(
-            Arc::clone(&venus),
-            Arc::clone(&shared),
-            stopped.clone(),
-        )),
-        tokio::spawn(import_history(Arc::clone(&shared), stopped.clone())),
-    ];
-    if shared.tariff.is_some() {
-        let client = crate::http_client()?;
-        let (prices_changed, prices_rx) = watch::channel(0u64);
-        tasks.push(tokio::spawn(fetch_prices(
-            Arc::clone(&shared),
-            client.clone(),
-            prices_changed,
-            stopped.clone(),
-        )));
-        tasks.push(tokio::spawn(fetch_weather(
-            Arc::clone(&shared),
-            client,
-            stopped.clone(),
-        )));
-        tasks.push(tokio::spawn(train(Arc::clone(&shared), stopped.clone())));
-        tasks.push(tokio::spawn(crate::control::run(
-            Arc::clone(&venus),
-            Arc::clone(&shared),
-            stopped.clone(),
-        )));
-        tasks.push(tokio::spawn(plan_loop(
-            Arc::clone(&venus),
-            Arc::clone(&shared),
-            prices_rx,
-            stopped.clone(),
-        )));
-    } else {
-        info!("no [tariff] configured: recording only, no planning");
-    }
-
+    let tasks = spawn_tasks(&venus, &shared, &stopped)?;
     shutdown.await;
     info!("shutting down");
     let _ = stop.send(true);
@@ -194,6 +139,81 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
         venus.close().await;
     }
     Ok(())
+}
+
+impl Shared {
+    fn new(config: Config, store: Store) -> anyhow::Result<Self> {
+        let tariff = config
+            .tariff
+            .as_ref()
+            .map(crate::config::TariffConfig::to_tariff)
+            .transpose()?;
+        let tz = match &tariff {
+            Some(tariff) => tariff.time_zone.clone(),
+            None => TimeZone::get("Europe/Amsterdam")?,
+        };
+        Ok(Self {
+            config,
+            tariff,
+            tz,
+            store: Mutex::new(store),
+            plan: watch::Sender::new(None),
+            weather: watch::Sender::new(Arc::new(BTreeMap::new())),
+            location: watch::Sender::new(None),
+            pv_model: watch::Sender::new(None),
+            hp_model: watch::Sender::new(None),
+            load_model: watch::Sender::new(None),
+            status: Mutex::new(Status::default()),
+            control: Mutex::new(crate::control::ControlStatus::default()),
+            replan_now: watch::Sender::new(0),
+        })
+    }
+}
+
+/// Starts the service's tasks; planning ones only with a tariff.
+fn spawn_tasks(
+    venus: &Arc<Venus>,
+    shared: &Arc<Shared>,
+    stopped: &watch::Receiver<bool>,
+) -> anyhow::Result<Vec<JoinHandle<()>>> {
+    let mut tasks = vec![
+        tokio::spawn(record(
+            Arc::clone(venus),
+            Arc::clone(shared),
+            stopped.clone(),
+        )),
+        tokio::spawn(import_history(Arc::clone(shared), stopped.clone())),
+    ];
+    if shared.tariff.is_none() {
+        info!("no [tariff] configured: recording only, no planning");
+        return Ok(tasks);
+    }
+    let client = crate::http_client()?;
+    let (prices_changed, prices_rx) = watch::channel(0u64);
+    tasks.push(tokio::spawn(fetch_prices(
+        Arc::clone(shared),
+        client.clone(),
+        prices_changed,
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(fetch_weather(
+        Arc::clone(shared),
+        client,
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(train(Arc::clone(shared), stopped.clone())));
+    tasks.push(tokio::spawn(crate::control::run(
+        Arc::clone(venus),
+        Arc::clone(shared),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(plan_loop(
+        Arc::clone(venus),
+        Arc::clone(shared),
+        prices_rx,
+        stopped.clone(),
+    )));
+    Ok(tasks)
 }
 
 /// Resolves once `stop` becomes true.
@@ -565,6 +585,7 @@ async fn plan_loop(
     let mut model = shared.pv_model.subscribe();
     let mut hp_model = shared.hp_model.subscribe();
     let mut load_model = shared.load_model.subscribe();
+    let mut replan_now = shared.replan_now.subscribe();
     loop {
         replan(&venus, &shared);
         let now = Timestamp::now();
@@ -576,6 +597,7 @@ async fn plan_loop(
             _ = model.changed() => true,
             _ = hp_model.changed() => true,
             _ = load_model.changed() => true,
+            _ = replan_now.changed() => true,
             () = stopped(&mut stop) => return,
         };
         if changed {
@@ -590,6 +612,7 @@ async fn plan_loop(
             model.mark_unchanged();
             hp_model.mark_unchanged();
             load_model.mark_unchanged();
+            replan_now.mark_unchanged();
         }
     }
 }
@@ -610,6 +633,7 @@ fn replan(venus: &Venus, shared: &Shared) {
         }
         None => BTreeMap::new(),
     };
+    let outage = planning::outage_window(&lock(&shared.store), now);
     let inputs = planning::ForecastInputs {
         pv: &pv,
         weather: &weather,
@@ -617,6 +641,7 @@ fn replan(venus: &Venus, shared: &Shared) {
             heat_pump: hp_model.as_deref(),
             load: load_model.as_deref(),
         },
+        outage,
     };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)

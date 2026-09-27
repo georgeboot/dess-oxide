@@ -41,6 +41,7 @@ pub async fn serve(listen: SocketAddr, shared: Arc<Shared>, mut stop: watch::Rec
         .route("/", get(page))
         .route("/api/plan", get(plan_json))
         .route("/api/control", axum::routing::post(set_control))
+        .route("/api/outage", axum::routing::post(set_outage))
         .layer(middleware::from_fn(ingress_only))
         .with_state(shared);
     let result = axum::serve(
@@ -89,6 +90,60 @@ async fn set_control(
     }
     info!(on, "control switched on the page");
     // Back to the page, under Home Assistant's ingress path when there is one.
+    let base = headers
+        .get("x-ingress-path")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    axum::response::Redirect::to(&format!("{base}/")).into_response()
+}
+
+#[derive(serde::Deserialize)]
+struct OutageForm {
+    /// "on" to expect an outage, anything else to cancel.
+    expected: String,
+    /// Local time, as `<input type="datetime-local">` sends it.
+    #[serde(default)]
+    start: String,
+    #[serde(default)]
+    hours: String,
+}
+
+async fn set_outage(
+    State(shared): State<Arc<Shared>>,
+    headers: axum::http::HeaderMap,
+    axum::Form(form): axum::Form<OutageForm>,
+) -> Response {
+    use crate::planning::{OUTAGE_EXPECTED, OUTAGE_HOURS, OUTAGE_START};
+    let result = tokio::task::block_in_place(|| {
+        let store = lock(&shared.store);
+        if form.expected != "on" {
+            return store.set_setting(OUTAGE_EXPECTED, "off");
+        }
+        let start = form
+            .start
+            .parse::<jiff::civil::DateTime>()
+            .map_err(anyhow::Error::from)
+            .and_then(|local| Ok(local.to_zoned(shared.tz.clone())?.timestamp()))?;
+        let hours: f64 = form.hours.parse()?;
+        store.set_setting(OUTAGE_START, &start.to_string())?;
+        store.set_setting(OUTAGE_HOURS, &hours.clamp(0.25, 72.0).to_string())?;
+        store.set_setting(OUTAGE_EXPECTED, "on")
+    });
+    if let Err(error) = result {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("couldn't read that: {error:#}"),
+        )
+            .into_response();
+    }
+    info!(
+        expected = form.expected,
+        start = form.start,
+        hours = form.hours,
+        "outage settings changed"
+    );
+    // Plan again with the new window.
+    shared.replan_now.send_modify(|n| *n += 1);
     let base = headers
         .get("x-ingress-path")
         .and_then(|v| v.to_str().ok())
@@ -196,6 +251,7 @@ fn render(
                 @match view {
                     Some(view) => {
                         (control_card(shared))
+                        (outage_card(shared, view, now))
                         (now_cards(view))
                         (plan_section(shared, view, now))
                     }
@@ -261,6 +317,44 @@ fn control_card(shared: &Shared) -> Markup {
                     ", battery " (format!("{:+.1} kW", decision.battery_ac.0 / 1000.0))
                     ", PV " (if decision.pv_on { "on" } else { "off" }) ". "
                     (switch(false, "Switch control off"))
+                }
+            }
+        }
+    }
+}
+
+fn outage_card(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
+    let window = crate::planning::outage_window(&lock(&shared.store), now);
+    let tomorrow_morning = now
+        .to_zoned(shared.tz.clone())
+        .date()
+        .tomorrow()
+        .map(|d| d.at(8, 0, 0, 0).strftime("%Y-%m-%dT%H:%M").to_string())
+        .unwrap_or_default();
+    html! {
+        section.control {
+            @match window {
+                Some((start, end)) => {
+                    @let prepared = view.plan.slots.iter().find(|s| s.slot.end() > start).map(|s| s.soc_start);
+                    strong { "Outage expected " }
+                    (local(shared, start, "%a %H:%M")) "–" (local(shared, end, "%a %H:%M")) ". "
+                    "The plan runs that window on the battery (planning for 30 % more load and 30 % less PV than forecast)"
+                    @if let Some(soc) = prepared { " and starts it at " strong { (format!("{soc:.0} %")) } } ". "
+                    form.inline method="post" action="api/outage" {
+                        input type="hidden" name="expected" value="off";
+                        button type="submit" { "Cancel" }
+                    }
+                }
+                None => {
+                    form.inline method="post" action="api/outage" {
+                        input type="hidden" name="expected" value="on";
+                        "Expect a power outage from "
+                        input type="datetime-local" name="start" value=(tomorrow_morning) required;
+                        " for "
+                        input type="number" name="hours" value="4" min="0.25" max="72" step="0.25" style="width: 5em" required;
+                        " hours "
+                        button type="submit" { "Prepare" }
+                    }
                 }
             }
         }
@@ -720,6 +814,7 @@ footer { margin-top: 28px; }
 .control { margin-top: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); }
 .control .active { color: var(--bat); }
 form.inline { display: inline; }
+input { font: inherit; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); }
 button { font: inherit; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
 h3 { font-size: 15px; margin: 18px 0 4px; }
 ul { margin: 4px 0; padding-left: 20px; }

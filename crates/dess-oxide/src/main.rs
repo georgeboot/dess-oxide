@@ -204,6 +204,7 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
                 pv: &pv,
                 weather: &weather,
                 models: models.as_models(),
+                outage: planning::outage_window(&planning::lock(&store), now),
             },
         )
     })?;

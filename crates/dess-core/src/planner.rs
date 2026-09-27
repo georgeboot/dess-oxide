@@ -31,6 +31,9 @@ pub struct SlotForecast {
     pub min_soc_end: f64,
     /// The price is an estimate beyond the published day-ahead prices.
     pub estimated_price: bool,
+    /// An expected outage: no grid. Importing is impossible (penalised),
+    /// surplus PV is curtailed for free, and PV stays on.
+    pub islanded: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -260,7 +263,7 @@ impl<'a> Problem<'a> {
         } = *self.request;
         let horizon = slots.len();
         let levels = self.levels;
-        let relays: &[usize] = if settings.pv_switchable {
+        let switchable: &[usize] = if settings.pv_switchable {
             &[0, 1]
         } else {
             &[1]
@@ -289,6 +292,7 @@ impl<'a> Problem<'a> {
             let forecast = &slots[t];
             let hours = self.hours[t];
             let moves = self.moves(t);
+            let relays: &[usize] = if forecast.islanded { &[1] } else { switchable };
             // The lowest level that still meets the slot's minimum SoC.
             let floor_level = ((forecast.min_soc_end / 100.0 * self.capacity) / self.step)
                 .ceil()
@@ -390,7 +394,7 @@ impl<'a> Problem<'a> {
                 grid: Watts(grid),
                 pv_on,
                 cost: stage_cost(forecast, battery, settings, hours, &m, pv_on)
-                    - excess_penalty(grid, settings, hours),
+                    - excess_penalty(forecast, grid, settings, hours),
                 stored_energy_value: values.marginal_value(t + 1, decision.relay, next),
                 prices: forecast.prices,
                 estimated_price: forecast.estimated_price,
@@ -424,7 +428,17 @@ fn grid_power(forecast: &SlotForecast, battery: &BatteryModel, m: &Move, pv_on: 
     forecast.load.0 + battery.standby.0 + m.ac - pv
 }
 
-fn excess_penalty(grid: f64, settings: &PlannerSettings, hours: f64) -> f64 {
+/// Penalty for grid use beyond what's possible: the connection's limits, or
+/// any import at all while islanded.
+fn excess_penalty(
+    forecast: &SlotForecast,
+    grid: f64,
+    settings: &PlannerSettings,
+    hours: f64,
+) -> f64 {
+    if forecast.islanded {
+        return settings.shortfall_penalty.0 * grid.max(0.0) * hours / 1000.0;
+    }
     let excess = (grid - settings.max_import.0).max(0.0) + (-grid - settings.max_export.0).max(0.0);
     settings.grid_excess_penalty.0 * excess * hours / 1000.0
 }
@@ -438,11 +452,16 @@ fn stage_cost(
     pv_on: bool,
 ) -> f64 {
     let grid = grid_power(forecast, battery, m, pv_on);
+    let wear = settings.wear_cost.0 * (m.dc * hours).abs() / 1000.0;
+    if forecast.islanded {
+        // No grid: surplus PV is curtailed, and imports are only a penalty.
+        return wear + excess_penalty(forecast, grid, settings, hours);
+    }
     let import_kwh = grid.max(0.0) * hours / 1000.0;
     let export_kwh = (-grid).max(0.0) * hours / 1000.0;
     forecast.prices.buy.0 * import_kwh - forecast.prices.sell.0 * export_kwh
-        + settings.wear_cost.0 * (m.dc * hours).abs() / 1000.0
-        + excess_penalty(grid, settings, hours)
+        + wear
+        + excess_penalty(forecast, grid, settings, hours)
 }
 
 #[cfg(test)]
@@ -481,6 +500,7 @@ mod tests {
                     },
                     min_soc_end: 0.0,
                     estimated_price: false,
+                    islanded: false,
                 };
                 slot = slot.next();
                 f
@@ -549,6 +569,28 @@ mod tests {
             p.slots.last().unwrap().soc_end < 45.0,
             "uses everything above the floor"
         );
+    }
+
+    #[test]
+    fn prepares_for_an_outage() {
+        // Cheap now, an outage later: the battery must carry 2 kW for an hour.
+        let mut slots = forecasts(
+            &[0.10, 0.10, 0.10, 0.10, 0.30, 0.30, 0.30, 0.30],
+            2000.0,
+            0.0,
+        );
+        for s in &mut slots[4..] {
+            s.islanded = true;
+        }
+        let p = run(&slots, 5.0, &settings());
+        assert!(
+            p.slots[..4].iter().any(|s| s.battery_ac.0 > 0.0),
+            "charges before the outage"
+        );
+        for s in &p.slots[4..] {
+            assert!(s.grid.0 <= 1e-6, "no imports during the outage: {s:?}");
+            assert!(s.pv_on);
+        }
     }
 
     #[test]
@@ -642,6 +684,7 @@ mod timing {
                     },
                     min_soc_end: 5.0,
                     estimated_price: t > 60,
+                    islanded: false,
                 };
                 slot = slot.next();
                 f

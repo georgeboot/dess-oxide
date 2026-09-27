@@ -41,6 +41,12 @@ control back to plain ESS whenever:
 - **Plans** the cheapest battery schedule for the next 48 hours or more, at
   every quarter hour and whenever prices or forecasts change. Every plan is
   stored.
+- **Prepares for a power cut** you expect: set the window on the page. The
+  plan then charges in the cheapest slots beforehand to cover the window's
+  load (with margins: load +30 %, PV −30 %), and keeps PV on during it. With
+  control on, ESS's own minimum SoC is raised to that reserve from three
+  hours before the window until its end, so the Victron keeps it even if
+  dess-oxide stops. The original minimum is restored afterwards.
 - **Shows** it all on the **dess-oxide** page in the sidebar:
   - the plan;
   - the last 24 hours, comparing what happened with what dess-oxide planned

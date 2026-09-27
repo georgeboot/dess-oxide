@@ -138,6 +138,7 @@ mod tests {
                     },
                     min_soc_end: 0.0,
                     estimated_price: false,
+                    islanded: false,
                 };
                 slot = slot.next();
                 f

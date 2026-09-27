@@ -39,6 +39,22 @@ const FALLBACK_LOAD: Watts = Watts(600.0);
 #[error("no day-ahead prices yet")]
 pub struct NoPrices;
 
+/// The expected outage window from the page's settings, if one is set and
+/// hasn't ended yet.
+pub fn outage_window(store: &Store, now: Timestamp) -> Option<(Timestamp, Timestamp)> {
+    if store.setting(OUTAGE_EXPECTED).ok().flatten().as_deref() != Some("on") {
+        return None;
+    }
+    let start: Timestamp = store.setting(OUTAGE_START).ok().flatten()?.parse().ok()?;
+    let hours: f64 = store.setting(OUTAGE_HOURS).ok().flatten()?.parse().ok()?;
+    let end = start + SignedDuration::from_secs_f64(hours.clamp(0.25, 72.0) * 3600.0);
+    (end > now).then_some((start, end))
+}
+
+pub const OUTAGE_EXPECTED: &str = "outage_expected";
+pub const OUTAGE_START: &str = "outage_start";
+pub const OUTAGE_HOURS: &str = "outage_hours";
+
 /// What a price update found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PriceUpdate {
@@ -110,7 +126,14 @@ pub struct ForecastInputs<'a> {
     /// The latest weather forecast.
     pub weather: &'a BTreeMap<Slot, Weather>,
     pub models: Models<'a>,
+    /// An expected outage, `[start, end)`.
+    pub outage: Option<(Timestamp, Timestamp)>,
 }
+
+/// During an expected outage, plan for more load and less PV than forecast,
+/// so the battery holds out even when the forecast is off.
+const OUTAGE_LOAD_MARGIN: f64 = 1.3;
+const OUTAGE_PV_MARGIN: f64 = 0.7;
 
 /// Plans from the current snapshot, stored prices and history.
 pub fn make_plan(
@@ -143,7 +166,15 @@ pub fn make_plan(
         )
     };
     let min_soc = min_soc(&info, config);
-    let forecasts = slot_forecasts(now, &prices, tariff, loads, inputs.pv, min_soc)?;
+    let forecasts = slot_forecasts(
+        now,
+        &prices,
+        tariff,
+        loads,
+        inputs.pv,
+        min_soc,
+        inputs.outage,
+    )?;
     let settings = planner_settings(config, &forecasts);
     let plan = planner::plan(&PlanRequest {
         now,
@@ -278,6 +309,7 @@ pub fn slot_forecasts(
     loads: impl FnOnce(&[Slot]) -> anyhow::Result<Vec<Watts>>,
     pv: &BTreeMap<Slot, Watts>,
     min_soc: f64,
+    outage: Option<(Timestamp, Timestamp)>,
 ) -> anyhow::Result<Vec<SlotForecast>> {
     let first = Slot::containing(now);
     let min_end = Slot::containing(now + SignedDuration::from_hours(MIN_HORIZON_HOURS));
@@ -292,13 +324,25 @@ pub fn slot_forecasts(
     spot.iter()
         .zip(loads)
         .map(|(price, load)| {
+            let pv = pv.get(&price.slot).copied().unwrap_or(Watts::ZERO);
+            let islanded = outage
+                .is_some_and(|(start, end)| price.slot.end() > start && price.slot.start() < end);
             Ok(SlotForecast {
                 slot: price.slot,
-                load,
-                pv: pv.get(&price.slot).copied().unwrap_or(Watts::ZERO),
+                load: if islanded {
+                    Watts(load.0 * OUTAGE_LOAD_MARGIN)
+                } else {
+                    load
+                },
+                pv: if islanded {
+                    Watts(pv.0 * OUTAGE_PV_MARGIN)
+                } else {
+                    pv
+                },
                 prices: tariff.prices(price.slot, price.spot)?,
                 min_soc_end: min_soc,
                 estimated_price: price.estimated,
+                islanded,
             })
         })
         .collect()

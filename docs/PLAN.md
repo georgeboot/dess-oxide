@@ -657,11 +657,11 @@ Kept behind the same trait.
 - outage duration (hours, default 4)
 
 **Behaviour:**
-- **Reserve:** `R = Σ_window (P90 base load + P90 backed-up heat pump − P10 PV) / η_discharge + ESS minimum SoC`, capped at capacity. The EV is not backed up and is left out.
-- **Planning:**
-  - The planner requires `E(t_start) ≥ R` and simulates the window as islanded (grid = 0).
+- **Planning (built):**
+  - The window's slots are islanded in the DP: the PV relay is forced on, any grid import costs the shortfall penalty, and export earns nothing. The reserve then falls out of the plan: it's the energy needed to get through the window without import.
+  - Margins until quantile forecasts exist: load ×1.3 and PV ×0.7 inside the window. The target is `R = Σ_window (P90 base load + P90 backed-up heat pump − P10 PV) / η_discharge + ESS minimum SoC`; the EV is not backed up and is left out.
   - Charging for the outage therefore happens in the cheapest slots before the window. It doesn't simply charge to 100 % right away.
-- **Backstop:** once the plan reaches R, Victron's ESS minimum SoC (`BatteryLife/MinimumSocLimit`) is raised to R. Plain ESS, our setpoint override and the DESS controller all honour it, so the Victron keeps the reserve even if dess-oxide or HA dies. The minimum is restored after the window.
+- **Backstop (built):** from three hours before the window until its end, Victron's ESS minimum SoC (`BatteryLife/MinimumSocLimit`) is raised to the plan's SoC at the window start (minus 3 points, never above the current SoC). Plain ESS, our setpoint override and the DESS controller all honour it, so the Victron keeps the reserve even if dess-oxide or HA dies. The original minimum is remembered in SQLite and restored after the window. It needs both locks, like the setpoint.
 - **PV:** the relay is forced on during the window. The Victron can then throttle the AC-coupled PV while islanded (frequency shifting), and PV can recharge the battery.
 - **Grid-loss detection:**
   - When the active input reads 240 (disconnected) or VE.Bus raises its grid-lost alarm, the page shows it (and `binary_sensor.dess_grid`, if enabled, turns off) and control drops to "island": PV on, no other actions.
@@ -782,10 +782,11 @@ These are off by default, enabled with an app option. They're for automations th
 - [ ] OpenAmber's DHW schedule as a feature; forecast accuracy per lead time
 
 **M3: Control.**
-- executor with fail-safe, relay curtailment, overrides
-- outage mode with the Victron minimum-SoC backstop
-- the "another controller is active" interlock and the two-lock enable
-- shadow-mode comparison against DAO (forecasts, decisions, cost), then handover at George's site (§18)
+- [x] executor with fail-safe, relay curtailment
+- [ ] manual overrides (hold / charge / discharge)
+- [x] outage mode with the Victron minimum-SoC backstop
+- [x] the "another controller is active" interlock and the two-lock enable
+- [ ] shadow-mode comparison against DAO (forecasts, decisions, cost), then handover at George's site (§18)
 
 **M4: Brother's site and polish.**
 - EV awareness
