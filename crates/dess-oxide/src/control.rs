@@ -225,7 +225,7 @@ fn evaluate(
     let measured = Measured {
         load: sample.load_out + sample.load_in,
         pv: sample.pv_ac + sample.pv_dc,
-        soc_pct: sample.soc_pct,
+        soc_pct: shared.soc(now).unwrap_or(sample.soc_pct),
     };
     let mut decision = control::decide(
         &view.plan,

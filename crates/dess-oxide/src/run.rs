@@ -22,6 +22,7 @@ use anyhow::Context;
 use dess_core::Slot;
 use dess_core::efficiency::EfficiencySampler;
 use dess_core::record::{Recorder, SlotRecord};
+use dess_core::soc::SocEstimator;
 use dess_core::tariff::Tariff;
 use dess_core::weather::Weather;
 use dess_models::heatpump::HpModel;
@@ -70,6 +71,8 @@ pub struct Shared {
     pub replan_now: watch::Sender<u64>,
     /// When to start the dishwasher; fixed once that time has come.
     pub cheapest_start: watch::Sender<Option<planning::CheapestStart>>,
+    /// The recorder's SoC estimate (finer than the BMS's) and when it was made.
+    pub soc: Mutex<Option<(Timestamp, f64)>>,
 }
 
 /// What the page shows about the service itself.
@@ -93,6 +96,14 @@ impl Shared {
 
     pub fn control_status(&self) -> crate::control::ControlStatus {
         self.control.lock().expect("control lock poisoned").clone()
+    }
+
+    /// The SoC estimate, if it's current.
+    pub fn soc(&self, now: Timestamp) -> Option<f64> {
+        let estimate = *self.soc.lock().expect("soc lock poisoned");
+        estimate
+            .filter(|(at, _)| now.duration_since(*at) <= SignedDuration::from_secs(5))
+            .map(|(_, soc)| soc)
     }
 }
 
@@ -169,6 +180,7 @@ impl Shared {
             control: Mutex::new(crate::control::ControlStatus::default()),
             replan_now: watch::Sender::new(0),
             cheapest_start: watch::Sender::new(None),
+            soc: Mutex::new(None),
         })
     }
 }
@@ -233,6 +245,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     let mut recorder = Recorder::new(MAX_SAMPLE_GAP);
     let mut sampler = EfficiencySampler::default();
+    let mut soc = SocEstimator::new(dess_core::WattHours(0.0));
     let mut warnings = RateLimitedWarning::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
@@ -245,10 +258,19 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
         let now = Timestamp::now();
         let sample = venus.with_snapshot(|snapshot| {
             fresh(&venus, snapshot, now)?;
-            reading::sample(snapshot, now).map_err(|e| e.to_string())
+            // The plan's capacity includes the learned one.
+            let planned = shared.plan.borrow().as_ref().map(|v| v.battery.capacity.0);
+            let capacity = planned.or_else(|| {
+                planning::capacity_wh(&reading::battery_info(snapshot), &shared.config, None)
+            });
+            let sample = reading::sample(snapshot, now).map_err(|e| e.to_string())?;
+            Ok::<_, String>((sample, capacity))
         });
         match sample {
-            Ok(sample) => {
+            Ok((mut sample, capacity)) => {
+                soc.set_capacity(dess_core::WattHours(capacity.unwrap_or(0.0)));
+                sample.soc_pct = soc.update(now, sample.soc_pct, sample.battery);
+                *shared.soc.lock().expect("soc lock poisoned") = Some((now, sample.soc_pct));
                 if warnings.clear() {
                     shared.update_status(|s| s.problem = None);
                 }
@@ -651,6 +673,7 @@ fn replan(venus: &Venus, shared: &Shared) {
             load: load_model.as_deref(),
         },
         outage,
+        soc: shared.soc(now),
     };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)

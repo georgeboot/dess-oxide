@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.8.0
+
+- **Forecast accuracy by lead time:** the page compares the last week's
+  load and PV forecasts with what happened, split by how far ahead they
+  were made (0–6 h, 6–24 h, 24–48 h): error and bias. Useful while it runs
+  next to DAO.
+- **Finer state of charge:** a BMS that reports whole percent (320 Wh
+  steps on 32 kWh) is refined from battery power between its steps, and
+  re-anchored at each step. The plan, control and records use it.
+- **Learned usable capacity** from long charge and discharge stretches,
+  shown with the cells' own round-trip efficiency. A configured
+  `battery.capacity_kwh` still wins.
+
 ## 0.7.0
 
 - **Cheapest start** for the dishwasher (or any flexible run): the page

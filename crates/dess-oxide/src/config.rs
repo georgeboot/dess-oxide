@@ -107,6 +107,16 @@ pub struct HistoryConfig {
     pub ev: Option<String>,
 }
 
+impl VictronConfig {
+    /// The PV relay's index (0 or 1) and whether closed means PV on.
+    pub fn pv_relay_state(&self) -> Option<(usize, bool)> {
+        self.pv_relay.map(|relay| {
+            let closed_means_on = self.pv_relay_energized == RelayAction::PvOn;
+            (usize::from(relay.clamp(1, 2) - 1), closed_means_on)
+        })
+    }
+}
+
 impl HistoryConfig {
     /// `(role, entity)` for every configured sensor.
     pub fn entities(&self) -> Vec<(&'static str, &str)> {

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::Context;
+use dess_core::capacity::SlotEnergy;
 use dess_core::efficiency::BinStats;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
@@ -151,6 +152,24 @@ pub struct HistorySlot {
     pub planned_grid: Option<Watts>,
     pub forecast_load: Option<Watts>,
     pub forecast_pv: Option<Watts>,
+}
+
+/// Forecast errors for one range of lead times.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LeadAccuracy {
+    pub lead: &'static str,
+    pub load: Option<ErrorStats>,
+    pub pv: Option<ErrorStats>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ErrorStats {
+    /// Forecasts compared (one per stored plan and slot).
+    pub slots: usize,
+    /// Mean absolute error, and mean error (positive = forecast too high).
+    pub mae: Watts,
+    pub bias: Watts,
+    pub mean_actual: Watts,
 }
 
 impl Store {
@@ -576,6 +595,94 @@ impl Store {
         }
     }
 
+    /// How far off the stored forecasts were for the slots recorded since
+    /// `from`, by how far ahead they were made (up to 48 h). Load is
+    /// compared as in [`Store::load_history`]; PV only in daylight slots with
+    /// the PV relay in the PV-on state throughout (see [`Store::recorded_pv`]).
+    pub fn forecast_accuracy(
+        &self,
+        from: Slot,
+        include_input: bool,
+        pv_relay: Option<(usize, bool)>,
+    ) -> anyhow::Result<Vec<LeadAccuracy>> {
+        let mut query = self.conn.prepare_cached(
+            "WITH j AS (
+                SELECT CASE WHEN p.slot_start - p.planned_at < 6 * 3600 THEN 0
+                            WHEN p.slot_start - p.planned_at < 24 * 3600 THEN 1
+                            ELSE 2 END AS bucket,
+                       p.load_w AS load_f,
+                       (m.load_out_wh + CASE WHEN ?2 THEN m.load_in_wh ELSE 0 END) * 3600.0 / m.covered_seconds AS load_a,
+                       p.pv_w AS pv_f,
+                       (m.pv_ac_wh + m.pv_dc_wh) * 3600.0 / m.covered_seconds AS pv_a,
+                       CASE WHEN ?3 IS NULL THEN 1
+                            WHEN ?4 THEN (CASE ?3 WHEN 0 THEN m.relay1_closed_seconds ELSE m.relay2_closed_seconds END) >= m.covered_seconds - 1.0
+                            ELSE (CASE ?3 WHEN 0 THEN m.relay1_closed_seconds ELSE m.relay2_closed_seconds END) <= 1.0
+                       END AS pv_known
+                FROM plans p JOIN slot_measurements m USING (slot_start)
+                WHERE p.slot_start >= ?1 AND m.covered_seconds >= 850
+                  AND p.planned_at <= p.slot_start AND p.slot_start - p.planned_at <= 48 * 3600
+            )
+            SELECT bucket, count(*), avg(abs(load_f - load_a)), avg(load_f - load_a), avg(load_a),
+                   count(CASE WHEN pv_known AND (pv_f > 50 OR pv_a > 50) THEN 1 END),
+                   avg(CASE WHEN pv_known AND (pv_f > 50 OR pv_a > 50) THEN abs(pv_f - pv_a) END),
+                   avg(CASE WHEN pv_known AND (pv_f > 50 OR pv_a > 50) THEN pv_f - pv_a END),
+                   avg(CASE WHEN pv_known AND (pv_f > 50 OR pv_a > 50) THEN pv_a END)
+            FROM j GROUP BY bucket ORDER BY bucket",
+        )?;
+        let (relay, closed_means_on) = pv_relay.map_or((None, false), |(r, c)| (Some(r), c));
+        let rows = query.query_map(
+            params![
+                from.start_unix(),
+                include_input,
+                relay.map(|r| u8::from(r > 0)),
+                closed_means_on
+            ],
+            |row| {
+                let error = |n: usize, mae: usize| -> rusqlite::Result<Option<ErrorStats>> {
+                    let count: i64 = row.get(n)?;
+                    if count == 0 {
+                        return Ok(None);
+                    }
+                    Ok(Some(ErrorStats {
+                        slots: usize::try_from(count).unwrap_or(0),
+                        mae: Watts(row.get(mae)?),
+                        bias: Watts(row.get(mae + 1)?),
+                        mean_actual: Watts(row.get(mae + 2)?),
+                    }))
+                };
+                Ok(LeadAccuracy {
+                    lead: match row.get::<_, i64>(0)? {
+                        0 => "0–6 h",
+                        1 => "6–24 h",
+                        _ => "24–48 h",
+                    },
+                    load: error(1, 2)?,
+                    pv: error(5, 6)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Battery DC energy and SoC per fully covered slot since `from`.
+    pub fn slot_energy(&self, from: Slot) -> anyhow::Result<Vec<SlotEnergy>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, soc_start, soc_end, battery_charge_wh, battery_discharge_wh
+             FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds >= 850
+             ORDER BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok(SlotEnergy {
+                start: row.get(0)?,
+                soc_start: row.get(1)?,
+                soc_end: row.get(2)?,
+                charge_wh: row.get(3)?,
+                discharge_wh: row.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Recorded AC PV energy per slot since `from`, for fully covered slots
     /// with the PV relay in the PV-on state throughout (per `pv_on`).
     pub fn recorded_pv(
@@ -751,6 +858,42 @@ mod tests {
         assert!((mean(false) - 1000.0).abs() < 10.0, "{}", mean(false));
         let history = store.history(from, false).unwrap();
         assert!((history[0].load.0 - 1000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn forecast_errors_by_lead_time() {
+        let store = Store::in_memory().unwrap();
+        let mut slot = record("2026-09-27T11:00:00Z", 899);
+        slot.load_out = dess_core::WattHours(250.0); // 1 kW
+        slot.pv_ac = dess_core::WattHours(500.0); // 2 kW
+        store.save_slot(&slot, 0).unwrap();
+        let start = slot.slot.start_unix();
+        // Forecasts made 1 h ahead (load 1.5 kW, PV 2 kW) and 30 h ahead
+        // (load 0.5 kW, PV 3 kW).
+        for (ahead, load, pv) in [(3600, 1500.0, 2000.0), (30 * 3600, 500.0, 3000.0)] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO plans VALUES (?1, ?2, ?3, ?4, 0.2, 0.1, 0, 0, 0, 1, 50, 0.1)",
+                    params![start - ahead, start, load, pv],
+                )
+                .unwrap();
+        }
+        let accuracy = store.forecast_accuracy(slot.slot, true, None).unwrap();
+        assert_eq!(accuracy.len(), 2);
+        let (near, far) = (&accuracy[0], &accuracy[1]);
+        assert_eq!((near.lead, far.lead), ("0–6 h", "24–48 h"));
+        let near_load = near.load.unwrap();
+        assert!((near_load.bias.0 - 500.0).abs() < 5.0, "{near_load:?}");
+        assert!((near.pv.unwrap().mae.0).abs() < 5.0);
+        assert!((far.load.unwrap().bias.0 + 500.0).abs() < 5.0);
+        assert!((far.pv.unwrap().bias.0 - 1000.0).abs() < 5.0);
+        // With the relay open all slot and "closed = PV on", PV isn't known.
+        let relay = store
+            .forecast_accuracy(slot.slot, true, Some((1, true)))
+            .unwrap();
+        assert!(relay[0].pv.is_none());
+        assert!(relay[0].load.is_some());
     }
 
     #[test]

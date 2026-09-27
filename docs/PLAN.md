@@ -411,8 +411,8 @@ Learned from the ~1 s Victron samples:
   - DC side: battery power minus DC PV (zero at George's site).
 - **Steady-state filter:** keep samples where power is stable within ±3 % for at least 20 s. Leave out transitions and charge-stage changes. Samples are aggregated into `efficiency_bins`.
 - **Loss model per direction:** `loss(P) = a + b·|P| + c·P²`, where `a` is idle loss, `b` covers switching and linear losses, and `c` is resistive. This gives the planner a smooth, physically shaped efficiency curve.
-- **SoC estimator:** George's JK-BMS reports whole percent (320 Wh steps) and its coulomb counter drifts between full charges. We keep our own estimate: integrate battery DC power, re-anchor at each BMS step and at 100 % (a small Kalman filter). The planner's 100 Wh grid and the 1 Hz loop need it.
-- **Usable capacity:** over long one-way stretches (ΔSoC ≥ 30 %), `C = ∫P_dc dt / ΔSoC`. The difference between charge and discharge stretches gives the battery's own DC round-trip efficiency. Tracking capacity fade comes for free.
+- **SoC estimator (built):** George's JK-BMS reports whole percent (320 Wh steps) and its coulomb counter drifts between full charges. We keep our own estimate: integrate battery DC power, keep it within the reported value's rounding band, and re-anchor at each BMS step (the midpoint of the two values). The planner's 100 Wh grid and the 1 Hz loop need it. Fractional reports pass through.
+- **Usable capacity (built):** over long one-way stretches (ΔSoC ≥ 30 %, charging stops counting near 100 % where the BMS may resync), `C = ∫P_dc dt / ΔSoC`, the median per direction. The planner uses the geometric mean of the two; their ratio is the battery's own DC round-trip efficiency. Tracking capacity fade comes for free. A configured `capacity_kwh` still wins.
 - **Power limits:** the live DVCC/BMS charge and discharge current limits are read live from the Cerbo. For future slots, the planner uses a learned curve of maximum charge power vs SoC (the taper near full).
 - **Prior until enough data:** a loss curve fitted to George's DAO stage table (71 % at 300 W charge, which is mostly idle loss from three units) and 32 kWh.
 
@@ -779,8 +779,9 @@ These are off by default, enabled with an app option. They're for automations th
 - [x] heat pump (burn): balance temperature, thermal lag, wind, solar, COP(T), humidity-driven frost, hot water profile
 - [x] base load (burn MLP) with Dutch holidays
 - [x] promotion gate against baselines on held-out days; learned values on the page
-- [ ] usable capacity and SoC estimator (the JK-BMS reports whole percent)
-- [ ] OpenAmber's DHW schedule as a feature; forecast accuracy per lead time
+- [x] usable capacity and SoC estimator (the JK-BMS reports whole percent)
+- [x] forecast accuracy per lead time (0–6 h, 6–24 h, 24–48 h, from the stored plans)
+- [ ] OpenAmber's DHW schedule as a feature
 
 **M3: Control.**
 - [x] executor with fail-safe, relay curtailment

@@ -37,7 +37,9 @@ control back to plain ESS whenever:
   - house load from a **learned base-load model plus a learned heat pump
     model**. The heat pump model includes frost losses in humid air. Until
     they beat the naive forecast, load comes from history.
-- **Learns the battery and inverter losses** from what it records.
+- **Learns the battery**: the inverter and battery losses, and the usable
+  capacity from long charge and discharge stretches. It also keeps a finer
+  state of charge than a BMS that reports whole percent.
 - **Plans** the cheapest battery schedule for the next 48 hours or more, at
   every quarter hour and whenever prices or forecasts change. Every plan is
   stored.
@@ -51,7 +53,8 @@ control back to plain ESS whenever:
   - the plan;
   - the last 24 hours, comparing what happened with what dess-oxide planned
     and the setpoint your current system actually ran;
-  - forecast accuracy.
+  - forecast accuracy over the last week, by how far ahead each forecast
+    was made.
 
 It creates no Home Assistant entities unless you turn on `ha_entities`.
 

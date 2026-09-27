@@ -12,7 +12,7 @@ use axum::http::StatusCode;
 use axum::middleware::{self, Next};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use dess_core::Slot;
+use dess_core::{Slot, Watts};
 use dess_victron::probe::Severity;
 use jiff::{SignedDuration, Timestamp};
 use maud::{DOCTYPE, Markup, PreEscaped, html};
@@ -22,7 +22,8 @@ use tracing::{error, info};
 use crate::chart::{Chart, Kind, Series};
 use crate::planning::{PlanView, lock};
 use crate::run::Shared;
-use crate::store::{HistorySlot, StoredModel};
+use crate::store::{ErrorStats, HistorySlot, LeadAccuracy, StoredModel};
+use dess_core::capacity::CapacityFit;
 use dess_core::efficiency::LearnedLosses;
 
 /// Home Assistant's ingress proxy; the only client allowed inside HA.
@@ -196,7 +197,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
         error!(%error, "reading history");
         Vec::new()
     });
-    let (models, losses) = tokio::task::block_in_place(|| {
+    let (models, (losses, capacity), accuracy) = tokio::task::block_in_place(|| {
         let store = lock(&shared.store);
         let models = ["pv", "heat_pump", "load"].map(|name| {
             store.model(name).unwrap_or_else(|error| {
@@ -204,27 +205,50 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
                 None
             })
         });
-        (models, crate::planning::learned_losses(&store, now).ok())
+        let accuracy = store
+            .forecast_accuracy(
+                Slot::containing(now - SignedDuration::from_hours(24 * 7)),
+                !shared.config.ev.on_input,
+                shared.config.victron.pv_relay_state(),
+            )
+            .unwrap_or_else(|error| {
+                error!(%error, "reading forecast accuracy");
+                Vec::new()
+            });
+        let battery = (
+            crate::planning::learned_losses(&store, now).ok(),
+            crate::planning::learned_capacity(&store, now).ok(),
+        );
+        (models, battery, accuracy)
     });
     Html(
         render(
             &shared,
             view.as_deref(),
-            &history,
+            &Recorded {
+                history: &history,
+                accuracy: &accuracy,
+            },
             &models,
-            losses.as_ref(),
+            (losses.as_ref(), capacity.as_ref()),
             now,
         )
         .into_string(),
     )
 }
 
+/// What the page shows about the past.
+struct Recorded<'a> {
+    history: &'a [HistorySlot],
+    accuracy: &'a [LeadAccuracy],
+}
+
 fn render(
     shared: &Shared,
     view: Option<&PlanView>,
-    history: &[HistorySlot],
+    recorded: &Recorded<'_>,
     models: &[Option<StoredModel>; 3],
-    losses: Option<&LearnedLosses>,
+    (losses, capacity): (Option<&LearnedLosses>, Option<&CapacityFit>),
     now: Timestamp,
 ) -> Markup {
     let status = shared.status.lock().expect("status lock poisoned").clone();
@@ -259,9 +283,10 @@ fn render(
                     }
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
                 }
-                (history_section(shared, history, now))
+                (history_section(shared, recorded.history, now))
+                (accuracy_section(recorded.accuracy))
                 (models_section(shared, models))
-                @if let Some(view) = view { (battery_section(&view.battery, losses)) }
+                @if let Some(view) = view { (battery_section(&view.battery, losses, capacity)) }
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -377,7 +402,7 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
     };
     html! {
         section.cards {
-            div.card { span.label { "Battery" } span.value { (format!("{:.0} %", view.soc)) } span.sub { (format!("{:.1} kWh usable", view.battery.capacity.0 / 1000.0)) } }
+            div.card { span.label { "Battery" } span.value { (format!("{:.1} %", shared.soc(Timestamp::now()).unwrap_or(view.soc))) } span.sub { (format!("{:.1} kWh usable", view.battery.capacity.0 / 1000.0)) } }
             div.card { span.label { "This quarter hour" } span.value { (format!("{battery:+.1} kW")) } span.sub { (action) ", grid " (format!("{:+.1} kW", first.grid.0 / 1000.0)) } }
             div.card { span.label { "Price now" } span.value { (format!("€{:.3}", first.prices.buy.0)) } span.sub { "sell €" (format!("{:.3}", first.prices.sell.0)) } }
             div.card { span.label { "Stored energy is worth" } span.value { (format!("€{:.3}/kWh", first.stored_energy_value.0)) } span.sub { "what the last kWh in the battery will save or earn later — not what it cost" } }
@@ -586,6 +611,52 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     }
 }
 
+fn accuracy_section(accuracy: &[LeadAccuracy]) -> Markup {
+    if accuracy.is_empty() {
+        return html! {};
+    }
+    let cell = |stats: Option<ErrorStats>| match stats {
+        None => html! { td { "–" } td { "–" } },
+        Some(s) => {
+            let percent = |w: Watts| {
+                if s.mean_actual.0.abs() > 1.0 {
+                    format!(" ({:+.0} %)", w.0 / s.mean_actual.0 * 100.0)
+                } else {
+                    String::new()
+                }
+            };
+            html! {
+                td { (format!("{:.2} kW", s.mae.0 / 1000.0)) (percent(s.mae).replace('+', "")) }
+                td { (format!("{:+.2} kW", s.bias.0 / 1000.0)) (percent(s.bias)) }
+            }
+        }
+    };
+    html! {
+        section {
+            h2 { "Forecast accuracy" }
+            p.muted {
+                "The last 7 days, by how far ahead the forecast was made: mean absolute error, and bias "
+                "(positive = forecast too high), as a share of the actual mean. PV counts daylight slots with PV on."
+            }
+            div.scroll {
+                table {
+                    thead { tr { th { "ahead" } th { "load error" } th { "load bias" } th { "PV error" } th { "PV bias" } th { "forecasts" } } }
+                    tbody {
+                        @for row in accuracy {
+                            tr {
+                                td { (row.lead) }
+                                (cell(row.load))
+                                (cell(row.pv))
+                                td { (row.load.map_or(0, |s| s.slots)) }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup {
     let [pv, heat_pump, load] = models;
     let number = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
@@ -677,7 +748,9 @@ fn hot_water_peak(profile: &[f64; 24]) -> String {
 fn battery_section(
     battery: &dess_core::battery::BatteryModel,
     losses: Option<&LearnedLosses>,
+    capacity: Option<&CapacityFit>,
 ) -> Markup {
+    let kwh = |wh: f64| format!("{:.1} kWh", wh / 1000.0);
     let learned = |side: bool| {
         losses.is_some_and(|l| {
             if side {
@@ -697,6 +770,21 @@ fn battery_section(
     };
     html! {
         h3 { "Battery and inverters" }
+        p {
+            "Usable capacity " strong { (kwh(battery.capacity.0)) }
+            @match capacity.filter(|c| c.usable_wh().is_some()) {
+                Some(c) => {
+                    ", learned from " (c.stretches) " long charge or discharge stretches"
+                    @if let (Some(charge), Some(discharge)) = (c.charge_wh, c.discharge_wh) {
+                        " (charging " (kwh(charge)) ", discharging " (kwh(discharge))
+                        @if let Some(rt) = c.round_trip() { ": the cells' own round trip is " (format!("{:.1} %", rt * 100.0)) }
+                        ")"
+                    }
+                    ", unless set in the options."
+                }
+                None => ", from the options or the GX device until it has seen a 30 % stretch each way.",
+            }
+        }
         p {
             "Charging curve: " (if learned(true) { "learned" } else { "prior (not enough steady data yet)" })
             "; discharging: " (if learned(false) { "learned" } else { "prior" })

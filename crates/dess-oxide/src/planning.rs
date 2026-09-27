@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use dess_core::battery::BatteryModel;
+use dess_core::capacity::CapacityFit;
 use dess_core::efficiency::LearnedLosses;
 use dess_core::planner::{self, Plan, PlanRequest, PlannerSettings, SlotForecast};
 use dess_core::solar::Orientation;
@@ -186,7 +187,7 @@ pub struct Models<'a> {
     pub load: Option<&'a LoadModel>,
 }
 
-/// What the plan's forecasts are made from.
+/// What the plan is made from, besides the GX snapshot and the store.
 #[derive(Debug, Clone, Copy)]
 pub struct ForecastInputs<'a> {
     pub pv: &'a BTreeMap<Slot, Watts>,
@@ -195,6 +196,8 @@ pub struct ForecastInputs<'a> {
     pub models: Models<'a>,
     /// An expected outage, `[start, end)`.
     pub outage: Option<(Timestamp, Timestamp)>,
+    /// A finer SoC than the BMS reports, if the recorder has one (%).
+    pub soc: Option<f64>,
 }
 
 /// During an expected outage, plan for more load and less PV than forecast,
@@ -211,9 +214,13 @@ pub fn make_plan(
     tariff: &Tariff,
     inputs: ForecastInputs<'_>,
 ) -> anyhow::Result<PlanView> {
-    let soc = reading::sample(snapshot, now)?.soc_pct;
+    let soc = match inputs.soc {
+        Some(soc) => soc,
+        None => reading::sample(snapshot, now)?.soc_pct,
+    };
     let info = reading::battery_info(snapshot);
-    let battery = battery_model(&info, config, &learned_losses(store, now)?)?;
+    let learned = learned_capacity(store, now)?.usable_wh();
+    let battery = battery_model(&info, config, &learned_losses(store, now)?, learned)?;
     let lookback =
         Slot::containing(now - SignedDuration::from_hours(24 * i64::from(PRICE_LOOKBACK_DAYS + 1)));
     let prices = store.prices(
@@ -334,16 +341,29 @@ pub fn learned_losses(store: &Store, now: Timestamp) -> anyhow::Result<LearnedLo
 
 /// The battery model and current state, from the GX device, with learned
 /// losses where there's enough data.
+/// Usable capacity learned from the last half year's long SoC stretches.
+pub fn learned_capacity(store: &Store, now: Timestamp) -> anyhow::Result<CapacityFit> {
+    let from = Slot::containing(now - SignedDuration::from_hours(24 * 180));
+    Ok(dess_core::capacity::fit_capacity(&store.slot_energy(from)?))
+}
+
+/// Usable capacity: configured, else learned, else from the GX device.
+pub fn capacity_wh(info: &BatteryInfo, config: &Config, learned: Option<f64>) -> Option<f64> {
+    config
+        .battery
+        .capacity_kwh
+        .map(|kwh| kwh * 1000.0)
+        .or(learned)
+        .or(info.capacity_wh)
+}
+
 pub fn battery_model(
     info: &BatteryInfo,
     config: &Config,
     learned: &LearnedLosses,
+    learned_capacity: Option<f64>,
 ) -> anyhow::Result<BatteryModel> {
-    let capacity_wh = config
-        .battery
-        .capacity_kwh
-        .map(|kwh| kwh * 1000.0)
-        .or(info.capacity_wh)
+    let capacity_wh = capacity_wh(info, config, learned_capacity)
         .context("battery capacity unknown: set battery.capacity_kwh")?;
     let units = info.inverter_units;
     let voltage = info.voltage.unwrap_or(51.2);

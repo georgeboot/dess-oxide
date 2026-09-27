@@ -13,7 +13,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::json;
 
-use crate::config::{Config, LocationConfig, RelayAction};
+use crate::config::{Config, LocationConfig};
 use crate::store::Store;
 
 /// Configured arrays lose about this much before AC; the learned kWp
@@ -59,11 +59,7 @@ pub fn pv_hours(
     );
     let until = Slot::containing(now);
     let weather = store.weather(from, until)?;
-    let relay = config.victron.pv_relay.map(|relay| {
-        let closed_means_on = config.victron.pv_relay_energized == RelayAction::PvOn;
-        (usize::from(relay - 1), closed_means_on)
-    });
-    let recorded = store.recorded_pv(from, relay)?;
+    let recorded = store.recorded_pv(from, config.victron.pv_relay_state())?;
     let ha: BTreeMap<i64, f64> = match config.history.pv.as_deref().filter(|e| !e.is_empty()) {
         Some(entity) => store
             .ha_hourly(&[entity], from.start())?
