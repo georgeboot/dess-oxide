@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.14.0
+
+- **The AC battery options are gone:** `history.battery_in` and
+  `battery_out` are no longer read. Give the BMS's DC counters
+  (`battery_dc_in`, `battery_dc_out`); dess-oxide works out the AC side
+  itself. Without them, the house load comes from its own recordings.
+
 ## 0.13.0
 
 - **Battery history from the BMS's DC counters:** set `history.battery_dc_in`

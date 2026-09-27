@@ -299,9 +299,10 @@ pub fn make_plan(
 /// plus hours from Home Assistant's statistics where nothing was recorded
 /// (each hour's mean spread over its four slots).
 ///
-/// The battery's part comes from its AC sensors, or from its DC counters
-/// (the BMS's) through `battery`'s loss curves and standby draw; DC wins
-/// when both are set. Without a model, DC counts as AC.
+/// The battery's part comes from its DC counters (the BMS's) through
+/// `battery`'s loss curves and standby draw; without a model, DC counts as
+/// AC. Without both counters, only the recordings count: the derived load
+/// would be wrong whenever the battery moved.
 pub fn load_history(
     store: &Store,
     history: &HistoryConfig,
@@ -323,18 +324,10 @@ pub fn load_history(
     let (Some(import), Some(export)) = (entity("grid_import"), entity("grid_export")) else {
         return Ok(by_slot.into_iter().collect());
     };
-    let dc = entity("battery_dc_in").is_some() && entity("battery_dc_out").is_some();
-    let (battery_in, battery_out) = if dc {
-        ("battery_dc_in", "battery_dc_out")
-    } else {
-        ("battery_in", "battery_out")
-    };
-    // Without the battery's flows the derived load would be wrong whenever
-    // the battery moved: then only dess-oxide's own recordings count.
-    if entity(battery_in).is_none() || entity(battery_out).is_none() {
+    if entity("battery_dc_in").is_none() || entity("battery_dc_out").is_none() {
         return Ok(by_slot.into_iter().collect());
     }
-    let optional = ["pv", battery_in, battery_out, "ev"].map(entity);
+    let optional = ["pv", "battery_dc_in", "battery_dc_out", "ev"].map(entity);
     let mut entities = vec![import.as_str(), export.as_str()];
     entities.extend(optional.iter().flatten().map(String::as_str));
     for (hour, values) in store.ha_hourly(&entities, from.start())? {
@@ -351,7 +344,7 @@ pub fn load_history(
             continue;
         }
         let [pv, battery_in, battery_out, ev] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
-        let (battery_in, battery_out) = match battery.filter(|_| dc) {
+        let (battery_in, battery_out) = match battery {
             Some(model) => ac_from_dc(model, battery_in, battery_out),
             None => (battery_in, battery_out),
         };
@@ -969,16 +962,16 @@ mod tests {
             grid_import: Some("sensor.import".into()),
             grid_export: Some("sensor.export".into()),
             pv: Some("sensor.pv".into()),
-            battery_in: Some("sensor.bat_in".into()),
-            battery_out: Some("sensor.bat_out".into()),
+            battery_dc_in: Some("sensor.bat_in".into()),
+            battery_dc_out: Some("sensor.bat_out".into()),
             heat_pump: None,
             ev: None,
-            ..HistoryConfig::default()
         };
         let from = Slot::containing("2026-09-26T00:00:00Z".parse().unwrap());
         let loads = load_history(&store, &history, false, None, from).unwrap();
         assert_eq!(loads.len(), 4);
-        // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour.
+        // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour (no battery
+        // model, so DC counts as AC).
         assert!(loads.iter().all(|(_, w)| (w.0 - 1600.0).abs() < 1e-9));
 
         // A sensor without a value for the hour makes the hour unusable.

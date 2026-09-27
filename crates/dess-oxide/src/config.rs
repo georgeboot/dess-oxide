@@ -108,20 +108,17 @@ impl Default for CheapestStartConfig {
 }
 
 /// Energy sensors (cumulative kWh, as in HA's energy dashboard). House load
-/// is derived as `grid_import − grid_export + pv − battery_in + battery_out`.
+/// is derived as `grid_import − grid_export + pv − AC into the inverters + AC
+/// out of them`, the AC side from the battery's DC counters.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct HistoryConfig {
     pub grid_import: Option<String>,
     pub grid_export: Option<String>,
     pub pv: Option<String>,
-    /// AC energy into the battery system.
-    pub battery_in: Option<String>,
-    /// AC energy out of the battery system.
-    pub battery_out: Option<String>,
-    /// DC energy into the battery, e.g. the BMS's counter. With
-    /// `battery_dc_out`, used instead of the AC pair, converted with the
-    /// learned losses.
+    /// DC energy into the battery, e.g. the BMS's counter. Turned into AC
+    /// with the learned losses; without both counters, HA's history isn't
+    /// used for the load (only dess-oxide's own recordings are).
     pub battery_dc_in: Option<String>,
     pub battery_dc_out: Option<String>,
     pub heat_pump: Option<String>,
@@ -146,8 +143,6 @@ impl HistoryConfig {
             ("grid_import", &self.grid_import),
             ("grid_export", &self.grid_export),
             ("pv", &self.pv),
-            ("battery_in", &self.battery_in),
-            ("battery_out", &self.battery_out),
             ("battery_dc_in", &self.battery_dc_in),
             ("battery_dc_out", &self.battery_dc_out),
             ("heat_pump", &self.heat_pump),

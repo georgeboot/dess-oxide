@@ -104,10 +104,8 @@ history:                    # optional: HA energy sensors (cumulative kWh)
   grid_import: sensor.p1_meter_energy_import
   grid_export: sensor.p1_meter_energy_export
   pv: sensor.pv_inverter_energy
-  battery_dc_in: sensor.bms_energy_in     # the BMS's counters (DC), or:
+  battery_dc_in: sensor.bms_energy_in     # the BMS's counters (DC)
   battery_dc_out: sensor.bms_energy_out
-  # battery_in: sensor.battery_ac_charge_energy   # AC side, if you have it
-  # battery_out: sensor.battery_ac_discharge_energy
   heat_pump: sensor.heat_pump_energy
   ev: sensor.ev_charger_energy   # optional: left out of the house load
 cheapest_start:             # a flexible run, such as the dishwasher
@@ -124,13 +122,14 @@ openamber_device: ""        # e.g. openamber: split the heat pump into heating a
 **`history`** gives the forecasts real history on day one. dess-oxide
 copies these sensors' hourly statistics from Home Assistant: up to three
 years at first, then every six hours. House load is derived as
-`import − export + pv − battery_in + battery_out`. This only reads from HA.
+`import − export + pv −` the inverters' AC in `+` their AC out. This only
+reads from HA.
 
-For the battery, the BMS's DC counters (`battery_dc_in`, `battery_dc_out`)
-are usually the better choice: they tend to go back further than AC
-sensors. dess-oxide turns each hour's DC energy into AC with the losses it
-learned from the inverters, plus their standby draw. If both pairs are set,
-DC wins.
+For the battery, give the BMS's DC counters (`battery_dc_in`,
+`battery_dc_out`): dess-oxide turns each hour's DC energy into AC itself,
+with the losses it learns from the inverters and their standby draw. No AC
+sensor is needed. Without the counters, the house load comes from
+dess-oxide's own recordings only (the models then need a couple of weeks).
 
 **`cheapest_start`** is DAO's `machines`, simplified: the page shows when
 to start a run of `hours` using `kwh` so it's cheapest, within the night

@@ -4,7 +4,7 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.13.0"
+version: "0.14.0"
 slug: dess_oxide
 description: Plans and (once you allow it) runs a Victron ESS against Dutch day-ahead prices.
 url: https://github.com/georgeboot/dess-oxide
@@ -103,8 +103,6 @@ schema:
     grid_import: str?
     grid_export: str?
     pv: str?
-    battery_in: str?
-    battery_out: str?
     battery_dc_in: str?
     battery_dc_out: str?
     heat_pump: str?

@@ -44,7 +44,8 @@ vat_on_export = false
 # longitude = 5.12
 
 # Optional: HA energy sensors (cumulative kWh) whose long-term statistics
-# bootstrap the history. Load = import − export + pv − battery_in + battery_out.
+# bootstrap the history. Load = import − export + pv − AC into the inverters + AC
+# out of them, the AC side from the battery's DC counters and the learned losses.
 [history]
 grid_import = "sensor.p1_meter_energy_import"
 grid_export = "sensor.p1_meter_energy_export"

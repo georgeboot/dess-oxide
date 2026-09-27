@@ -77,7 +77,7 @@ What DAO gets right, and we keep:
 - date-effective tariff components
 - a receding horizon that executes only the first slot
 - power-dependent conversion efficiency (we learn it instead of asking for it)
-- the load identity `load = import − export + pv − battery_in + battery_out`
+- the load identity `load = import − export + pv − AC into the inverters + AC out` (the AC side from the BMS's DC counters and the learned losses)
 
 ## 5. Scope
 
@@ -212,8 +212,8 @@ history:                         # optional, only used by `import`
   grid_import: sensor.p1_meter_energy_import
   grid_export: sensor.p1_meter_energy_export
   pv: sensor.pv_omvormer_energie
-  battery_in: sensor.accu_ac_laadenergie
-  battery_out: sensor.accu_ac_ontlaadenergie
+  battery_dc_in: sensor.batterij_energie_in     # BMS counters; AC from the learned losses
+  battery_dc_out: sensor.batterij_energie_uit
   soc: sensor.batterij_soc
 ```
 
