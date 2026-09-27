@@ -68,6 +68,8 @@ pub struct Shared {
     pub control: Mutex<crate::control::ControlStatus>,
     /// Bumped to make the planner run now (e.g. after an outage change).
     pub replan_now: watch::Sender<u64>,
+    /// When to start the dishwasher; fixed once that time has come.
+    pub cheapest_start: watch::Sender<Option<planning::CheapestStart>>,
 }
 
 /// What the page shows about the service itself.
@@ -166,6 +168,7 @@ impl Shared {
             status: Mutex::new(Status::default()),
             control: Mutex::new(crate::control::ControlStatus::default()),
             replan_now: watch::Sender::new(0),
+            cheapest_start: watch::Sender::new(None),
         })
     }
 }
@@ -197,6 +200,12 @@ fn spawn_tasks(
         stopped.clone(),
     )));
     tasks.push(tokio::spawn(fetch_weather(
+        Arc::clone(shared),
+        client.clone(),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(crate::entities::publish(
+        Arc::clone(venus),
         Arc::clone(shared),
         client,
         stopped.clone(),
@@ -668,6 +677,17 @@ fn replan(venus: &Venus, shared: &Shared) {
                     "planned (shadow)"
                 );
             }
+            let next =
+                planning::cheapest_start(&view, &shared.config.cheapest_start, &shared.tz, now);
+            shared.cheapest_start.send_if_modified(|current| {
+                // Once the start time has come, it stays until the window closes.
+                let started = current.is_some_and(|c| c.start <= now && now < c.window_end);
+                let changed = !started && *current != next;
+                if changed {
+                    *current = next;
+                }
+                changed
+            });
             shared.plan.send_replace(Some(Arc::new(view)));
             shared.update_status(|s| {
                 if s.problem

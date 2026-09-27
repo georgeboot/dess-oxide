@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "dess-core"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "jiff",
  "proptest",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "dess-models"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "burn",
  "dess-core",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "dess-oxide"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1925,6 +1925,7 @@ dependencies = [
  "serde",
  "serde_ignored",
  "serde_json",
+ "serde_norway",
  "thiserror 2.0.21",
  "tokio",
  "tokio-tungstenite",
@@ -1935,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "dess-victron"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "dess-core",
  "jiff",
@@ -4809,6 +4810,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde_norway"
+version = "0.9.42"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e408f29489b5fd500fab51ff1484fc859bb655f32c671f307dcd733b72e8168c"
+dependencies = [
+ "indexmap",
+ "itoa",
+ "ryu",
+ "serde",
+ "unsafe-libyaml-norway",
+]
+
+[[package]]
 name = "serde_path_to_error"
 version = "0.1.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5745,6 +5759,12 @@ name = "unindent"
 version = "0.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7264e107f553ccae879d21fbea1d6724ac785e8c3bfc762137959b5802826ef3"
+
+[[package]]
+name = "unsafe-libyaml-norway"
+version = "0.2.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b39abd59bf32521c7f2301b52d05a6a2c975b6003521cbd0c6dc1582f0a22104"
 
 [[package]]
 name = "untrusted"

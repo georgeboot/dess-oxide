@@ -65,3 +65,14 @@ azimuth = 193   # compass degrees, 180 = south
 kwp = 3.44
 tilt = 9
 azimuth = 193
+
+# The dishwasher, or any flexible run: the page shows its cheapest start.
+[cheapest_start]
+hours = 3.0
+kwh = 1.0
+earliest = "20:00"
+finish_by = "08:00"
+
+# An EV charger between the grid meter and the Victrons.
+# [ev]
+# on_input = true

@@ -4,7 +4,7 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.6.0"
+version: "0.7.0"
 slug: dess_oxide
 description: Plans and (once you allow it) runs a Victron ESS against Dutch day-ahead prices.
 url: https://github.com/georgeboot/dess-oxide
@@ -53,6 +53,14 @@ options:
     vat_on_export: false
   pv: []
   history: {}
+  cheapest_start:
+    hours: 3
+    kwh: 1
+    earliest: "20:00"
+    finish_by: "08:00"
+  ha_entities: false
+  ev:
+    on_input: false
 schema:
   control: bool
   victron:
@@ -97,3 +105,12 @@ schema:
     battery_in: str?
     battery_out: str?
     heat_pump: str?
+    ev: str?
+  cheapest_start:
+    hours: float(0.25,24)
+    kwh: float
+    earliest: 'match(^\d{2}:\d{2}$)'
+    finish_by: 'match(^\d{2}:\d{2}$)'
+  ha_entities: bool
+  ev:
+    on_input: bool

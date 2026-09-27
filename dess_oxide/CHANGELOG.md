@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.7.0
+
+- **Cheapest start** for the dishwasher (or any flexible run): the page
+  shows when to start it tonight so it costs least. It counts what the
+  battery and PV would otherwise do, not just the price. Set the run and
+  its night window under `cheapest_start`.
+- **Optional Home Assistant entities** (`ha_entities: true`):
+  `sensor.dess_oxide_cheapest_start`, for an automation's time trigger, and
+  `binary_sensor.dess_oxide_grid`. Off by default.
+- **EV awareness** (`ev.on_input`): a charger between the grid meter and the
+  Victrons is left out of the house load's history and forecast; while it
+  charges, the plan and control see it.
+- `probe` reports what it got over slow links instead of giving up.
+
 ## 0.6.0
 
 - **Outage mode:** tell dess-oxide when you expect a power cut (start time

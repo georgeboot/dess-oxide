@@ -20,7 +20,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ToSpan};
 use tracing::{debug, warn};
 
-use crate::config::{Config, HistoryConfig, LocationConfig, RelayAction};
+use crate::config::{CheapestStartConfig, Config, HistoryConfig, LocationConfig, RelayAction};
 use crate::nordpool::NordPool;
 use crate::store::Store;
 use dess_models::features::HourWeather;
@@ -49,6 +49,73 @@ pub fn outage_window(store: &Store, now: Timestamp) -> Option<(Timestamp, Timest
     let hours: f64 = store.setting(OUTAGE_HOURS).ok().flatten()?.parse().ok()?;
     let end = start + SignedDuration::from_secs_f64(hours.clamp(0.25, 72.0) * 3600.0);
     (end > now).then_some((start, end))
+}
+
+/// When to start the flexible run (the dishwasher), from the plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CheapestStart {
+    pub start: Timestamp,
+    pub end: Timestamp,
+    /// The close of the night window it was chosen in.
+    pub window_end: Timestamp,
+    /// The run's expected cost at this start, €.
+    pub cost: f64,
+    /// The window's first possible start, and the run's cost there.
+    pub first_start: Timestamp,
+    pub first_cost: f64,
+    /// Whether it relies on estimated prices (tomorrow's aren't out yet).
+    pub estimated_price: bool,
+}
+
+/// The cheapest start for the configured run in the next night window that
+/// it still fits in, at the marginal cost of its extra load under the plan's
+/// policy: battery, PV and export included, not just the spot price.
+pub fn cheapest_start(
+    view: &PlanView,
+    run: &CheapestStartConfig,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> Option<CheapestStart> {
+    let duration = SignedDuration::from_secs_f64(run.hours * 3600.0);
+    let today = now.to_zoned(tz.clone()).date();
+    let at = |day: jiff::civil::Date, time| day.to_datetime(time).to_zoned(tz.clone()).ok();
+    let (open, close) = (-1..=1).find_map(|offset: i64| {
+        let day = today.checked_add(offset.days()).ok()?;
+        let close_day = if run.finish_by <= run.earliest {
+            day.tomorrow().ok()?
+        } else {
+            day
+        };
+        let open = at(day, run.earliest)?.timestamp().max(now);
+        let close = at(close_day, run.finish_by)?.timestamp();
+        (open + duration <= close).then_some((open, close))
+    })?;
+
+    let slots: Vec<Slot> = view.plan.slots.iter().map(|s| s.slot).collect();
+    let costs = dess_core::control::marginal_costs(
+        &view.plan,
+        &view.forecasts,
+        &view.battery,
+        &view.settings,
+        view.min_soc,
+        Watts(run.kwh / run.hours * 1000.0),
+    );
+    let needed = (run.hours * 4.0).ceil() as usize;
+    let (i, mean) = dess_core::control::cheapest_run(&slots, &costs, open, close, needed)?;
+    let first = slots.iter().position(|s| s.start() >= open)?;
+    let first_mean = costs.get(first..first + needed)?.iter().sum::<f64>() / needed as f64;
+    let start = slots[i].start();
+    Some(CheapestStart {
+        start,
+        end: start + duration,
+        window_end: close,
+        cost: mean * run.kwh,
+        first_start: slots[first].start(),
+        first_cost: first_mean * run.kwh,
+        estimated_price: view.plan.slots[i..i + needed]
+            .iter()
+            .any(|s| s.estimated_price),
+    })
 }
 
 pub const OUTAGE_EXPECTED: &str = "outage_expected";
@@ -153,7 +220,7 @@ pub fn make_plan(
         lookback,
         Slot::containing(now + SignedDuration::from_hours(72)),
     )?;
-    let history = load_history(store, &config.history, lookback)?;
+    let history = load_history(store, &config.history, config.ev.on_input, lookback)?;
     let loads = |slots: &[Slot]| {
         house_load(
             slots,
@@ -175,6 +242,15 @@ pub fn make_plan(
         min_soc,
         inputs.outage,
     )?;
+    let mut forecasts = forecasts;
+    if config.ev.on_input {
+        // The EV isn't forecast, but a car charging now likely charges on
+        // for the rest of this slot.
+        let ev = reading::sample(snapshot, now)?.load_in.0;
+        if let Some(first) = forecasts.first_mut().filter(|_| ev > 500.0) {
+            first.load = Watts(first.load.0 + ev);
+        }
+    }
     let settings = planner_settings(config, &forecasts);
     let plan = planner::plan(&PlanRequest {
         now,
@@ -195,15 +271,19 @@ pub fn make_plan(
     })
 }
 
-/// Mean load per slot since `from`: recorded slots, plus hours from Home
-/// Assistant's statistics where nothing was recorded (each hour's mean
-/// spread over its four slots).
+/// Mean house load per slot since `from`, without the EV: recorded slots,
+/// plus hours from Home Assistant's statistics where nothing was recorded
+/// (each hour's mean spread over its four slots).
 pub fn load_history(
     store: &Store,
     history: &HistoryConfig,
+    ev_on_input: bool,
     from: Slot,
 ) -> anyhow::Result<Vec<(Slot, Watts)>> {
-    let mut by_slot: BTreeMap<Slot, Watts> = store.load_history(from)?.into_iter().collect();
+    let mut by_slot: BTreeMap<Slot, Watts> = store
+        .load_history(from, !ev_on_input)?
+        .into_iter()
+        .collect();
     let entity = |role: &str| {
         history
             .entities()
@@ -214,7 +294,7 @@ pub fn load_history(
     let (Some(import), Some(export)) = (entity("grid_import"), entity("grid_export")) else {
         return Ok(by_slot.into_iter().collect());
     };
-    let optional = ["pv", "battery_in", "battery_out"].map(entity);
+    let optional = ["pv", "battery_in", "battery_out", "ev"].map(entity);
     let mut entities = vec![import.as_str(), export.as_str()];
     entities.extend(optional.iter().flatten().map(String::as_str));
     for (hour, values) in store.ha_hourly(&entities, from.start())? {
@@ -230,8 +310,8 @@ pub fn load_history(
         {
             continue;
         }
-        let [pv, battery_in, battery_out] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
-        let load_kwh = imported - exported + pv - battery_in + battery_out;
+        let [pv, battery_in, battery_out, ev] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
+        let load_kwh = (imported - exported + pv - battery_in + battery_out - ev).max(0.0);
         let Some(first) = Slot::from_start_unix(hour) else {
             continue;
         };
@@ -540,9 +620,10 @@ mod tests {
             battery_in: Some("sensor.bat_in".into()),
             battery_out: Some("sensor.bat_out".into()),
             heat_pump: None,
+            ev: None,
         };
         let from = Slot::containing("2026-09-26T00:00:00Z".parse().unwrap());
-        let loads = load_history(&store, &history, from).unwrap();
+        let loads = load_history(&store, &history, false, from).unwrap();
         assert_eq!(loads.len(), 4);
         // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour.
         assert!(loads.iter().all(|(_, w)| (w.0 - 1600.0).abs() < 1e-9));
@@ -555,6 +636,9 @@ mod tests {
                 1.0,
             )])
             .unwrap();
-        assert_eq!(load_history(&store, &history, from).unwrap().len(), 4);
+        assert_eq!(
+            load_history(&store, &history, false, from).unwrap().len(),
+            4
+        );
     }
 }

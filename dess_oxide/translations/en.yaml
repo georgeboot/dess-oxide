@@ -5,3 +5,21 @@ configuration:
       host: address of the Cerbo GX (MQTT on LAN must be enabled).
       port: MQTT port, default 1883.
       portal_id: VRM portal id; discovered automatically when empty.
+  cheapest_start:
+    name: Cheapest start
+    description: >-
+      A flexible run such as the dishwasher: how long it takes (hours), what
+      it uses (kWh), and the night window it must fit in (earliest start and
+      finish-by time, HH:MM). The page shows its cheapest start time.
+  ha_entities:
+    name: Home Assistant entities
+    description: >-
+      Publishes sensor.dess_oxide_cheapest_start (a timestamp, for a time
+      trigger) and binary_sensor.dess_oxide_grid. Off by default.
+  ev:
+    name: EV charger
+    description: >-
+      on_input: the charger sits between the grid meter and the Victrons, so
+      the Victron's loads on input are the EV. It's then left out of the
+      house load forecast (set history.ev to leave it out of the imported
+      history too).

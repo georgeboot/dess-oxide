@@ -11,7 +11,7 @@ use std::path::Path;
 use anyhow::{Context, bail};
 use dess_core::EurPerKwh;
 use dess_core::tariff::{Schedule, Tariff};
-use jiff::civil::Date;
+use jiff::civil::{Date, Time};
 use jiff::tz::TimeZone;
 use serde::Deserialize;
 
@@ -43,6 +43,51 @@ pub struct Config {
     /// Standalone only: where Home Assistant is. The app uses the Supervisor.
     #[serde(default)]
     pub homeassistant: Option<HomeAssistantConfig>,
+    /// The flexible run whose cheapest start time is shown (the dishwasher).
+    #[serde(default)]
+    pub cheapest_start: CheapestStartConfig,
+    /// Publishes a few Home Assistant entities for automations. Off by default.
+    #[serde(default)]
+    pub ha_entities: bool,
+    #[serde(default)]
+    pub ev: EvConfig,
+}
+
+/// An EV charger (PLAN.md §12.6). It isn't forecast: it's left out of the
+/// house load, and while it charges the per-second control sees it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct EvConfig {
+    /// The charger sits between the grid meter and the inverters, so what
+    /// Venus sees as load on the inverter input is the EV.
+    pub on_input: bool,
+}
+
+/// A flexible run, such as the dishwasher: dess-oxide finds its cheapest
+/// start time in a nightly window (PLAN.md §14.4).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct CheapestStartConfig {
+    /// How long the run takes.
+    pub hours: f64,
+    /// What it uses.
+    pub kwh: f64,
+    /// Local time it may start from, `HH:MM`.
+    pub earliest: Time,
+    /// Local time it must be done by, `HH:MM`: the next day if not after
+    /// `earliest`.
+    pub finish_by: Time,
+}
+
+impl Default for CheapestStartConfig {
+    fn default() -> Self {
+        Self {
+            hours: 3.0,
+            kwh: 1.0,
+            earliest: Time::constant(20, 0, 0, 0),
+            finish_by: Time::constant(8, 0, 0, 0),
+        }
+    }
 }
 
 /// Energy sensors (cumulative kWh, as in HA's energy dashboard). House load
@@ -58,6 +103,8 @@ pub struct HistoryConfig {
     /// AC energy out of the battery system.
     pub battery_out: Option<String>,
     pub heat_pump: Option<String>,
+    /// The EV charger, left out of the house load.
+    pub ev: Option<String>,
 }
 
 impl HistoryConfig {
@@ -70,6 +117,7 @@ impl HistoryConfig {
             ("battery_in", &self.battery_in),
             ("battery_out", &self.battery_out),
             ("heat_pump", &self.heat_pump),
+            ("ev", &self.ev),
         ]
         .into_iter()
         .filter_map(|(role, entity)| {
@@ -261,6 +309,10 @@ impl Config {
                 bail!("pv[{i}]: kwp must be positive, tilt 0–90 and azimuth 0–360");
             }
         }
+        let run = &self.cheapest_start;
+        if !(0.25..=24.0).contains(&run.hours) || run.kwh <= 0.0 {
+            bail!("cheapest_start: hours must be 0.25–24 and kwh positive");
+        }
         if let Some(tariff) = &self.tariff {
             tariff.to_tariff()?;
         }
@@ -305,6 +357,70 @@ mod tests {
         assert_eq!(config.grid.max_import_kw, 17.0);
         assert_eq!(config.prices.area, "NL");
         assert!(config.tariff.is_none());
+    }
+
+    /// A valid value for every option in an app schema.
+    fn sample(schema: &serde_json::Value) -> serde_json::Value {
+        use serde_json::Value;
+        match schema {
+            Value::Object(map) => map.iter().map(|(k, v)| (k.clone(), sample(v))).collect(),
+            Value::Array(items) => items.iter().map(sample).collect(),
+            Value::String(kind) => {
+                let kind = kind.trim_end_matches('?');
+                match kind {
+                    "bool" => false.into(),
+                    "str" => "192.168.1.20".into(),
+                    "port" => 1883.into(),
+                    _ if kind.starts_with("float") => 1.0.into(),
+                    _ if kind.starts_with("int") => 1.into(),
+                    _ if kind.starts_with("list(") => {
+                        kind[5..].split(['|', ')']).next().unwrap().into()
+                    }
+                    _ if kind.contains(r"\d{4}") => "2025-01-01".into(),
+                    _ if kind.contains(r"\d{2}:") => "20:00".into(),
+                    _ => panic!("unknown schema type {kind}"),
+                }
+            }
+            other => panic!("unexpected schema value {other}"),
+        }
+    }
+
+    /// The app's `config.yaml`: its default options and a sample of every
+    /// option in its schema must parse, with nothing ignored. (An option the
+    /// image doesn't know would otherwise be silently dropped.)
+    #[test]
+    fn the_app_options_match_the_config() {
+        use serde_json::Value;
+        let app: Value =
+            serde_norway::from_str(include_str!("../../../dess_oxide/config.yaml")).unwrap();
+
+        let mut options = app["options"].clone();
+        options["victron"]["host"] = "192.168.1.20".into();
+        let (config, ignored) = Config::parse(&options.to_string(), true).unwrap();
+        assert!(
+            ignored.is_empty(),
+            "defaults not in the config: {ignored:?}"
+        );
+        config.validate().unwrap();
+
+        let (config, ignored) = Config::parse(&sample(&app["schema"]).to_string(), true).unwrap();
+        assert!(
+            ignored.is_empty(),
+            "schema options not in the config: {ignored:?}"
+        );
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn parses_the_cheapest_start_window() {
+        let config: Config = serde_json::from_str(
+            r#"{"victron": {"host": "x"}, "cheapest_start": {"hours": 2.5, "kwh": 0.9, "earliest": "21:30", "finish_by": "07:00"}}"#,
+        )
+        .unwrap();
+        let run = &config.cheapest_start;
+        assert_eq!(run.earliest, Time::constant(21, 30, 0, 0));
+        assert_eq!(run.finish_by, Time::constant(7, 0, 0, 0));
+        assert!(!config.ha_entities);
     }
 
     #[test]

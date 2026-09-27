@@ -189,11 +189,13 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
     let now = Timestamp::now();
     let view = shared.plan.borrow().clone();
     let since = Slot::containing(now - SignedDuration::from_hours(24));
-    let history = tokio::task::block_in_place(|| lock(&shared.store).history(since))
-        .unwrap_or_else(|error| {
-            error!(%error, "reading history");
-            Vec::new()
-        });
+    let history = tokio::task::block_in_place(|| {
+        lock(&shared.store).history(since, !shared.config.ev.on_input)
+    })
+    .unwrap_or_else(|error| {
+        error!(%error, "reading history");
+        Vec::new()
+    });
     let (models, losses) = tokio::task::block_in_place(|| {
         let store = lock(&shared.store);
         let models = ["pv", "heat_pump", "load"].map(|name| {
@@ -252,7 +254,7 @@ fn render(
                     Some(view) => {
                         (control_card(shared))
                         (outage_card(shared, view, now))
-                        (now_cards(view))
+                        (now_cards(shared, view))
                         (plan_section(shared, view, now))
                     }
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
@@ -361,7 +363,7 @@ fn outage_card(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
     }
 }
 
-fn now_cards(view: &PlanView) -> Markup {
+fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
     let Some(first) = view.plan.slots.first() else {
         return html! {};
     };
@@ -380,6 +382,30 @@ fn now_cards(view: &PlanView) -> Markup {
             div.card { span.label { "Price now" } span.value { (format!("€{:.3}", first.prices.buy.0)) } span.sub { "sell €" (format!("{:.3}", first.prices.sell.0)) } }
             div.card { span.label { "Stored energy is worth" } span.value { (format!("€{:.3}/kWh", first.stored_energy_value.0)) } span.sub { "what the last kWh in the battery will save or earn later — not what it cost" } }
             div.card { span.label { "Expected over the horizon" } span.value { (format!("€{:.2}", view.plan.expected_cost)) } span.sub { "negative is money earned" } }
+            (cheapest_start_card(shared))
+        }
+    }
+}
+
+fn cheapest_start_card(shared: &Shared) -> Markup {
+    let run = &shared.config.cheapest_start;
+    let label = format!("Cheapest start ({} h, {} kWh)", run.hours, run.kwh);
+    let Some(best) = *shared.cheapest_start.borrow() else {
+        return html! {
+            div.card { span.label { (label) } span.value { "—" } span.sub { "no room for it in the plan's night windows" } }
+        };
+    };
+    html! {
+        div.card {
+            span.label { (label) }
+            span.value { (local(shared, best.start, "%a %H:%M")) }
+            span.sub {
+                "done " (local(shared, best.end, "%H:%M")) ", about " (format!("€{:.2}", best.cost))
+                @if best.first_cost - best.cost > 0.005 {
+                    " (€" (format!("{:.2}", best.first_cost)) " starting at " (local(shared, best.first_start, "%H:%M")) ")"
+                }
+                @if best.estimated_price { "; tomorrow's prices are estimated" }
+            }
         }
     }
 }

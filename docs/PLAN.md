@@ -485,9 +485,9 @@ The goal is to learn everything from history. Watt-peak and orientation in confi
 
 ### 12.6 EV (brother's site)
 - **Wiring:** the charger is on the Victron AC-in side. The grid meter and Victron's consumption on input include it, but it is not backed up.
-- **v1:**
-  - EV energy is measured, from an entity or from Victron's consumption on input, and left out of base-load training. It is not forecast.
-  - When charging starts, the next replan sees it.
+- **v1 (built, `ev.on_input`):**
+  - Victron's loads on input are the EV there. They're left out of the load history, base-load training and the forecast; `history.ev` subtracts the charger's HA sensor from imported history. It is not forecast.
+  - While charging, the current slot's forecast includes it, so each replan sees it.
   - The executor's loop stops the house battery from draining into the car in cheap slots (§15.2): the battery helps only when stored energy is worth less than the current buy price.
 - **Later:** forecasting EV sessions, and smart charging through the charger's API.
 
@@ -561,9 +561,10 @@ If multiple storage units ever arrive, for example with EV smart charging, the p
 
 "Cheapest start" gives the start time of a flexible run (default 3 h at about 1 kWh, within a 20:00–08:00 window; both configurable).
 
-- It's computed by re-running the DP with that extra load added at each candidate start, which takes about 40 runs × a few ms.
+- **Built:** each slot's marginal cost of the extra load comes from the plan's value function: the per-second policy's stage cost with and without the extra load, at the planned energy. It's the buy price where the grid covers it, λ where the battery does, the lost sell price where it cuts an export. Summed over each candidate run; no DP re-runs needed.
 - So it reflects the *true* marginal cost, battery and PV included, not just the spot price.
-- An HA automation starts the dishwasher at that time.
+- Once the start time has come, it's fixed until the window closes, so a time trigger isn't moved away under it.
+- An HA automation starts the dishwasher at that time (`sensor.dess_oxide_cheapest_start` with `ha_entities: true`).
 
 ## 15. Executor
 
@@ -789,8 +790,8 @@ These are off by default, enabled with an app option. They're for automations th
 - [ ] shadow-mode comparison against DAO (forecasts, decisions, cost), then handover at George's site (§18)
 
 **M4: Brother's site and polish.**
-- EV awareness
-- cheapest-start sensor
+- [x] EV awareness
+- [x] cheapest-start sensor, and the optional HA entities
 - better price tail
 - quantile-aware reserve
 - docs

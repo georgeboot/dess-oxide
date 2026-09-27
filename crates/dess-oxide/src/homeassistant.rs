@@ -1,5 +1,6 @@
 //! What dess-oxide reads from Home Assistant: its location, and the
-//! long-term statistics of energy sensors (to bootstrap history).
+//! long-term statistics of energy sensors (to bootstrap history). With
+//! `ha_entities: true` it also sets the state of a few entities of its own.
 //!
 //! Inside HA the app talks to the Supervisor's proxy with `SUPERVISOR_TOKEN`;
 //! standalone it needs `[homeassistant] url` and a long-lived `token`. Only
@@ -69,6 +70,27 @@ pub async fn location(
         latitude: config.latitude,
         longitude: config.longitude,
     })
+}
+
+/// Sets an entity's state through the REST API. HA forgets such states when
+/// it restarts, so callers repeat them now and then; an unchanged state
+/// doesn't add to HA's history.
+pub async fn set_state(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    entity_id: &str,
+    state: &str,
+    attributes: &Value,
+) -> anyhow::Result<()> {
+    client
+        .post(format!("{}/states/{entity_id}", endpoint.rest))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({ "state": state, "attributes": attributes }))
+        .send()
+        .await
+        .with_context(|| format!("setting {entity_id}"))?
+        .error_for_status()?;
+    Ok(())
 }
 
 /// An authenticated WebSocket connection.

@@ -53,7 +53,7 @@ control back to plain ESS whenever:
     and the setpoint your current system actually ran;
   - forecast accuracy.
 
-It creates no Home Assistant entities.
+It creates no Home Assistant entities unless you turn on `ha_entities`.
 
 ## Requirements
 
@@ -94,12 +94,53 @@ history:                    # optional: HA energy sensors (cumulative kWh)
   battery_in: sensor.battery_ac_charge_energy
   battery_out: sensor.battery_ac_discharge_energy
   heat_pump: sensor.heat_pump_energy
+  ev: sensor.ev_charger_energy   # optional: left out of the house load
+cheapest_start:             # a flexible run, such as the dishwasher
+  hours: 3
+  kwh: 1
+  earliest: "20:00"
+  finish_by: "08:00"
+ha_entities: false          # publish a few entities for automations
+ev:
+  on_input: false           # the charger is between the grid meter and the Victrons
 ```
 
 **`history`** gives the forecasts real history on day one. dess-oxide
 copies these sensors' hourly statistics from Home Assistant: up to three
 years at first, then every six hours. House load is derived as
 `import − export + pv − battery_in + battery_out`. This only reads from HA.
+
+**`cheapest_start`** is DAO's `machines`, simplified: the page shows when
+to start a run of `hours` using `kwh` so it's cheapest, within the night
+window. "Cheapest" is the plan's marginal cost of the extra load, so it
+counts what the battery and PV would otherwise do, not just the spot price.
+Once the start time has come, it stays put until the window closes.
+
+**`ha_entities: true`** publishes two entities, and nothing else:
+- `sensor.dess_oxide_cheapest_start`, a timestamp: use it as a time trigger.
+- `binary_sensor.dess_oxide_grid`: off while the grid is down.
+
+They change only when their value does, so they add next to nothing to
+HA's history. For example:
+
+```yaml
+automation:
+  - alias: Dishwasher at the cheapest time
+    trigger:
+      - platform: time
+        at: sensor.dess_oxide_cheapest_start
+    action:
+      - action: button.press   # whatever starts your dishwasher remotely
+        target:
+          entity_id: button.dishwasher_start
+```
+
+**`ev.on_input`**: if the charger sits between the grid meter and the
+Victrons, what the Victron sees as loads on its input is the EV. It's then
+left out of the house load's history and forecast. The EV isn't forecast;
+while it charges, the per-second control keeps the battery from draining
+into the car unless that pays. Set `history.ev` to leave it out of the
+imported history too.
 
 - **Set your supplier's markups.** The defaults are typical values, not
   yours.

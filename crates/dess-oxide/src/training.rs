@@ -202,7 +202,9 @@ pub fn house_hours(
 
     // Total house load per hour, where all four slots are known.
     let mut totals: BTreeMap<i64, (f64, u8)> = BTreeMap::new();
-    for (slot, watts) in crate::planning::load_history(store, &config.history, from)? {
+    for (slot, watts) in
+        crate::planning::load_history(store, &config.history, config.ev.on_input, from)?
+    {
         let entry = totals
             .entry(slot.start_unix().div_euclid(3600) * 3600)
             .or_default();

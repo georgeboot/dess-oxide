@@ -287,14 +287,19 @@ impl Store {
         Ok(usize::try_from(count)?)
     }
 
-    /// Mean power of all loads per recorded slot since `from`, for slots with
-    /// at least half their time covered.
-    pub fn load_history(&self, from: Slot) -> anyhow::Result<Vec<(Slot, Watts)>> {
+    /// Mean power of the loads per recorded slot since `from`, for slots with
+    /// at least half their time covered. The loads on the inverter input
+    /// count only with `include_input` (they're the EV at some sites).
+    pub fn load_history(
+        &self,
+        from: Slot,
+        include_input: bool,
+    ) -> anyhow::Result<Vec<(Slot, Watts)>> {
         let mut query = self.conn.prepare_cached(
-            "SELECT slot_start, (load_out_wh + load_in_wh) * 3600.0 / covered_seconds
+            "SELECT slot_start, (load_out_wh + CASE WHEN ?2 THEN load_in_wh ELSE 0 END) * 3600.0 / covered_seconds
              FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds >= 450 ORDER BY slot_start",
         )?;
-        let rows = query.query_map([from.start_unix()], |row| {
+        let rows = query.query_map(rusqlite::params![from.start_unix(), include_input], |row| {
             Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
         })?;
         let mut history = Vec::new();
@@ -350,12 +355,13 @@ impl Store {
     }
 
     /// Recorded slots since `from` (at least a minute covered), joined with the
-    /// plan made at the start of each.
-    pub fn history(&self, from: Slot) -> anyhow::Result<Vec<HistorySlot>> {
+    /// plan made at the start of each. Loads on the inverter input count only
+    /// with `include_input`, as in [`Store::load_history`].
+    pub fn history(&self, from: Slot, include_input: bool) -> anyhow::Result<Vec<HistorySlot>> {
         let mut query = self.conn.prepare_cached(
             "SELECT m.slot_start,
                     (m.grid_import_wh - m.grid_export_wh) * 3600.0 / m.covered_seconds,
-                    (m.load_out_wh + m.load_in_wh) * 3600.0 / m.covered_seconds,
+                    (m.load_out_wh + CASE WHEN ?2 THEN m.load_in_wh ELSE 0 END) * 3600.0 / m.covered_seconds,
                     (m.pv_ac_wh + m.pv_dc_wh) * 3600.0 / m.covered_seconds,
                     m.soc_end,
                     CASE WHEN m.setpoint_seconds > 0 THEN m.setpoint_integral_wh * 3600.0 / m.setpoint_seconds END,
@@ -367,7 +373,7 @@ impl Store {
              WHERE m.slot_start >= ?1 AND m.covered_seconds > 60
              ORDER BY m.slot_start",
         )?;
-        let rows = query.query_map([from.start_unix()], |row| {
+        let rows = query.query_map(rusqlite::params![from.start_unix(), include_input], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 HistorySlot {
@@ -730,6 +736,21 @@ mod tests {
             });
         }
         recorder.flush().unwrap()
+    }
+
+    #[test]
+    fn the_ev_on_input_can_be_left_out() {
+        let store = Store::in_memory().unwrap();
+        let mut slot = record("2026-09-27T11:00:00Z", 899);
+        slot.load_out = dess_core::WattHours(250.0);
+        slot.load_in = dess_core::WattHours(1500.0);
+        store.save_slot(&slot, 0).unwrap();
+        let from = slot.slot;
+        let mean = |include_input| store.load_history(from, include_input).unwrap()[0].1.0;
+        assert!((mean(true) - 7000.0).abs() < 10.0, "{}", mean(true));
+        assert!((mean(false) - 1000.0).abs() < 10.0, "{}", mean(false));
+        let history = store.history(from, false).unwrap();
+        assert!((history[0].load.0 - 1000.0).abs() < 10.0);
     }
 
     #[test]

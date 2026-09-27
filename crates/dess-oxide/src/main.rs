@@ -1,6 +1,7 @@
 mod chart;
 mod config;
 mod control;
+mod entities;
 mod homeassistant;
 mod nordpool;
 mod openmeteo;
@@ -124,7 +125,10 @@ async fn main() -> anyhow::Result<()> {
 async fn probe(options: VenusOptions, watch: Duration, json: bool) -> anyhow::Result<()> {
     let started = Instant::now();
     let venus = Venus::connect(options, Duration::from_secs(15)).await?;
-    venus.full_publish(Duration::from_secs(30)).await?;
+    if let Err(error) = venus.full_publish(Duration::from_secs(30)).await {
+        // Slow links (a VPN) can take longer; report what did arrive.
+        tracing::warn!(%error, "continuing with the values received so far");
+    }
     tokio::time::sleep(watch).await;
     let report = venus.with_snapshot(|snapshot| {
         ProbeReport::from_snapshot(
