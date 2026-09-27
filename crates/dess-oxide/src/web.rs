@@ -1400,12 +1400,6 @@ fn sell_note(shared: &Shared, slot: Slot) -> Option<&'static str> {
     let tariff = shared.tariff.as_ref()?;
     let date = slot.start().to_zoned(tariff.time_zone.clone()).date();
     let netted = tariff.net_metering_until.is_some_and(|until| date <= until);
-    if netted && tariff.net_exporter {
-        return Some(l.t(
-            "set as a net exporter, so no energy tax or VAT back on the extra kWh",
-            "ingesteld als netto-teruglevering, dus geen energiebelasting of btw terug op de extra kWh",
-        ));
-    }
     if !netted {
         return Some(l.t(
             "net metering has ended: no energy tax back",

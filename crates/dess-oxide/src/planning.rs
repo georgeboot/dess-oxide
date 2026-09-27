@@ -317,36 +317,40 @@ pub fn load_history(
         .load_history(from, !ev_on_input)?
         .into_iter()
         .collect();
-    let entity = |role: &str| {
-        history
-            .entities()
-            .into_iter()
-            .find(|(r, _)| *r == role)
-            .map(|(_, e)| e.to_owned())
-    };
-    let (Some(import), Some(export)) = (entity("grid_import"), entity("grid_export")) else {
-        return Ok(by_slot.into_iter().collect());
-    };
-    if entity("battery_dc_in").is_none() || entity("battery_dc_out").is_none() {
+    let roles = [
+        "grid_import",
+        "grid_export",
+        "pv",
+        "battery_dc_in",
+        "battery_dc_out",
+        "ev",
+    ]
+    .map(|role| history.of(role));
+    let [import, export, _, battery_dc_in, battery_dc_out, _] = &roles;
+    // Without the battery's flows the derived load would be wrong whenever
+    // the battery moved: then only dess-oxide's own recordings count.
+    if import.is_empty()
+        || export.is_empty()
+        || battery_dc_in.is_empty()
+        || battery_dc_out.is_empty()
+    {
         return Ok(by_slot.into_iter().collect());
     }
-    let optional = ["pv", "battery_dc_in", "battery_dc_out", "ev"].map(entity);
-    let mut entities = vec![import.as_str(), export.as_str()];
-    entities.extend(optional.iter().flatten().map(String::as_str));
+    let entities: Vec<&str> = roles.iter().flatten().copied().collect();
     for (hour, values) in store.ha_hourly(&entities, from.start())? {
-        let get = |e: &Option<String>| e.as_ref().and_then(|e| values.get(e)).copied();
-        let (Some(imported), Some(exported)) = (values.get(&import), values.get(&export)) else {
+        // A role's sum, if every one of its sensors has a value: otherwise
+        // the load would be wrong, and the hour is skipped.
+        let sum = |sensors: &[&str]| -> Option<f64> {
+            sensors.iter().map(|e| values.get(*e).copied()).sum()
+        };
+        let Some([imported, exported, pv, battery_in, battery_out, ev]) = roles
+            .iter()
+            .map(|sensors| sum(sensors))
+            .collect::<Option<Vec<f64>>>()
+            .and_then(|v| <[f64; 6]>::try_from(v).ok())
+        else {
             continue;
         };
-        // Every configured sensor must have a value, or the load would be wrong.
-        if optional
-            .iter()
-            .zip(optional.iter().map(get))
-            .any(|(e, v)| e.is_some() && v.is_none())
-        {
-            continue;
-        }
-        let [pv, battery_in, battery_out, ev] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
         let (battery_in, battery_out) = match battery {
             Some(model) => ac_from_dc(model, battery_in, battery_out),
             None => (battery_in, battery_out),
@@ -923,6 +927,36 @@ mod tests {
         let tomorrow = 48; // slots from 00:00 on the 28th
         assert!((kwh(tomorrow + 44, tomorrow + 52) - 2.0).abs() < 1e-9);
         assert!((kwh(tomorrow + 60, tomorrow + 62) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_meters_tariff_registers_are_summed() {
+        let mut store = Store::in_memory().unwrap();
+        let hour: Timestamp = "2026-09-26T10:00:00Z".parse().unwrap();
+        let rows: Vec<(String, Timestamp, f64)> = [
+            ("sensor.import_t1", 0.6),
+            ("sensor.import_t2", 0.4),
+            ("sensor.export_t1", 0.1),
+            ("sensor.export_t2", 0.1),
+            ("sensor.bat_in", 0.0),
+            ("sensor.bat_out", 0.0),
+        ]
+        .into_iter()
+        .map(|(e, kwh)| (e.to_owned(), hour, kwh))
+        .collect();
+        store.save_ha_hourly(&rows).unwrap();
+        let history = HistoryConfig {
+            grid_import: Some("sensor.import_t1, sensor.import_t2".into()),
+            grid_export: Some("sensor.export_t1,sensor.export_t2".into()),
+            battery_dc_in: Some("sensor.bat_in".into()),
+            battery_dc_out: Some("sensor.bat_out".into()),
+            ..HistoryConfig::default()
+        };
+        let from = Slot::containing("2026-09-26T00:00:00Z".parse().unwrap());
+        let loads = load_history(&store, &history, false, None, from).unwrap();
+        // (0.6 + 0.4) − (0.1 + 0.1) = 0.8 kWh in the hour.
+        assert_eq!(loads.len(), 4);
+        assert!(loads.iter().all(|(_, w)| (w.0 - 800.0).abs() < 1e-9));
     }
 
     #[test]

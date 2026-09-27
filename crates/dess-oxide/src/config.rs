@@ -174,7 +174,9 @@ impl VictronConfig {
 }
 
 impl HistoryConfig {
-    /// `(role, entity)` for every configured sensor.
+    /// `(role, entity)` for every configured sensor. A role may list several
+    /// sensors separated by commas (a meter's two tariff registers), which
+    /// are summed.
     pub fn entities(&self) -> Vec<(&'static str, &str)> {
         [
             ("grid_import", &self.grid_import),
@@ -186,13 +188,25 @@ impl HistoryConfig {
             ("ev", &self.ev),
         ]
         .into_iter()
-        .filter_map(|(role, entity)| {
+        .flat_map(|(role, entity)| {
             entity
                 .as_deref()
+                .unwrap_or("")
+                .split(',')
+                .map(str::trim)
                 .filter(|e| !e.is_empty())
-                .map(|e| (role, e))
+                .map(move |e| (role, e))
         })
         .collect()
+    }
+
+    /// The sensors of one role.
+    pub fn of(&self, role: &str) -> Vec<&str> {
+        self.entities()
+            .into_iter()
+            .filter(|(r, _)| *r == role)
+            .map(|(_, e)| e)
+            .collect()
     }
 }
 
@@ -292,10 +306,6 @@ pub struct TariffConfig {
     /// Last day exports are netted against imports (salderen ends 2027-01-01).
     #[serde(default)]
     pub net_metering_until: Option<Date>,
-    /// Whether exports exceed imports over the netting period; then the
-    /// energy tax isn't at stake on the marginal kWh.
-    #[serde(default)]
-    pub net_exporter: bool,
     /// Whether the supplier pays VAT on exports after net metering ends.
     #[serde(default)]
     pub vat_on_export: bool,
@@ -427,7 +437,6 @@ impl TariffConfig {
             markup_buy: prices("tariff.markup_buy", &self.markup_buy)?,
             markup_sell: prices("tariff.markup_sell", &self.markup_sell)?,
             net_metering_until: self.net_metering_until,
-            net_exporter: self.net_exporter,
             vat_on_export: self.vat_on_export,
             time_zone: TimeZone::get(&self.time_zone)
                 .with_context(|| format!("unknown time zone {}", self.time_zone))?,

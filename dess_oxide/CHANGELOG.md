@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.17.0
+
+- **`net_exporter` is gone:** until net metering ends (1 January 2027)
+  every exported kWh is netted, energy tax and VAT included. With a
+  battery's losses a home is rarely a net exporter over the year, and
+  after salderen it doesn't matter anymore. The option is ignored if set.
+- **Two tariff registers:** a history sensor option can list several
+  sensors separated by commas (a P1 meter's T1 and T2); they're summed.
+
 ## 0.16.1
 
 - The price card says why selling pays less than buying when it does

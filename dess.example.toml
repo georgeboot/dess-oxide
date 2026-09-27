@@ -35,7 +35,6 @@ markup_sell = [{ from = "2025-12-14", value = 0.01504 }]
 net_metering_until = "2026-12-31"
 # Over the netting period, do exports exceed imports? Then the energy tax
 # isn't at stake on the marginal kWh and exports earn only the feed-in rate.
-net_exporter = false
 vat_on_export = false
 
 # Home Assistant's location is used when running as an app.

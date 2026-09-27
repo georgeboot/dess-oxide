@@ -106,7 +106,6 @@ tariff:                     # each component takes effect on its date
   markup_buy: [{from: "2025-01-01", value: 0.02}]
   markup_sell: [{from: "2025-01-01", value: 0.02}]
   net_metering_until: "2026-12-31"
-  net_exporter: false       # true only if the meter shows net export over the year
   vat_on_export: false
 pv:                         # optional: your arrays, for the PV forecast
   - {kwp: 5.59, tilt: 33, azimuth: 193}   # compass degrees, 180 = south
@@ -140,6 +139,12 @@ copies these sensors' hourly statistics from Home Assistant: up to three
 years at first, then every six hours. House load is derived as
 `import − export + pv −` the inverters' AC in `+` their AC out. This only
 reads from HA.
+
+A meter that reports two tariff registers (T1 and T2, as Dutch P1 meters
+do) can be given as one comma-separated line, e.g.
+`grid_import: sensor.meter_import_t1, sensor.meter_import_t2`: they're
+summed. The same works for `grid_export`, `pv`, the battery counters and
+`ev`.
 
 For the battery, give the BMS's DC counters (`battery_dc_in`,
 `battery_dc_out`): dess-oxide turns each hour's DC energy into AC itself,
@@ -204,12 +209,8 @@ imported history too.
 
 - **Set your supplier's markups.** The defaults are typical values, not
   yours.
-- **`net_exporter`:** only `true` if your *meter* shows more exported
-  than imported over the year. It's not about the panels against the
-  house: trading through the battery costs energy (battery and inverter
-  losses, standby), and a heat pump adds use, so many homes with more PV
-  than use still end the year as net importers. As a net importer every
-  exported kWh cancels an imported one, energy tax and VAT included, so
-  selling pays the same as buying (with equal markups). As a net exporter
-  the extra kWh gets neither, which is why the page then shows a lower sell
-  price.
+- **Net metering:** until `net_metering_until` (salderen ends on
+  1 January 2027), every exported kWh cancels an imported one, energy tax
+  and VAT included, so selling pays as much as buying (with equal
+  markups). After that, exports earn the spot price plus `markup_sell`, with
+  VAT only if `vat_on_export`.

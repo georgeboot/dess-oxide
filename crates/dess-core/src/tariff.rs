@@ -67,13 +67,11 @@ pub struct SlotPrices {
 /// ```
 ///
 /// While exports are netted against imports (salderen, until 2027-01-01),
-/// the energy tax only counts for the year's *net* import:
-/// - **Net importer:** every exported kWh cancels an imported one, so it earns
-///   the buy price's tax and VAT back:
-///   `sell = (spot + markup_sell + energy_tax) × (1 + vat)`.
-/// - **Net exporter:** the surplus earns only the feed-in rate, and one more
-///   imported kWh just shrinks the surplus. The tax isn't at stake on either
-///   side: `buy = (spot + markup_buy) × (1 + vat)`, and `sell` as above.
+/// every exported kWh cancels an imported one, so it earns the buy price's
+/// tax and VAT back: `sell = (spot + markup_sell + energy_tax) × (1 + vat)`.
+/// (A home that exports more than it imports over the year would get less
+/// for the surplus; with a battery's losses that's rare, and it ends with
+/// salderen anyway.)
 ///
 /// `markup_sell` is added as-is: positive when the supplier nets its markup
 /// too, negative for a feed-in fee.
@@ -85,8 +83,6 @@ pub struct Tariff {
     pub markup_sell: Schedule<EurPerKwh>,
     /// The last day on which exports are netted against imports.
     pub net_metering_until: Option<Date>,
-    /// Whether exports exceed imports over the netting period.
-    pub net_exporter: bool,
     /// Whether the supplier pays VAT on exports once net metering has ended.
     pub vat_on_export: bool,
     pub time_zone: TimeZone,
@@ -101,19 +97,11 @@ impl Tariff {
         let markup_sell = self.markup_sell.at(date)?;
         let export_vat = if self.vat_on_export { vat } else { 0.0 };
         let netted = self.net_metering_until.is_some_and(|until| date <= until);
-        let (buy, sell) = match (netted, self.net_exporter) {
-            (true, false) => (
-                (spot + markup_buy + tax).0 * (1.0 + vat),
-                (spot + markup_sell + tax).0 * (1.0 + vat),
-            ),
-            (true, true) => (
-                (spot + markup_buy).0 * (1.0 + vat),
-                (spot + markup_sell).0 * (1.0 + export_vat),
-            ),
-            (false, _) => (
-                (spot + markup_buy + tax).0 * (1.0 + vat),
-                (spot + markup_sell).0 * (1.0 + export_vat),
-            ),
+        let buy = (spot + markup_buy + tax).0 * (1.0 + vat);
+        let sell = if netted {
+            (spot + markup_sell + tax).0 * (1.0 + vat)
+        } else {
+            (spot + markup_sell).0 * (1.0 + export_vat)
         };
         Ok(SlotPrices {
             buy: EurPerKwh(buy),
@@ -144,7 +132,6 @@ mod tests {
             markup_sell: Schedule::new("markup_sell", [(date(2025, 12, 14), EurPerKwh(0.01504))])
                 .unwrap(),
             net_metering_until: Some(date(2026, 12, 31)),
-            net_exporter: false,
             vat_on_export: false,
             time_zone: TimeZone::get("Europe/Amsterdam").unwrap(),
         }
@@ -199,27 +186,19 @@ mod tests {
     }
 
     #[test]
-    fn a_net_exporter_has_no_tax_at_stake() {
-        let mut tariff = george();
-        tariff.net_exporter = true;
-        let p = tariff
-            .prices(
-                slot("2026-09-27T12:00:00Z"),
-                EurPerKwh::from_eur_per_mwh(-20.0),
-            )
-            .unwrap();
-        assert!((p.buy.0 - (-0.020 + 0.01504) * 1.21).abs() < 1e-12);
+    fn the_tax_comes_back_until_net_metering_ends() {
+        let tariff = george();
+        let spot = EurPerKwh::from_eur_per_mwh(-20.0);
+        let p = tariff.prices(slot("2026-09-27T12:00:00Z"), spot).unwrap();
+        assert!(
+            (p.buy.0 - p.sell.0).abs() < 1e-12,
+            "equal markups: same price"
+        );
+        let p = tariff.prices(slot("2027-01-02T12:00:00Z"), spot).unwrap();
+        assert!(p.buy.0 > 0.08);
         assert!(
             p.sell.0 < 0.0,
             "exporting at a negative spot price costs money"
         );
-        // After net metering ends, the tax is back on imports.
-        let p = tariff
-            .prices(
-                slot("2027-01-02T12:00:00Z"),
-                EurPerKwh::from_eur_per_mwh(-20.0),
-            )
-            .unwrap();
-        assert!(p.buy.0 > 0.08);
     }
 }
