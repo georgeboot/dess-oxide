@@ -771,7 +771,8 @@ These are off by default, enabled with an app option. They're for automations th
 - [x] shadow planning every slot, with every plan stored
 - [x] the dess-oxide page: plan, last 24 hours against DAO's setpoint, forecast errors
 - [x] backfill from HA statistics (automatic, in the service)
-- [ ] backtest harness
+- [x] replay harness: the last week re-run with dess-oxide's stored plans and policy against the measured loads, PV and prices, next to what happened, perfect foresight and no battery (nightly, on the page)
+- [ ] `backtest` CLI over longer history (needs historical forecasts) and the CI regression fixture
 
 **M2: Learned models.**
 - [x] battery and inverter losses from steady-state samples (standby + quadratic curve per direction)

@@ -164,6 +164,15 @@ pub struct SlotFlows {
     /// All loads, the EV included.
     pub load: WattHours,
     pub pv: WattHours,
+    pub soc_start: f64,
+    pub soc_end: f64,
+}
+
+impl SlotFlows {
+    /// Mean power over the covered part of the slot.
+    pub fn mean(&self, energy: WattHours) -> Watts {
+        Watts(energy.0 * 3600.0 / self.covered_seconds.max(1.0))
+    }
 }
 
 /// Forecast errors for one range of lead times.
@@ -681,7 +690,7 @@ impl Store {
     pub fn flows(&self, from: Slot) -> anyhow::Result<Vec<SlotFlows>> {
         let mut query = self.conn.prepare_cached(
             "SELECT slot_start, covered_seconds, grid_import_wh, grid_export_wh,
-                    load_out_wh + load_in_wh, pv_ac_wh + pv_dc_wh
+                    load_out_wh + load_in_wh, pv_ac_wh + pv_dc_wh, soc_start, soc_end
              FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds > 60
              ORDER BY slot_start",
         )?;
@@ -695,6 +704,8 @@ impl Store {
                     export: WattHours(row.get(3)?),
                     load: WattHours(row.get(4)?),
                     pv: WattHours(row.get(5)?),
+                    soc_start: row.get(6)?,
+                    soc_end: row.get(7)?,
                 },
             ))
         })?;
@@ -707,6 +718,53 @@ impl Store {
             }
         }
         Ok(flows)
+    }
+
+    /// The forecasts of the first plan made in each slot since `from`, keyed
+    /// by that slot, from that slot on. `min_soc_end` isn't stored (zero).
+    pub fn plan_forecasts(&self, from: Slot) -> anyhow::Result<BTreeMap<Slot, Vec<SlotForecast>>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT p.planned_at, p.slot_start, p.load_w, p.pv_w, p.buy, p.sell, p.estimated
+             FROM plans p
+             JOIN (SELECT min(planned_at) AS planned_at FROM plans
+                   WHERE planned_at >= ?1 GROUP BY planned_at / 900) f USING (planned_at)
+             WHERE p.slot_start > p.planned_at - 900
+             ORDER BY p.planned_at, p.slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, f64>(4)?,
+                row.get::<_, f64>(5)?,
+                row.get::<_, bool>(6)?,
+            ))
+        })?;
+        let mut plans: BTreeMap<Slot, Vec<SlotForecast>> = BTreeMap::new();
+        for row in rows {
+            let (planned_at, start, load, pv, buy, sell, estimated) = row?;
+            let (Some(planned), Some(slot)) = (
+                Slot::from_start_unix(planned_at - planned_at.rem_euclid(900)),
+                Slot::from_start_unix(start),
+            ) else {
+                continue;
+            };
+            plans.entry(planned).or_default().push(SlotForecast {
+                slot,
+                load: Watts(load),
+                pv: Watts(pv),
+                prices: dess_core::tariff::SlotPrices {
+                    buy: EurPerKwh(buy),
+                    sell: EurPerKwh(sell),
+                },
+                min_soc_end: 0.0,
+                estimated_price: estimated,
+                islanded: false,
+            });
+        }
+        Ok(plans)
     }
 
     /// Battery DC energy and SoC per fully covered slot since `from`.

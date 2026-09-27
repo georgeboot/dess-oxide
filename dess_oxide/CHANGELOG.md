@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.10.0
+
+- **The last week, replayed:** every night dess-oxide re-runs its own
+  plans (with the forecasts it had at the time) and its policy over the
+  week's measured load, PV and prices, and shows the cost next to what
+  actually happened (DAO, while it's in control), perfect foresight, and
+  no battery. All net of the change in stored energy. This is the
+  comparison to decide the handover on.
+
 ## 0.9.0
 
 - **Money:** what today, yesterday, the last 7 days and this month cost,

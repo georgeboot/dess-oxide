@@ -662,6 +662,8 @@ mod tests {
             export: WattHours(0.0),
             load: WattHours(2000.0),
             pv: WattHours(500.0),
+            soc_start: 50.0,
+            soc_end: 50.0,
         }];
         let m = money(&flows, &spot, &tariff);
         assert!((m.actual - buy).abs() < 1e-9);

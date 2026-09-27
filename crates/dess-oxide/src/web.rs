@@ -20,6 +20,7 @@ use tokio::sync::watch;
 use tracing::{error, info};
 
 use crate::chart::{Chart, Kind, Series};
+use crate::comparison::Comparison;
 use crate::planning::Money;
 use crate::planning::{PlanView, lock};
 use crate::run::Shared;
@@ -276,6 +277,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
                 history: &history,
                 accuracy: &accuracy,
                 money: &money,
+                comparison: *shared.comparison.lock().expect("comparison lock poisoned"),
             },
             &models,
             (losses.as_ref(), capacity.as_ref()),
@@ -290,6 +292,7 @@ struct Recorded<'a> {
     history: &'a [HistorySlot],
     accuracy: &'a [LeadAccuracy],
     money: &'a [(&'static str, Money)],
+    comparison: Option<Comparison>,
 }
 
 /// Costs for today, yesterday, the last 7 days and this month.
@@ -368,7 +371,7 @@ fn render(
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
                 }
                 (history_section(shared, recorded.history, now))
-                (money_section(recorded.money))
+                (money_section(shared, recorded.money, recorded.comparison))
                 (accuracy_section(recorded.accuracy))
                 (models_section(shared, models))
                 @if let Some(view) = view { (battery_section(&view.battery, losses, capacity)) }
@@ -713,10 +716,40 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     }
 }
 
-fn money_section(money: &[(&'static str, Money)]) -> Markup {
+fn money_section(
+    shared: &Shared,
+    money: &[(&'static str, Money)],
+    comparison: Option<Comparison>,
+) -> Markup {
     if money.iter().all(|(_, m)| m.hours == 0.0) {
         return html! {};
     }
+    let replayed = comparison.filter(|c| c.hours > 0.0).map(|c| {
+        html! {
+            h3 { "The last week, replayed" }
+            p.muted {
+                "dess-oxide's own plans, made with the forecasts it had at the time, and its policy, run over the "
+                "same load, PV and prices as actually happened (" (format!("{:.0}", c.hours)) " hours"
+                @if let Some(at) = c.made_at { ", replayed " (local(shared, at, "%a %H:%M")) }
+                "). Each is net of the change in stored energy. Perfect foresight is the best any strategy could do."
+            }
+            div.scroll {
+                table {
+                    thead { tr { th { "" } th { "cost" } th { "saved against no battery" } } }
+                    tbody {
+                        @for (label, cost) in [
+                            ("what happened", c.actual),
+                            ("dess-oxide, replayed", c.replayed),
+                            ("perfect foresight", c.perfect),
+                            ("without the battery", c.without_battery),
+                        ] {
+                            tr { td { (label) } td { (eur(cost)) } td { (eur(c.without_battery - cost)) } }
+                        }
+                    }
+                }
+            }
+        }
+    });
     html! {
         section {
             h2 { "Money" }
@@ -741,6 +774,7 @@ fn money_section(money: &[(&'static str, Money)]) -> Markup {
                     }
                 }
             }
+            @if let Some(replayed) = replayed { (replayed) }
         }
     }
 }

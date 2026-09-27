@@ -13,6 +13,7 @@ pub mod forecast;
 pub mod planner;
 pub mod prices;
 pub mod record;
+pub mod replay;
 pub mod slot;
 pub mod soc;
 pub mod solar;

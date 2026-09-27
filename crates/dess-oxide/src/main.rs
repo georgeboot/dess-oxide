@@ -1,4 +1,5 @@
 mod chart;
+mod comparison;
 mod config;
 mod control;
 mod entities;

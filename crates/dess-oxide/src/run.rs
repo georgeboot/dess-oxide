@@ -73,6 +73,8 @@ pub struct Shared {
     pub cheapest_start: watch::Sender<Option<planning::CheapestStart>>,
     /// The recorder's SoC estimate (finer than the BMS's) and when it was made.
     pub soc: Mutex<Option<(Timestamp, f64)>>,
+    /// The last week, replayed with dess-oxide's policy (made nightly).
+    pub comparison: Mutex<Option<crate::comparison::Comparison>>,
 }
 
 /// What the page shows about the service itself.
@@ -181,6 +183,7 @@ impl Shared {
             replan_now: watch::Sender::new(0),
             cheapest_start: watch::Sender::new(None),
             soc: Mutex::new(None),
+            comparison: Mutex::new(None),
         })
     }
 }
@@ -404,7 +407,41 @@ async fn train(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
             train_pv(&shared, location).await;
         }
         train_house(&shared).await;
+        compare_policies(&shared).await;
         wait = until_local(&shared.tz, 3, 30);
+    }
+}
+
+/// Replays the last week with dess-oxide's policy, for the page.
+async fn compare_policies(shared: &Arc<Shared>) {
+    const DAYS: i64 = 7;
+    let Some(view) = shared.plan.borrow().clone() else {
+        return;
+    };
+    let now = Timestamp::now();
+    let for_replay = Arc::clone(shared);
+    let started = std::time::Instant::now();
+    let result = tokio::task::spawn_blocking(move || {
+        let tariff = for_replay.tariff.as_ref().context("no tariff")?;
+        let inputs = crate::comparison::gather(&lock(&for_replay.store), now, DAYS)?;
+        anyhow::Ok(crate::comparison::compare(inputs, &view, tariff, now))
+    })
+    .await;
+    match result {
+        Ok(Ok(comparison)) => {
+            info!(
+                hours = comparison.hours,
+                actual_eur = format!("{:.2}", comparison.actual),
+                replayed_eur = format!("{:.2}", comparison.replayed),
+                perfect_eur = format!("{:.2}", comparison.perfect),
+                without_battery_eur = format!("{:.2}", comparison.without_battery),
+                seconds = format!("{:.1}", started.elapsed().as_secs_f64()),
+                "replayed the last week"
+            );
+            *shared.comparison.lock().expect("comparison lock poisoned") = Some(comparison);
+        }
+        Ok(Err(error)) => warn!("replaying the last week: {error:#}"),
+        Err(error) => error!(%error, "the replay panicked"),
     }
 }
 

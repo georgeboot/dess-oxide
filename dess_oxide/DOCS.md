@@ -60,7 +60,10 @@ battery, charge, discharge, or plain self-consumption.
     was made;
   - what today, yesterday, the last week and this month cost, and what
     they would have cost without the battery. While DAO runs the system,
-    that's DAO's result, so it's the yardstick for the handover.
+    that's DAO's result, so it's the yardstick for the handover;
+  - the last week replayed: dess-oxide's own plans and policy run over the
+    same loads, PV and prices, next to what actually happened, perfect
+    foresight and no battery (updated nightly).
 
 It creates no Home Assistant entities unless you turn on `ha_entities`.
 
