@@ -127,6 +127,12 @@ ha_entities: false          # publish a few entities for automations
 ev:
   on_input: false           # the charger is between the grid meter and the Victrons
 openamber_device: ""        # e.g. openamber: split the heat pump into heating and hot water
+weather_station:            # optional: a local station in HA, such as an Ecowitt WS90
+  temperature: sensor.ws90_outdoor_temperature
+  humidity: sensor.ws90_humidity
+  wind_speed: sensor.ws90_wind_speed
+  solar_radiation: sensor.ws90_solar_radiation
+language: auto              # the page's language: auto (Home Assistant's), en or nl
 ```
 
 **`history`** gives the forecasts real history on day one. dess-oxide
@@ -176,6 +182,18 @@ history grows from the day you set it. Heating is then learned from heating
 alone. Hot water gets its own forecast: energy per day against the outdoor
 temperature, at the hours it usually runs (your schedule), and legionella
 runs at the time OpenAmber announces. The page shows the split per day.
+
+**`weather_station`**: the forecast (KNMI's Harmonie model, at your
+location) is right on average but can be off on the day: fog it missed, a
+colder night, clouds an hour early. With a station's entities, dess-oxide
+compares the last hour it measured with the forecast and corrects the next
+hours: temperature and humidity by the difference, fading out over a few
+hours; sunshine by the ratio (against the station's usual ratio, so a
+sensor that reads high doesn't skew PV), fading within about an hour. The
+recent past gets the measured temperatures, so the heat pump model's
+thermal lag starts from what happened. Wind isn't corrected: a station a
+few metres up doesn't measure the 10 m wind the models use. Every sensor is
+optional; units are converted.
 
 **`ev.on_input`**: if the charger sits between the grid meter and the
 Victrons, what the Victron sees as loads on its input is the EV. It's then

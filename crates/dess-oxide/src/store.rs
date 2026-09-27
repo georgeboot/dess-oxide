@@ -10,6 +10,7 @@ use dess_core::heat_pump_modes::ModeSlot;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
 use dess_core::weather::Weather;
+use dess_core::weather_correction::Observation;
 use dess_core::{EurPerKwh, Slot, WattHours, Watts};
 use rusqlite::{Connection, params};
 
@@ -142,6 +143,16 @@ const MIGRATIONS: &[&str] = &[
     -- Idle efficiency bins mixed ESS idling with bypass (external control):
     -- start them over; bypass is measured on its own now.
     DELETE FROM efficiency_bins WHERE bin = 0;
+",
+    r"
+    -- A local weather station's means per slot (NULL: no such sensor).
+    CREATE TABLE observations (
+        slot_start  INTEGER PRIMARY KEY,
+        temperature REAL, -- °C
+        humidity    REAL, -- %
+        wind        REAL, -- m/s, at the station's height
+        ghi         REAL  -- W/m²
+    ) STRICT;
 ",
 ];
 
@@ -881,6 +892,41 @@ impl Store {
             });
         }
         Ok(plans)
+    }
+
+    /// Stores a slot's weather station means, replacing the slot.
+    pub fn save_observation(&self, slot: Slot, o: &Observation) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO observations VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![slot.start_unix(), o.temperature, o.humidity, o.wind, o.ghi],
+        )?;
+        Ok(())
+    }
+
+    /// Weather station means per slot since `from`.
+    pub fn observations(&self, from: Slot) -> anyhow::Result<BTreeMap<Slot, Observation>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, temperature, humidity, wind, ghi FROM observations WHERE slot_start >= ?1",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                Observation {
+                    temperature: row.get(1)?,
+                    humidity: row.get(2)?,
+                    wind: row.get(3)?,
+                    ghi: row.get(4)?,
+                },
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (start, o) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                out.insert(slot, o);
+            }
+        }
+        Ok(out)
     }
 
     /// Stores split heat pump energy, replacing those slots.

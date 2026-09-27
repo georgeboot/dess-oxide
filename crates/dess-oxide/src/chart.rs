@@ -9,6 +9,8 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use maud::{Markup, PreEscaped, html};
 
+use crate::i18n::Lang;
+
 const WIDTH: f64 = 960.0;
 const LEFT: f64 = 52.0;
 const RIGHT: f64 = 8.0;
@@ -68,6 +70,7 @@ pub struct Chart<'a> {
     pub shade_from: Option<usize>,
     /// Fixed y range, e.g. 0–100 for SoC.
     pub y_range: Option<(f64, f64)>,
+    pub lang: Lang,
 }
 
 impl Chart<'_> {
@@ -119,7 +122,7 @@ impl Chart<'_> {
                 continue;
             }
             let label = if local.hour() == 0 {
-                local.strftime("%a").to_string()
+                self.lang.strftime(&local, "%a")
             } else {
                 local.strftime("%H:%M").to_string()
             };
@@ -161,7 +164,7 @@ impl Chart<'_> {
                 figcaption {
                     span.unit { (self.unit) }
                     @for (i, series) in self.series.iter().enumerate() {
-                        span.legend data-i=(i) title="click to hide or show" { i class=(series.class) {} (series.label) }
+                        span.legend data-i=(i) title=(self.lang.t("click to hide or show", "klik om te verbergen of te tonen")) { i class=(series.class) {} (series.label) }
                     }
                 }
             }
@@ -175,7 +178,7 @@ impl Chart<'_> {
             "labels": self
                 .slots
                 .iter()
-                .map(|s| s.to_zoned(tz.clone()).strftime("%a %H:%M").to_string())
+                .map(|s| self.lang.strftime(&s.to_zoned(tz.clone()), "%a %H:%M"))
                 .collect::<Vec<_>>(),
             "unit": self.unit,
             "left": LEFT,
@@ -336,6 +339,7 @@ mod tests {
             now: None,
             shade_from: Some(3),
             y_range: None,
+            lang: Lang::En,
         };
         let svg = chart.render(&TimeZone::UTC).into_string();
         assert_eq!(

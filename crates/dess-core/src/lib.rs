@@ -21,6 +21,7 @@ pub mod solar;
 pub mod tariff;
 pub mod units;
 pub mod weather;
+pub mod weather_correction;
 
 pub use slot::Slot;
 pub use units::{EurPerKwh, WattHours, Watts};

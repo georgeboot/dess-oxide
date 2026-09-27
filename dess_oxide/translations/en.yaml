@@ -36,3 +36,14 @@ configuration:
       entities start with it, e.g. "openamber"). dess-oxide then splits the
       heat pump's energy into heating and hot water, and forecasts both.
       Needs history.heat_pump. Leave empty without OpenAmber.
+  weather_station:
+    name: Weather station
+    description: >-
+      Entities of a local weather station in Home Assistant, such as an
+      Ecowitt WS90: temperature, humidity, wind_speed, solar_radiation (each
+      optional). dess-oxide compares the last hour with the forecast and
+      corrects the next hours by the difference.
+  language:
+    name: Language
+    description: >-
+      The dess-oxide page's language: auto (Home Assistant's), en or nl.

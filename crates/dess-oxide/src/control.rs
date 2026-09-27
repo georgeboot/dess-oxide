@@ -80,12 +80,12 @@ impl Override {
         }
     }
 
-    pub fn label(self) -> &'static str {
+    pub fn label(self, l: crate::i18n::Lang) -> &'static str {
         match self {
-            Self::Hold => "hold the battery",
-            Self::Charge => "charge",
-            Self::Discharge => "discharge",
-            Self::SelfConsumption => "self-consumption",
+            Self::Hold => l.t("hold the battery", "accu vasthouden"),
+            Self::Charge => l.t("charge", "laden"),
+            Self::Discharge => l.t("discharge", "ontladen"),
+            Self::SelfConsumption => l.t("self-consumption", "eigen verbruik"),
         }
     }
 

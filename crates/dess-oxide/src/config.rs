@@ -57,6 +57,43 @@ pub struct Config {
     /// `history.heat_pump`. Empty: no OpenAmber.
     #[serde(default)]
     pub openamber_device: String,
+    /// A local weather station's entities in Home Assistant (such as an
+    /// Ecowitt WS90), to correct the forecast for the next hours.
+    #[serde(default)]
+    pub weather_station: WeatherStationConfig,
+    /// The page's language: `auto` (Home Assistant's), `en` or `nl`.
+    #[serde(default = "default_language")]
+    pub language: String,
+}
+
+fn default_language() -> String {
+    "auto".to_owned()
+}
+
+/// Entities of a local weather station; each is optional.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+#[serde(default)]
+pub struct WeatherStationConfig {
+    pub temperature: Option<String>,
+    pub humidity: Option<String>,
+    pub wind_speed: Option<String>,
+    /// In W/m² (or lux, converted roughly).
+    pub solar_radiation: Option<String>,
+}
+
+impl WeatherStationConfig {
+    /// `(what, entity)` for every configured sensor.
+    pub fn entities(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("temperature", &self.temperature),
+            ("humidity", &self.humidity),
+            ("wind_speed", &self.wind_speed),
+            ("solar_radiation", &self.solar_radiation),
+        ]
+        .into_iter()
+        .filter_map(|(what, e)| Some((what, e.as_deref().filter(|e| !e.is_empty())?)))
+        .collect()
+    }
 }
 
 /// The OpenAmber entities dess-oxide reads.

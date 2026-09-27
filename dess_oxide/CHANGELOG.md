@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.16.0
+
+- **Dutch:** the page follows Home Assistant's language (or set `language`
+  to `en` or `nl`), with Dutch day names and decimal commas.
+- **Local weather station** (`weather_station`, e.g. an Ecowitt WS90): the
+  last hour it measured corrects the forecast for the next hours
+  (temperature and humidity fading over a few hours, sunshine within about
+  an hour). The page shows the readings and the correction.
+- **Clearer "stored energy" card:** "One more kWh in the battery is worth",
+  with what it means right now: charging from the grid pays below one
+  price, discharging into the grid above another, and in between the
+  battery holds.
+
 ## 0.15.0
 
 - **Bypass, like DAO's:** when the battery has nothing worthwhile to do in a

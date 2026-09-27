@@ -80,6 +80,18 @@ pub struct Shared {
     pub comparison: Mutex<Option<crate::comparison::Comparison>>,
     /// When OpenAmber runs its next legionella cycle.
     pub next_legionella: Mutex<Option<Timestamp>>,
+    /// The local weather station's latest readings.
+    pub station: Mutex<Option<crate::station::Reading>>,
+    /// How the last plan corrected the forecast with the station.
+    pub weather_correction: Mutex<Option<dess_core::weather_correction::Correction>>,
+    /// The page's language.
+    pub lang: Mutex<crate::i18n::Lang>,
+}
+
+impl Shared {
+    pub fn lang(&self) -> crate::i18n::Lang {
+        *self.lang.lock().expect("lock poisoned")
+    }
 }
 
 /// What the page shows about the service itself.
@@ -165,6 +177,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
 
 impl Shared {
     fn new(config: Config, store: Store) -> anyhow::Result<Self> {
+        let config_language = config.language.clone();
         let tariff = config
             .tariff
             .as_ref()
@@ -193,6 +206,12 @@ impl Shared {
             soc: Mutex::new(None),
             comparison: Mutex::new(None),
             next_legionella: Mutex::new(None),
+            station: Mutex::new(None),
+            weather_correction: Mutex::new(None),
+            lang: Mutex::new(match config_language.as_str() {
+                "auto" => crate::i18n::Lang::En,
+                code => crate::i18n::Lang::from_code(code),
+            }),
         })
     }
 }
@@ -224,6 +243,11 @@ fn spawn_tasks(
         stopped.clone(),
     )));
     tasks.push(tokio::spawn(fetch_weather(
+        Arc::clone(shared),
+        client.clone(),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(crate::station::run(
         Arc::clone(shared),
         client.clone(),
         stopped.clone(),
@@ -674,6 +698,18 @@ async fn fetch_weather(
 ) {
     let mut location = None;
     loop {
+        if location.is_none()
+            && shared.config.language == "auto"
+            && let Some(endpoint) = crate::homeassistant::Endpoint::resolve(&shared.config)
+        {
+            match crate::homeassistant::language(&client, &endpoint).await {
+                Ok(code) => {
+                    *shared.lang.lock().expect("lock poisoned") =
+                        crate::i18n::Lang::from_code(&code);
+                }
+                Err(error) => warn!("reading Home Assistant's language: {error:#}"),
+            }
+        }
         if location.is_none() {
             match planning::resolve_location(&client, &shared.config).await {
                 Ok(found) => {
@@ -781,7 +817,7 @@ fn replan(venus: &Venus, shared: &Shared) {
     let Some(tariff) = &shared.tariff else { return };
     let now = Timestamp::now();
     let snapshot = venus.snapshot();
-    let weather = shared.weather.borrow().clone();
+    let weather = corrected_weather(shared, now);
     let (pv_model, hp_model, load_model, hot_water_model) = (
         shared.pv_model.borrow().clone(),
         shared.hp_model.borrow().clone(),
@@ -867,6 +903,39 @@ fn replan(venus: &Venus, shared: &Shared) {
             shared.update_status(|s| s.problem = Some(format!("planning: {error:#}")));
         }
     }
+}
+
+/// The forecast, corrected with the local weather station when there is one
+/// (the recent past included, so moving averages start from what happened).
+fn corrected_weather(shared: &Shared, now: Timestamp) -> Arc<BTreeMap<Slot, Weather>> {
+    use dess_core::weather_correction;
+    let forecast = shared.weather.borrow().clone();
+    if shared.config.weather_station.entities().is_empty() {
+        return forecast;
+    }
+    let read = tokio::task::block_in_place(|| {
+        let store = lock(&shared.store);
+        let past = store.weather(
+            Slot::containing(now - SignedDuration::from_hours(24 * 10)),
+            Slot::containing(now),
+        )?;
+        let observed =
+            store.observations(Slot::containing(now - SignedDuration::from_hours(24 * 8)))?;
+        anyhow::Ok((past, observed))
+    });
+    let (mut merged, observed) = match read {
+        Ok(read) => read,
+        Err(error) => {
+            warn!("reading the weather station's history: {error:#}");
+            return forecast;
+        }
+    };
+    merged.extend(forecast.iter().map(|(slot, w)| (*slot, *w)));
+    let correction = weather_correction::correction(&merged, &observed, now);
+    *shared.weather_correction.lock().expect("lock poisoned") = Some(correction);
+    Arc::new(weather_correction::apply(
+        &merged, &observed, correction, now,
+    ))
 }
 
 /// Copies hourly energy statistics from Home Assistant: a backfill on the

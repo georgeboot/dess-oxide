@@ -72,6 +72,20 @@ pub async fn location(
     })
 }
 
+/// Home Assistant's configured language, such as `nl` or `en`.
+pub async fn language(client: &reqwest::Client, endpoint: &Endpoint) -> anyhow::Result<String> {
+    let config: Value = client
+        .get(format!("{}/config", endpoint.rest))
+        .bearer_auth(&endpoint.token)
+        .send()
+        .await
+        .context("asking Home Assistant for its language")?
+        .error_for_status()?
+        .json()
+        .await?;
+    Ok(config["language"].as_str().unwrap_or("en").to_owned())
+}
+
 /// Sets an entity's state through the REST API. HA forgets such states when
 /// it restarts, so callers repeat them now and then; an unchanged state
 /// doesn't add to HA's history.
@@ -208,6 +222,32 @@ fn parse_history(
         out.insert(id.clone(), changes);
     }
     Ok(out)
+}
+
+/// An entity's current state and its unit of measurement, if it exists.
+pub async fn state_with_unit(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    entity_id: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    let response = client
+        .get(format!("{}/states/{entity_id}", endpoint.rest))
+        .bearer_auth(&endpoint.token)
+        .send()
+        .await
+        .with_context(|| format!("reading {entity_id}"))?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(None);
+    }
+    let body: Value = response.error_for_status()?.json().await?;
+    Ok(body["state"].as_str().map(|state| {
+        (
+            state.to_owned(),
+            body["attributes"]["unit_of_measurement"]
+                .as_str()
+                .map(str::to_owned),
+        )
+    }))
 }
 
 /// An entity's current state, if it has one.
