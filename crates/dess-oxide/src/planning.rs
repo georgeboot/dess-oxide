@@ -226,8 +226,13 @@ pub fn make_plan(
         None => reading::sample(snapshot, now)?.soc_pct,
     };
     let info = reading::battery_info(snapshot);
-    let learned = learned_capacity(store, now)?.usable_wh();
-    let mut battery = battery_model(&info, &learned_losses(store, now)?, learned)?;
+    let fit = learned_capacity(store, now)?;
+    let mut battery = battery_model(&info, &learned_losses(store, now)?, fit.usable_wh())?;
+    // The cells' own round trip: from the BMS's counters over the last year,
+    // else from the charge and discharge stretches.
+    if let Some(round_trip) = cell_round_trip(store, &config.history, now)?.or(fit.round_trip()) {
+        battery.cell_efficiency = round_trip.sqrt().clamp(0.9, 1.0);
+    }
     if let Some(draw) = learned_bypass_draw(store) {
         battery.bypass_draw = Some(Watts(draw));
     }
@@ -447,6 +452,31 @@ pub fn learned_bypass_draw(store: &Store) -> Option<f64> {
 pub fn learned_capacity(store: &Store, now: Timestamp) -> anyhow::Result<CapacityFit> {
     let from = Slot::containing(now - SignedDuration::from_hours(24 * 180));
     Ok(dess_core::capacity::fit_capacity(&store.slot_energy(from)?))
+}
+
+/// The battery's own round trip from its DC counters (energy out over energy
+/// in) over the last year: with thousands of kWh through it, the SoC's
+/// change over the window doesn't matter.
+pub fn cell_round_trip(
+    store: &Store,
+    history: &HistoryConfig,
+    now: Timestamp,
+) -> anyhow::Result<Option<f64>> {
+    let (into, out) = (history.of("battery_dc_in"), history.of("battery_dc_out"));
+    if into.is_empty() || out.is_empty() {
+        return Ok(None);
+    }
+    let from = now - SignedDuration::from_hours(24 * 365);
+    let total = |sensors: &[&str]| -> anyhow::Result<f64> {
+        sensors
+            .iter()
+            .map(|e| Ok(store.ha_total(e, from, now)?.0))
+            .sum()
+    };
+    let (charged, discharged) = (total(&into)?, total(&out)?);
+    Ok((charged >= 1000.0)
+        .then(|| discharged / charged)
+        .filter(|r| (0.8..=1.0).contains(r)))
 }
 
 /// Usable capacity: learned from long stretches, else from the GX device
@@ -958,6 +988,35 @@ mod tests {
         // (0.6 + 0.4) − (0.1 + 0.1) = 0.8 kWh in the hour.
         assert_eq!(loads.len(), 4);
         assert!(loads.iter().all(|(_, w)| (w.0 - 800.0).abs() < 1e-9));
+    }
+
+    #[test]
+    fn the_cells_round_trip_from_the_bms_counters() {
+        let mut store = Store::in_memory().unwrap();
+        let now: Timestamp = "2026-09-27T12:00:00Z".parse().unwrap();
+        let rows: Vec<(String, Timestamp, f64)> = (1..=200)
+            .flat_map(|d| {
+                let at = now - SignedDuration::from_hours(24 * d);
+                [
+                    ("sensor.in".to_owned(), at, 10.0),
+                    ("sensor.out".to_owned(), at, 9.6),
+                ]
+            })
+            .collect();
+        store.save_ha_hourly(&rows).unwrap();
+        let history = HistoryConfig {
+            battery_dc_in: Some("sensor.in".into()),
+            battery_dc_out: Some("sensor.out".into()),
+            ..HistoryConfig::default()
+        };
+        let rt = cell_round_trip(&store, &history, now).unwrap().unwrap();
+        assert!((rt - 0.96).abs() < 1e-9);
+        // Too little through it yet: nothing.
+        let few = HistoryConfig {
+            battery_dc_in: Some("sensor.none".into()),
+            ..history.clone()
+        };
+        assert_eq!(cell_round_trip(&store, &few, now).unwrap(), None);
     }
 
     #[test]

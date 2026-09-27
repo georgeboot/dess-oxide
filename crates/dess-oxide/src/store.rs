@@ -528,6 +528,21 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// An imported entity's total over `[from, until)`, and the hours it covers.
+    pub fn ha_total(
+        &self,
+        entity: &str,
+        from: jiff::Timestamp,
+        until: jiff::Timestamp,
+    ) -> anyhow::Result<(f64, i64)> {
+        Ok(self.conn.query_row(
+            "SELECT coalesce(sum(kwh), 0), count(*) FROM ha_hourly
+             WHERE entity = ?1 AND hour_start >= ?2 AND hour_start < ?3",
+            params![entity, from.as_second(), until.as_second()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
     /// Per imported entity: its first and last hour, and how many hours.
     pub fn ha_coverage(
         &self,

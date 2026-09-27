@@ -57,6 +57,9 @@ pub struct BatteryModel {
     pub max_charge_ac: Watts,
     /// Most AC power the system can deliver while discharging.
     pub max_discharge_ac: Watts,
+    /// The cells' own efficiency, each way: of the DC energy at the terminals
+    /// this share ends up stored, and taking energy out costs `1 / this`.
+    pub cell_efficiency: f64,
 }
 
 impl BatteryModel {
@@ -86,29 +89,35 @@ impl BatteryModel {
             bypass_draw: Some(Watts(8.0 * n)),
             max_charge_ac,
             max_discharge_ac,
+            // LFP cells lose about 4 % over a round trip, until measured.
+            cell_efficiency: 0.98,
         }
     }
 
-    /// DC power at the battery for AC power `ac` (positive = charging).
+    /// How fast the stored energy changes for AC power `ac` (positive =
+    /// charging): the inverters' conversion losses and the cells' own.
     pub fn dc_for_ac(&self, ac: Watts) -> Watts {
         let p = ac.0.abs();
+        let cells = self.cell_efficiency.clamp(0.5, 1.0);
         if ac.0 >= 0.0 {
             let c = self.charge_loss;
-            Watts(p - c.linear * p - c.quadratic * p * p)
+            Watts((p - c.linear * p - c.quadratic * p * p) * cells)
         } else {
             let d = self.discharge_loss;
-            Watts(-(p + d.linear * p + d.quadratic * p * p))
+            Watts(-(p + d.linear * p + d.quadratic * p * p) / cells)
         }
     }
 
     /// AC power (positive = charging) that changes the stored energy by
     /// `delta` over `hours`, or `None` if that exceeds the limits.
     pub fn ac_power_for(&self, delta: WattHours, hours: f64) -> Option<Watts> {
-        let dc = delta.0 / hours;
-        let ac = if dc >= 0.0 {
-            self.charge_loss.ac_for_charging(dc)?
+        let cells = self.cell_efficiency.clamp(0.5, 1.0);
+        let stored = delta.0 / hours;
+        // At the terminals: more going in than gets stored, less coming out.
+        let ac = if stored >= 0.0 {
+            self.charge_loss.ac_for_charging(stored / cells)?
         } else {
-            -self.discharge_loss.ac_from_discharging(-dc)
+            -self.discharge_loss.ac_from_discharging(-stored * cells)
         };
         (ac <= self.max_charge_ac.0 + 1e-9 && -ac <= self.max_discharge_ac.0 + 1e-9)
             .then_some(Watts(ac))
@@ -118,6 +127,22 @@ impl BatteryModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stored_energy_counts_the_cells_too() {
+        let mut b = prior();
+        let with_cells = b.dc_for_ac(Watts(3000.0)).0;
+        b.cell_efficiency = 1.0;
+        let without = b.dc_for_ac(Watts(3000.0)).0;
+        assert!((with_cells - without * 0.98).abs() < 1e-9);
+        // And back: storing that much takes the same AC power.
+        b.cell_efficiency = 0.98;
+        let ac = b
+            .ac_power_for(WattHours(with_cells * 0.25), 0.25)
+            .unwrap()
+            .0;
+        assert!((ac - 3000.0).abs() < 1e-6, "{ac}");
+    }
 
     fn prior() -> BatteryModel {
         BatteryModel::multiplus_ii_prior(WattHours(32_000.0), 3, Watts(10_000.0), Watts(11_000.0))

@@ -399,7 +399,7 @@ fn render(
                 (money_section(shared, recorded.money, recorded.comparison))
                 (accuracy_section(l, recorded.accuracy, recorded.days))
                 (models_section(shared, models))
-                @if let Some(view) = view { (battery_section(l, &view.battery, losses, capacity, crate::planning::learned_bypass_draw(&lock(&shared.store)).is_some())) }
+                @if let Some(view) = view { (battery_section(l, &view.battery, losses, capacity, battery_learned(shared, capacity))) }
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -1242,7 +1242,7 @@ fn battery_section(
     battery: &dess_core::battery::BatteryModel,
     losses: Option<&LearnedLosses>,
     capacity: Option<&CapacityFit>,
-    bypass_learned: bool,
+    (bypass_learned, cells_measured): (bool, bool),
 ) -> Markup {
     let kwh = |wh: f64| format!("{:.1} kWh", wh / 1000.0);
     let learned = |side: bool| {
@@ -1304,7 +1304,17 @@ fn battery_section(
                 }
             }
         }
-        p.muted { (l.t("Conversion efficiency without the standby draw, which the planner counts separately.", "Omzettingsrendement zonder het stand-byverbruik, dat de planner apart meerekent.")) }
+        p.muted {
+            (l.t("Conversion efficiency without the standby draw, which the planner counts separately. On top of it, the cells themselves keep ",
+                 "Omzettingsrendement zonder het stand-byverbruik, dat de planner apart meerekent. Daarbovenop houden de cellen zelf "))
+            (format!("{:.1} %", battery.cell_efficiency * 100.0))
+            (l.t(" each way", " per richting vast"))
+            @if cells_measured {
+                (l.t(" (measured: energy out over energy in).", " (gemeten: energie eruit gedeeld door energie erin)."))
+            } @else {
+                (l.t(" (typical for LFP, until measured).", " (gebruikelijk voor LFP, tot het gemeten is)."))
+            }
+        }
     }
 }
 
@@ -1406,6 +1416,20 @@ fn decimal_commas(page: &str) -> String {
         previous = c;
     }
     out
+}
+
+/// Whether the bypass draw and the cells' round trip are measured yet.
+fn battery_learned(shared: &Shared, capacity: Option<&CapacityFit>) -> (bool, bool) {
+    let store = lock(&shared.store);
+    let cells = crate::planning::cell_round_trip(&store, &shared.config.history, Timestamp::now())
+        .ok()
+        .flatten()
+        .is_some()
+        || capacity.and_then(CapacityFit::round_trip).is_some();
+    (
+        crate::planning::learned_bypass_draw(&store).is_some(),
+        cells,
+    )
 }
 
 /// Why selling pays less than buying, when the tariff makes it so.

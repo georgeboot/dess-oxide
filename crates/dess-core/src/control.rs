@@ -263,8 +263,9 @@ mod tests {
             &limited,
         );
         let planned_grid = p.slots[0].grid.0;
+        // Within one 100 Wh step (400 W over a quarter hour) of the limit.
         assert!(
-            (planned_grid + 5000.0).abs() < 300.0,
+            (planned_grid + 5000.0).abs() < 450.0,
             "plan exports at the limit: {planned_grid}"
         );
         let now = start() + jiff::SignedDuration::from_mins(5);
@@ -276,7 +277,7 @@ mod tests {
         let d = decide(&p, &battery(), &limited, 0.0, now, surprise).unwrap();
         // The extra 2 kW comes from the battery; the export stays.
         assert!(
-            (d.setpoint.0 - planned_grid).abs() < 300.0,
+            (d.setpoint.0 - planned_grid).abs() < 450.0,
             "setpoint {} vs planned {planned_grid}",
             d.setpoint.0
         );

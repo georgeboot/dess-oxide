@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.19.0
+
+- **The battery's own losses count too:** what goes into the cells doesn't
+  all come back out. The plan now includes the cells' round trip on top of
+  the inverters' losses: measured from the BMS's counters (energy out over
+  energy in, over the last year), else from the long charge and discharge
+  stretches, else about 4 %. Small price spreads are no longer traded when
+  the round trip eats them.
+
 ## 0.18.0
 
 - **The reserve is ESS's own minimum SoC** on the GX device ("Minimum SoC
