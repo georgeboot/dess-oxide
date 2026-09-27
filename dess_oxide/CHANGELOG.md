@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.0
+
+- **Bypass, like DAO's:** when the battery has nothing worthwhile to do in a
+  quarter hour, the plan holds it in bypass (ESS external control: the
+  battery idle, the grid passing through). The inverters draw less then
+  (measured from your Cerbo; about 22 W against 60 W idling), so the plan
+  no longer trickle-charges or trickle-discharges. With control on, ESS is
+  switched to external control for those quarter hours and back otherwise;
+  "hold the battery" uses bypass too. The plan table shows bypass slots.
+- The efficiency fit leaves out bypass periods (they made the standby look
+  lower); its idle samples start over.
+- **Handover check:** with `dryrun: false`, the page warns when ESS's own
+  grid setpoint is far from zero (DAO writes that setting, and plain ESS
+  aims for it whenever dess-oxide isn't in control).
+
 ## 0.14.1
 
 - **Fix:** the "ESS setpoint" line showed the stored setpoint while ESS was

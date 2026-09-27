@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use dess_core::Watts;
 use dess_core::control::{self, Decision, Measured};
-use dess_victron::writer::{MINIMUM_SOC, SETPOINT_OVERRIDE, SETPOINT_SETTING};
+use dess_victron::writer::{EssMode, MINIMUM_SOC, SETPOINT_OVERRIDE, SETPOINT_SETTING};
 use dess_victron::{Snapshot, Venus, WriteAccess, Writer, reading};
 use jiff::{SignedDuration, Timestamp};
 use tokio::sync::watch;
@@ -35,6 +35,12 @@ const REFRESH: Duration = Duration::from_secs(10);
 const BACKSTOP_LEAD: SignedDuration = SignedDuration::from_hours(3);
 /// The setting that remembers ESS's minimum SoC while the backstop holds it.
 const MIN_SOC_BEFORE_OUTAGE: &str = "min_soc_before_outage";
+/// Set while dess-oxide has ESS in external control (bypass), so a restart
+/// knows that mode 3 is its own.
+const BYPASS_MARKER: &str = "ess_bypass_by_dess";
+/// ESS's own grid setpoint above this (either way) is worth a warning: plain
+/// ESS uses it whenever dess-oxide isn't in control.
+pub const SANE_SETPOINT_SETTING_W: f64 = 500.0;
 
 /// A plan older than this isn't trusted.
 const MAX_PLAN_AGE: SignedDuration = SignedDuration::from_mins(20);
@@ -172,6 +178,15 @@ pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiv
     };
     let writer = venus.writer(access);
     let mut state = State::default();
+    // Bypass left from before a restart is still ours.
+    let marker = lock(&shared.store).setting(BYPASS_MARKER).ok().flatten();
+    if marker.as_deref() == Some("on") {
+        if venus.with_snapshot(|s| s.number(ESS_MODE_PATH)) == Some(3.0) {
+            state.bypass = true;
+        } else {
+            let _ = lock(&shared.store).set_setting(BYPASS_MARKER, "off");
+        }
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     info!("control is allowed by the options; it acts once the page switch is on");
@@ -190,7 +205,7 @@ pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiv
                     info!("taking control");
                     state.active = true;
                 }
-                state.apply(&writer, &shared, decision, now).await;
+                let decision = state.apply(&writer, &shared, decision, now).await;
                 shared.set_control(ControlStatus::Active(decision));
             }
             Err(reason) => {
@@ -202,11 +217,13 @@ pub async fn run(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiv
             }
         }
     }
-    if state.active {
+    if state.active || state.bypass {
         info!("shutting down: releasing control to plain ESS");
         state.release(&writer, &shared).await;
     }
 }
+
+const ESS_MODE_PATH: &str = dess_victron::writer::ESS_MODE;
 
 /// Holds or releases the outage backstop on ESS's minimum SoC. Like the
 /// setpoint, it needs both locks (the option and the page switch), but none of
@@ -284,8 +301,9 @@ fn evaluate(
     {
         return Err("Victron Dynamic ESS is enabled; switch it off first".into());
     }
-    match snapshot.number("settings/0/Settings/CGwacs/Hub4Mode") {
+    match snapshot.number(ESS_MODE_PATH) {
         Some(1.0) => {}
+        Some(3.0) if state.bypass => {}
         Some(3.0) => {
             return Err("ESS is in external control (Hub4Mode 3), such as DAO's bypass; set it back to \"Optimized, total of all phases\"".into());
         }
@@ -324,10 +342,20 @@ fn evaluate(
         measured,
     )
     .ok_or("the plan doesn't cover now")?;
+    // The plan's bypass slots, when bypass is available.
+    let bypass_available = view.battery.bypass_draw.is_some();
+    decision.bypass = bypass_available
+        && view
+            .plan
+            .slots
+            .iter()
+            .find(|s| s.slot == dess_core::Slot::containing(now))
+            .is_some_and(|s| s.bypass);
     if let Some(mode) = active_override(&lock(&shared.store), now) {
         let battery_ac = mode.battery_power(measured, &view.battery, view.min_soc);
         decision.battery_ac = Watts(battery_ac);
         decision.setpoint = Watts(measured.load.0 - measured.pv.0 + battery_ac);
+        decision.bypass = bypass_available && mode == Override::Hold;
     }
     let limit = |w: f64| w.clamp(-view.settings.max_export.0, view.settings.max_import.0);
     decision.setpoint = Watts(limit(decision.setpoint.0));
@@ -337,6 +365,10 @@ fn evaluate(
 #[derive(Debug, Default)]
 struct State {
     active: bool,
+    /// We have ESS in external control (bypass).
+    bypass: bool,
+    /// Bypass or not is settled once per slot: the mode is a stored setting.
+    slot_mode: Option<(dess_core::Slot, bool)>,
     /// What we last wrote, and when.
     written: Option<(f64, std::time::Instant)>,
     relay_closed: Option<bool>,
@@ -369,14 +401,67 @@ impl State {
         }
     }
 
+    /// Carries out a decision; returns what was actually done (bypass is
+    /// settled at the first decision of each slot).
     async fn apply(
         &mut self,
         writer: &Writer<'_>,
         shared: &Shared,
-        decision: Decision,
+        mut decision: Decision,
         now: Timestamp,
-    ) {
-        let setpoint = decision.setpoint.0.round();
+    ) -> Decision {
+        let slot = dess_core::Slot::containing(now);
+        let bypass = match self.slot_mode {
+            Some((s, bypass)) if s == slot => bypass,
+            _ => {
+                self.slot_mode = Some((slot, decision.bypass));
+                decision.bypass
+            }
+        };
+        decision.bypass = bypass;
+        if bypass {
+            decision.battery_ac = Watts::ZERO;
+            if !self.bypass {
+                self.enter_bypass(writer, shared).await;
+            }
+        } else if self.bypass {
+            self.leave_bypass(writer, shared).await;
+        }
+        self.switch_pv(writer, shared, decision.pv_on, now).await;
+        if !self.bypass {
+            self.write_setpoint(writer, decision.setpoint.0.round())
+                .await;
+        }
+        decision
+    }
+
+    async fn enter_bypass(&mut self, writer: &Writer<'_>, shared: &Shared) {
+        if let Err(error) = writer.set_setpoint(None).await {
+            warn!(%error, "releasing the setpoint before bypass");
+        }
+        self.written = None;
+        match writer.set_ess_mode(EssMode::ExternalControl).await {
+            Ok(()) => {
+                info!("bypass: the battery holds, the grid passes through");
+                self.bypass = true;
+                let _ = lock(&shared.store).set_setting(BYPASS_MARKER, "on");
+            }
+            Err(error) => warn!(%error, "switching ESS to external control"),
+        }
+    }
+
+    async fn leave_bypass(&mut self, writer: &Writer<'_>, shared: &Shared) {
+        match writer.set_ess_mode(EssMode::TotalOfAllPhases).await {
+            Ok(()) => {
+                info!("leaving bypass");
+                self.bypass = false;
+                let _ = lock(&shared.store).set_setting(BYPASS_MARKER, "off");
+            }
+            Err(error) => warn!(%error, "switching ESS back to regulating the grid"),
+        }
+    }
+
+    async fn write_setpoint(&mut self, writer: &Writer<'_>, setpoint: f64) {
         let due = self
             .written
             .is_none_or(|(w, at)| (w - setpoint).abs() > DEADBAND_W || at.elapsed() > REFRESH);
@@ -386,12 +471,21 @@ impl State {
                 Err(error) => warn!(%error, "writing the setpoint"),
             }
         }
+    }
+
+    async fn switch_pv(
+        &mut self,
+        writer: &Writer<'_>,
+        shared: &Shared,
+        pv_on: bool,
+        now: Timestamp,
+    ) {
         if let Some(relay) = shared.config.victron.pv_relay {
-            let closed = relay_closed_for(decision.pv_on, shared.config.victron.pv_relay_energized);
+            let closed = relay_closed_for(pv_on, shared.config.victron.pv_relay_energized);
             if self.relay_closed != Some(closed) {
                 match writer.set_relay(relay, closed).await {
                     Ok(()) => {
-                        info!(pv_on = decision.pv_on, %now, "switched the PV relay");
+                        info!(pv_on, %now, "switched the PV relay");
                         self.relay_closed = Some(closed);
                     }
                     Err(error) => warn!(%error, "switching the PV relay"),
@@ -400,8 +494,12 @@ impl State {
         }
     }
 
-    /// Plain ESS again: the override released, PV on.
+    /// Plain ESS again: regulating the grid, the override released, PV on.
     async fn release(&mut self, writer: &Writer<'_>, shared: &Shared) {
+        if self.bypass {
+            self.leave_bypass(writer, shared).await;
+        }
+        self.slot_mode = None;
         if let Err(error) = writer.set_setpoint(None).await {
             error!(%error, "releasing the setpoint override");
         }

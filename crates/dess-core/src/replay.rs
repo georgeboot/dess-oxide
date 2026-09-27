@@ -68,10 +68,13 @@ pub fn replay(
                 settings,
             }));
         }
-        let planned_pv = plan
+        let planned = plan
             .as_ref()
-            .and_then(|p| p.slots.iter().find(|s| s.slot == h.slot))
-            .is_none_or(|s| s.pv_on);
+            .and_then(|p| p.slots.iter().find(|s| s.slot == h.slot));
+        let planned_pv = planned.is_none_or(|s| s.pv_on);
+        // A bypass slot runs in bypass whatever happens, as the executor
+        // does; the others follow the policy.
+        let bypass = planned.filter(|s| s.bypass).and(battery.bypass_draw);
         let pv = if planned_pv { h.pv } else { Watts::ZERO };
         let measured = Measured {
             load: h.load,
@@ -80,6 +83,7 @@ pub fn replay(
         };
         let ac = plan
             .as_ref()
+            .filter(|_| bypass.is_none())
             .and_then(|p| {
                 control::decide(p, battery, settings, min_soc_pct, h.slot.start(), measured)
             })
@@ -87,7 +91,7 @@ pub fn replay(
         let hours = 0.25;
         let energy =
             (soc / 100.0 * capacity + battery.dc_for_ac(Watts(ac)).0 * hours).clamp(0.0, capacity);
-        let grid = h.load.0 + battery.standby.0 + ac - pv.0;
+        let grid = h.load.0 + bypass.unwrap_or(battery.standby).0 + ac - pv.0;
         cost +=
             (h.prices.buy.0 * grid.max(0.0) - h.prices.sell.0 * (-grid).max(0.0)) * hours / 1000.0;
         soc = energy / capacity * 100.0;

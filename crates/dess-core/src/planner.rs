@@ -98,6 +98,8 @@ pub struct PlannedSlot {
     /// Grid power, positive = import.
     pub grid: Watts,
     pub pv_on: bool,
+    /// The battery holds and the inverters go to bypass for the slot.
+    pub bypass: bool,
     /// Grid cost plus wear for this slot, in euro.
     pub cost: f64,
     /// Marginal value of stored energy at the end of the slot.
@@ -393,6 +395,7 @@ impl<'a> Problem<'a> {
                 battery_dc: Watts(m.dc),
                 grid: Watts(grid),
                 pv_on,
+                bypass: bypass_draw(forecast, battery, &m).is_some(),
                 cost: stage_cost(forecast, battery, settings, hours, &m, pv_on)
                     - excess_penalty(forecast, grid, settings, hours),
                 stored_energy_value: values.marginal_value(t + 1, decision.relay, next),
@@ -425,7 +428,19 @@ fn moves(battery: &BatteryModel, step: f64, hours: f64) -> Vec<Move> {
 
 fn grid_power(forecast: &SlotForecast, battery: &BatteryModel, m: &Move, pv_on: bool) -> f64 {
     let pv = if pv_on { forecast.pv.0 } else { 0.0 };
-    forecast.load.0 + battery.standby.0 + m.ac - pv
+    let own = match bypass_draw(forecast, battery, m) {
+        Some(draw) => draw.0,
+        None => battery.standby.0,
+    };
+    forecast.load.0 + own + m.ac - pv
+}
+
+/// The inverters' draw if this move is a slot in bypass: the battery holds,
+/// bypass is available, and the grid is there.
+fn bypass_draw(forecast: &SlotForecast, battery: &BatteryModel, m: &Move) -> Option<Watts> {
+    battery
+        .bypass_draw
+        .filter(|_| m.levels == 0 && !forecast.islanded)
 }
 
 /// Penalty for grid use beyond what's possible: the connection's limits, or
@@ -517,6 +532,47 @@ mod tests {
             slots,
             settings,
         })
+    }
+
+    #[test]
+    fn holds_in_bypass_when_nothing_is_worth_it() {
+        // An empty battery and flat prices: nothing to gain, so the battery
+        // holds and the inverters draw only their bypass power.
+        let slots = forecasts(&[0.25; 8], 500.0, 0.0);
+        let p = run(&slots, 0.0, &settings());
+        let bypass = battery().bypass_draw.unwrap().0;
+        for s in &p.slots {
+            assert!(s.bypass, "{s:?}");
+            assert!((s.grid.0 - (500.0 + bypass)).abs() < 1e-6, "{s:?}");
+        }
+        // Without bypass, holding costs the full standby.
+        let no_bypass = BatteryModel {
+            bypass_draw: None,
+            ..battery()
+        };
+        let p = plan(&PlanRequest {
+            now: start(),
+            soc_pct: 0.0,
+            pv_on: true,
+            battery: &no_bypass,
+            slots: &slots,
+            settings: &settings(),
+        });
+        assert!(
+            p.slots
+                .iter()
+                .all(|s| !s.bypass && (s.grid.0 - 560.0).abs() < 1e-6)
+        );
+    }
+
+    #[test]
+    fn no_bypass_while_islanded() {
+        let mut slots = forecasts(&[0.25; 4], 500.0, 0.0);
+        for s in &mut slots {
+            s.islanded = true;
+        }
+        let p = run(&slots, 0.0, &settings());
+        assert!(p.slots.iter().all(|s| !s.bypass));
     }
 
     #[test]

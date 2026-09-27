@@ -38,6 +38,8 @@ pub struct Decision {
     pub setpoint: Watts,
     /// Whether PV should be on in this slot (the plan's choice).
     pub pv_on: bool,
+    /// Bypass instead: the battery idle, the grid passing through.
+    pub bypass: bool,
 }
 
 /// The best battery power now, or `None` if `now` isn't in the plan.
@@ -66,6 +68,7 @@ pub fn decide(
         battery_ac: Watts(best),
         setpoint: Watts(measured.load.0 - measured.pv.0 + best),
         pv_on: plan.slots[t].pv_on,
+        bypass: false,
     })
 }
 

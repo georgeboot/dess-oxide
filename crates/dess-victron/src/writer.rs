@@ -2,7 +2,7 @@
 //!
 //! A [`Writer`] needs a [`WriteAccess`], and only the `dryrun: false`
 //! configuration option creates one, so code without it can't write at all.
-//! Writes are limited to three paths, and each is confirmed by reading the
+//! Writes are limited to four paths, and each is confirmed by reading the
 //! value back from the GX device.
 
 use std::time::Duration;
@@ -20,6 +20,18 @@ pub const SETPOINT_OVERRIDE: &str = "hub4/0/Overrides/Setpoint";
 pub const MINIMUM_SOC: &str = "settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit";
 /// ESS's persisted setpoint setting; read to fall back to when releasing.
 pub const SETPOINT_SETTING: &str = "settings/0/Settings/CGwacs/AcPowerSetPoint";
+/// ESS's mode: 1 regulates the grid over all phases, 3 is external control
+/// (bypass: with nothing asked of the inverters, the battery sits idle).
+pub const ESS_MODE: &str = "settings/0/Settings/CGwacs/Hub4Mode";
+
+/// The ESS modes dess-oxide switches between.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EssMode {
+    /// "Optimized", regulating the total of all phases to the grid setpoint.
+    TotalOfAllPhases = 1,
+    /// External control, used as bypass.
+    ExternalControl = 3,
+}
 
 /// How long the GX device gets to echo a written value.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,6 +99,12 @@ impl Writer<'_> {
     pub async fn set_relay(&self, number: u8, closed: bool) -> Result<(), WriteError> {
         let path = format!("system/0/Relay/{}/State", number.clamp(1, 2) - 1);
         self.write(&path, json!(u8::from(closed))).await
+    }
+
+    /// Switches ESS between regulating the grid and bypass. A stored setting,
+    /// so it's written only when the mode changes.
+    pub async fn set_ess_mode(&self, mode: EssMode) -> Result<(), WriteError> {
+        self.write(ESS_MODE, json!(mode as u8)).await
     }
 
     /// Sets ESS's minimum SoC, %.

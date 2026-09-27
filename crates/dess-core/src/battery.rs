@@ -48,6 +48,11 @@ pub struct BatteryModel {
     pub discharge_loss: LossCurve,
     /// Constant draw of the inverter/chargers while they're on.
     pub standby: Watts,
+    /// Their draw in bypass (ESS external control with nothing asked of
+    /// them: the battery idle, the grid passing through), if the executor
+    /// can use bypass. Lower than `standby`, so a battery that has nothing
+    /// worthwhile to do is better off in bypass than trickling.
+    pub bypass_draw: Option<Watts>,
     /// Most AC power the system can take in while charging.
     pub max_charge_ac: Watts,
     /// Most AC power the system can deliver while discharging.
@@ -78,6 +83,7 @@ impl BatteryModel {
                 quadratic: 2.55e-5 / n,
             },
             standby: Watts(20.0 * n),
+            bypass_draw: Some(Watts(8.0 * n)),
             max_charge_ac,
             max_discharge_ac,
         }

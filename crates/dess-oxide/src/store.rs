@@ -138,6 +138,11 @@ const MIGRATIONS: &[&str] = &[
         legionella_wh    REAL NOT NULL  -- part of hot_water_wh
     ) STRICT;
 ",
+    r"
+    -- Idle efficiency bins mixed ESS idling with bypass (external control):
+    -- start them over; bypass is measured on its own now.
+    DELETE FROM efficiency_bins WHERE bin = 0;
+",
 ];
 
 pub struct Store {

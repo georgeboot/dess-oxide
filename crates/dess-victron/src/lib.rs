@@ -7,7 +7,7 @@
 //!
 //! Reading is the default. Writing (`W/…`) is a separate capability,
 //! [`Writer`], which needs a [`WriteAccess`] that only the `dryrun: false`
-//! option creates, and it can only write three values.
+//! option creates, and it can only write four values.
 
 mod client;
 pub mod probe;

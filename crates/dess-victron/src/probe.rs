@@ -211,8 +211,8 @@ fn control_findings(r: &ProbeReport, add: &mut impl FnMut(Severity, String)) {
     match r.ess.hub4_mode {
         Some(1) => {}
         Some(3) => add(
-            Severity::Blocker,
-            "ESS is in external control mode (Hub4Mode 3); dess-oxide needs ESS to regulate the grid setpoint.".into(),
+            Severity::Info,
+            "ESS is in external control (Hub4Mode 3), such as DAO's bypass. dess-oxide uses that mode itself for bypass, but takes control only from \"Total of all phases\" (1).".into(),
         ),
         Some(mode) => add(
             Severity::Warning,

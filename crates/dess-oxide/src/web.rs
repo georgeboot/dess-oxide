@@ -382,7 +382,7 @@ fn render(
                 (money_section(shared, recorded.money, recorded.comparison))
                 (accuracy_section(recorded.accuracy, recorded.days))
                 (models_section(shared, models))
-                @if let Some(view) = view { (battery_section(&view.battery, losses, capacity)) }
+                @if let Some(view) = view { (battery_section(&view.battery, losses, capacity, crate::planning::learned_bypass_draw(&lock(&shared.store)).is_some())) }
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -413,6 +413,14 @@ fn render(
 
 fn control_card(shared: &Shared) -> Markup {
     use crate::control::{ControlStatus, Override};
+    let stale_setpoint = shared
+        .status
+        .lock()
+        .expect("status lock poisoned")
+        .ess_setpoint_setting
+        .filter(|w| {
+            w.abs() > crate::control::SANE_SETPOINT_SETTING_W && shared.config.writes_allowed()
+        });
     let switched_on = crate::control::switched_on(shared);
     let active = crate::control::active_override(&lock(&shared.store), Timestamp::now());
     let switch = |on: bool, label: &str| {
@@ -437,10 +445,22 @@ fn control_card(shared: &Shared) -> Markup {
                 }
                 ControlStatus::Active(decision) => {
                     strong.active { "In control." }
-                    " Grid setpoint " (format!("{:+.1} kW", decision.setpoint.0 / 1000.0))
-                    ", battery " (format!("{:+.1} kW", decision.battery_ac.0 / 1000.0))
+                    @if decision.bypass {
+                        " Bypass: the battery holds, the grid passes through"
+                    } @else {
+                        " Grid setpoint " (format!("{:+.1} kW", decision.setpoint.0 / 1000.0))
+                        ", battery " (format!("{:+.1} kW", decision.battery_ac.0 / 1000.0))
+                    }
                     ", PV " (if decision.pv_on { "on" } else { "off" }) ". "
                     (switch(false, "Switch control off"))
+                }
+            }
+            @if let Some(setting) = stale_setpoint {
+                p.problem {
+                    "ESS's own grid setpoint is " (format!("{setting:.0} W")) " (probably left by DAO, which writes that setting). "
+                    "Plain ESS aims for it whenever dess-oxide isn't in control, "
+                    @if setting > 0.0 { "so it would charge from the grid at that power. " } @else { "so it would push that much into the grid. " }
+                    "Set it to about 0–50 W on the Cerbo (Settings → ESS → Grid setpoint) once DAO is off."
                 }
             }
             @if shared.config.writes_allowed() {
@@ -1093,6 +1113,7 @@ fn battery_section(
     battery: &dess_core::battery::BatteryModel,
     losses: Option<&LearnedLosses>,
     capacity: Option<&CapacityFit>,
+    bypass_learned: bool,
 ) -> Markup {
     let kwh = |wh: f64| format!("{:.1} kWh", wh / 1000.0);
     let learned = |side: bool| {
@@ -1134,6 +1155,11 @@ fn battery_section(
             "; discharging: " (if learned(false) { "learned" } else { "prior" })
             ". Standby " (format!("{:.0} W", battery.standby.0))
             (if losses.is_some_and(|l| l.standby.is_some()) { " (learned)" } else { " (prior)" }) "."
+            @if let Some(bypass) = battery.bypass_draw {
+                " In bypass (ESS in external control, the battery idle) the inverters draw "
+                (format!("{:.0} W", bypass.0)) (if bypass_learned { " (measured)" } else { " (prior)" })
+                ", so when the battery has nothing worthwhile to do the plan holds it in bypass rather than trickling."
+            }
         }
         div.scroll {
             table {
@@ -1196,7 +1222,7 @@ fn slot_table(shared: &Shared, view: &PlanView) -> Markup {
                                 td { (format!("{:.3}", s.prices.sell.0)) }
                                 td { (format!("{:.2}", f.load.0 / 1000.0)) }
                                 td { (format!("{:.2}", f.pv.0 / 1000.0)) }
-                                td { (format!("{:+.2}", s.battery_ac.0 / 1000.0)) }
+                                td { @if s.bypass { "bypass" } @else { (format!("{:+.2}", s.battery_ac.0 / 1000.0)) } }
                                 td { (format!("{:+.2}", s.grid.0 / 1000.0)) }
                                 td { (format!("{:.0}", s.soc_end)) }
                                 td { (if s.pv_on { "on" } else { "off" }) }

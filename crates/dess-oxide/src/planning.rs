@@ -227,7 +227,10 @@ pub fn make_plan(
     };
     let info = reading::battery_info(snapshot);
     let learned = learned_capacity(store, now)?.usable_wh();
-    let battery = battery_model(&info, config, &learned_losses(store, now)?, learned)?;
+    let mut battery = battery_model(&info, config, &learned_losses(store, now)?, learned)?;
+    if let Some(draw) = learned_bypass_draw(store) {
+        battery.bypass_draw = Some(Watts(draw));
+    }
     let lookback =
         Slot::containing(now - SignedDuration::from_hours(24 * i64::from(PRICE_LOOKBACK_DAYS + 1)));
     let prices = store.prices(
@@ -412,6 +415,30 @@ pub fn learned_losses(store: &Store, now: Timestamp) -> anyhow::Result<LearnedLo
 
 /// The battery model and current state, from the GX device, with learned
 /// losses where there's enough data.
+/// The inverters' measured draw in bypass, as `sum,samples` (fading).
+pub const BYPASS_DRAW: &str = "bypass_draw";
+/// Samples (seconds) needed before the measured bypass draw is used.
+const MIN_BYPASS_SAMPLES: f64 = 600.0;
+
+/// The stored bypass draw statistics: `(sum of watts, samples)`.
+pub fn bypass_draw_stats(store: &Store) -> (f64, f64) {
+    store
+        .setting(BYPASS_DRAW)
+        .ok()
+        .flatten()
+        .and_then(|s| {
+            let (sum, n) = s.split_once(',')?;
+            Some((sum.parse().ok()?, n.parse().ok()?))
+        })
+        .unwrap_or((0.0, 0.0))
+}
+
+/// The inverters' draw in bypass, once measured long enough.
+pub fn learned_bypass_draw(store: &Store) -> Option<f64> {
+    let (sum, n) = bypass_draw_stats(store);
+    (n >= MIN_BYPASS_SAMPLES).then(|| sum / n)
+}
+
 /// Usable capacity learned from the last half year's long SoC stretches.
 pub fn learned_capacity(store: &Store, now: Timestamp) -> anyhow::Result<CapacityFit> {
     let from = Slot::containing(now - SignedDuration::from_hours(24 * 180));

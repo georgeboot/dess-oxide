@@ -730,8 +730,10 @@ These are off by default, enabled with an app option. They're for automations th
   3. A daily comparison goes to the dess-oxide page.
   4. Handover, once George is satisfied:
      - disable DAO's Victron automations,
+     - set ESS's stored grid setpoint back to about 0–50 W (DAO writes that setting; plain ESS falls back to it),
      - set `dryrun: false` in the app options,
      - turn control on from the dess-oxide page.
+- **Bypass (built):** the inverters draw less in ESS external control (mode 3, battery idle, grid passing through; 22 W measured at George's site) than idling in mode 1 (about 60 W). The battery model has a bypass draw; a slot where the battery holds costs that instead of the standby, so the DP prefers bypass over low-power trickling. The executor switches ESS to mode 3 for such slots (settled once per slot, as the mode is a stored setting) and back to mode 1 otherwise; releasing control always returns to mode 1. The bypass draw is measured from mode-3 samples; those are kept out of the efficiency fit.
 - **CI:** `cargo fmt --check`, `clippy -D warnings`, tests, the backtest gate, and the multi-arch image build.
 
 ## 19. Packaging and deployment

@@ -90,6 +90,8 @@ pub struct Status {
     pub findings: Vec<(Severity, String)>,
     pub prices_updated: Option<Timestamp>,
     pub pv_updated: Option<Timestamp>,
+    /// ESS's own (stored) grid setpoint: what plain ESS aims for.
+    pub ess_setpoint_setting: Option<f64>,
 }
 
 impl Shared {
@@ -260,6 +262,7 @@ async fn stopped(stop: &mut watch::Receiver<bool>) {
 async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
     let mut recorder = Recorder::new(MAX_SAMPLE_GAP);
     let mut sampler = EfficiencySampler::default();
+    let mut bypass = BypassSampler::default();
     let mut soc = SocEstimator::new(dess_core::WattHours(0.0));
     let mut warnings = RateLimitedWarning::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -279,24 +282,40 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
                 planning::capacity_wh(&reading::battery_info(snapshot), &shared.config, None)
             });
             let sample = reading::sample(snapshot, now).map_err(|e| e.to_string())?;
-            Ok::<_, String>((sample, capacity))
+            let ess = (
+                snapshot.number(dess_victron::writer::ESS_MODE),
+                snapshot.number(dess_victron::writer::SETPOINT_SETTING),
+            );
+            Ok::<_, String>((sample, capacity, ess))
         });
         match sample {
-            Ok((mut sample, capacity)) => {
+            Ok((mut sample, capacity, (ess_mode, setpoint_setting))) => {
+                shared.update_status(|s| s.ess_setpoint_setting = setpoint_setting);
                 soc.set_capacity(dess_core::WattHours(capacity.unwrap_or(0.0)));
                 sample.soc_pct = soc.update(now, sample.soc_pct, sample.battery);
                 *shared.soc.lock().expect("soc lock poisoned") = Some((now, sample.soc_pct));
                 if warnings.clear() {
                     shared.update_status(|s| s.problem = None);
                 }
-                sampler.push(
-                    now,
-                    sample.inverter_ac,
-                    sample.battery - sample.pv_dc,
-                    sample.battery_voltage,
-                );
+                match ess_mode {
+                    // Efficiency only while ESS regulates: in external
+                    // control the inverters idle in bypass.
+                    Some(mode) if mode == 1.0 || mode == 2.0 => sampler.push(
+                        now,
+                        sample.inverter_ac,
+                        sample.battery - sample.pv_dc,
+                        sample.battery_voltage,
+                    ),
+                    Some(3.0) if sample.grid_connected && sample.battery.0.abs() < 15.0 => {
+                        bypass.push(sample.inverter_ac.0);
+                    }
+                    _ => {}
+                }
                 for record in recorder.push(sample) {
                     persist(&shared, &record, &mut sampler, now);
+                    if let Err(error) = bypass.persist(&shared) {
+                        warn!(%error, "storing the bypass draw");
+                    }
                 }
             }
             Err(message) => {
@@ -318,6 +337,35 @@ fn fresh(venus: &Venus, snapshot: &Snapshot, now: Timestamp) -> Result<(), Strin
         return Err("no recent heartbeat from the GX device".to_owned());
     }
     Ok(())
+}
+
+/// The inverters' AC draw in bypass (ESS in external control, the battery
+/// idle), averaged per slot into a slowly fading mean in the settings table.
+#[derive(Debug, Default)]
+struct BypassSampler {
+    sum: f64,
+    n: u32,
+}
+
+impl BypassSampler {
+    fn push(&mut self, watts: f64) {
+        self.sum += watts;
+        self.n += 1;
+    }
+
+    fn persist(&mut self, shared: &Shared) -> anyhow::Result<()> {
+        if self.n == 0 {
+            return Ok(());
+        }
+        let store = lock(&shared.store);
+        let (sum, n) = planning::bypass_draw_stats(&store);
+        // Older samples fade (half weight after about three days of them).
+        let decay = 0.999_f64.powf(f64::from(self.n) / 60.0);
+        let (sum, n) = (sum * decay + self.sum, n * decay + f64::from(self.n));
+        store.set_setting(planning::BYPASS_DRAW, &format!("{sum},{n}"))?;
+        *self = Self::default();
+        Ok(())
+    }
 }
 
 fn persist(shared: &Shared, record: &SlotRecord, sampler: &mut EfficiencySampler, now: Timestamp) {

@@ -16,8 +16,12 @@ your current setup (such as DAO) until you trust its plans.
 2. The switch on the dess-oxide page.
 
 It then moves ESS's grid setpoint once a second (a volatile override, not
-the stored setting) and switches the PV relay per quarter hour. It releases
-control back to plain ESS whenever:
+the stored setting) and switches the PV relay per quarter hour. When the
+battery has nothing worthwhile to do in a quarter hour, it puts ESS in
+**bypass** instead (external control: the battery idle, the grid passing
+through), as DAO does: the inverters then draw less than when ESS idles,
+so the plan doesn't trickle-charge or trickle-discharge. It releases control
+back to plain ESS (regulating the grid again) whenever:
 - the switch goes off;
 - the Victron Dynamic ESS is enabled;
 - something else wrote the ESS setpoint in the last five minutes (turn
@@ -27,7 +31,13 @@ control back to plain ESS whenever:
 - the app stops.
 
 While in control, the page can override the plan until midnight: hold the
-battery, charge, discharge, or plain self-consumption.
+battery (in bypass), charge, discharge, or plain self-consumption.
+
+**Handing over from DAO:** turn DAO's Victron automations off, and check
+ESS's own grid setpoint on the Cerbo (Settings → ESS → Grid setpoint). DAO
+writes that setting, and plain ESS aims for it whenever dess-oxide isn't in
+control: set it to about 0–50 W. Then set `dryrun: false` and switch control
+on here.
 
 - **Records** the system once a second from the Cerbo GX's local MQTT. It
   stores 15-minute energy totals and steady-state efficiency samples in
