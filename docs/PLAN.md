@@ -527,7 +527,9 @@ sell(t) = (spot + markup_sell + energy_tax) × (1 + vat)   while net metering ap
 - Slots run from now to the last known price: the end of D, or the end of D+1 after about 12:55. That is 11–35 h.
 - The horizon is always extended to at least 48 h with an **estimated price tail**. The estimate is the median of the same quarter hour over the last 14 days, blended toward the daily mean and marked as estimated. It gives stored energy a sensible value at the end, without DAO's end-SoC helpers.
 - Only the first slot is executed.
-- Later, the tail can use a better price forecast, for example from ENTSO-E wind and solar generation forecasts.
+- **Backlog: a better price tail.** Only worth building if it pays:
+  1. Measure the value of perfect information first: replay history with the estimated tail and again with the real prices as if they'd been known. The difference is the most a price forecast could ever earn.
+  2. If that's material, forecast the day-ahead price from residual load (demand − wind − solar), using ENTSO-E's day-ahead wind, solar and load forecasts for NL and DE (George has a token) or NED's production forecasts. A small regression per hour of day would do. Paid services such as wattwanneer.nl aren't needed.
 
 ### 14.2 Dynamic programming
 - **State:** battery energy E (DC side) on a 100 Wh grid (321 states for 32 kWh) × PV relay state (on/off).

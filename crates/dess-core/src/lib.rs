@@ -11,8 +11,10 @@ pub mod planner;
 pub mod prices;
 pub mod record;
 pub mod slot;
+pub mod solar;
 pub mod tariff;
 pub mod units;
+pub mod weather;
 
 pub use slot::Slot;
 pub use units::{EurPerKwh, WattHours, Watts};

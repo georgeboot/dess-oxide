@@ -9,7 +9,9 @@ use std::sync::Mutex;
 use anyhow::Context;
 use dess_core::battery::BatteryModel;
 use dess_core::planner::{self, Plan, PlanRequest, PlannerSettings, SlotForecast};
+use dess_core::solar::Orientation;
 use dess_core::tariff::Tariff;
+use dess_core::weather::{PvArray, Weather};
 use dess_core::{EurPerKwh, Slot, WattHours, Watts, forecast, prices};
 use dess_victron::Snapshot;
 use dess_victron::reading::{self, BatteryInfo};
@@ -17,7 +19,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ToSpan};
 use tracing::{debug, warn};
 
-use crate::config::{Config, HistoryConfig, RelayAction};
+use crate::config::{Config, HistoryConfig, LocationConfig, RelayAction};
 use crate::nordpool::NordPool;
 use crate::store::Store;
 
@@ -314,33 +316,53 @@ pub fn min_soc(info: &BatteryInfo, config: &Config) -> f64 {
         .max(config.battery.reserve_soc)
 }
 
-/// The baseline PV forecast, or none (with a warning) when it can't be made.
-pub async fn pv_forecast(
+/// Where the system is: from the config, or Home Assistant's location.
+pub async fn resolve_location(
     client: &reqwest::Client,
     config: &Config,
-) -> std::collections::BTreeMap<dess_core::Slot, dess_core::Watts> {
-    if config.pv.is_empty() {
-        tracing::warn!("no PV forecast: no [[pv]] arrays configured");
-        return std::collections::BTreeMap::new();
-    }
-    let location = match (
+) -> anyhow::Result<LocationConfig> {
+    match (
         config.location,
         crate::homeassistant::Endpoint::resolve(config),
     ) {
         (Some(location), _) => Ok(location),
         (None, Some(endpoint)) => crate::homeassistant::location(client, &endpoint).await,
-        (None, None) => Err(anyhow::anyhow!(
-            "no location: set [location] or [homeassistant]"
-        )),
-    };
-    let result = match location {
-        Ok(location) => crate::openmeteo::pv_forecast(client, location, &config.pv).await,
-        Err(error) => Err(error),
-    };
-    result.unwrap_or_else(|error| {
-        tracing::warn!("no PV forecast: {error:#}");
-        std::collections::BTreeMap::new()
-    })
+        (None, None) => anyhow::bail!("no location: set [location] or [homeassistant]"),
+    }
+}
+
+/// Expected PV power per slot from the weather and the configured arrays.
+pub fn pv_from_weather(
+    weather: &BTreeMap<Slot, Weather>,
+    config: &Config,
+    location: LocationConfig,
+) -> BTreeMap<Slot, Watts> {
+    let arrays: Vec<PvArray> = config
+        .pv
+        .iter()
+        .map(|a| PvArray {
+            kwp: a.kwp,
+            orientation: Orientation {
+                tilt: a.tilt,
+                azimuth: a.azimuth,
+            },
+        })
+        .collect();
+    weather
+        .iter()
+        .map(|(slot, w)| {
+            (
+                *slot,
+                dess_core::weather::baseline_pv(
+                    *slot,
+                    w,
+                    &arrays,
+                    location.latitude,
+                    location.longitude,
+                ),
+            )
+        })
+        .collect()
 }
 
 #[cfg(test)]

@@ -3,7 +3,8 @@
 //! - **recorder:** samples the system every second and stores 15-minute
 //!   energy totals and steady-state efficiency samples;
 //! - **prices:** keeps day-ahead prices up to date;
-//! - **PV forecast:** refreshes the baseline PV forecast hourly;
+//! - **weather:** fetches the forecast hourly (and from it the PV forecast),
+//!   and archives past weather for training;
 //! - **planner:** replans at every slot boundary and whenever prices or the PV
 //!   forecast change, and stores each plan (shadow mode);
 //! - **history import:** copies hourly energy statistics from Home Assistant;
@@ -136,7 +137,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
             prices_changed,
             stopped.clone(),
         )));
-        tasks.push(tokio::spawn(forecast_pv(
+        tasks.push(tokio::spawn(fetch_weather(
             Arc::clone(&shared),
             client,
             stopped.clone(),
@@ -295,22 +296,69 @@ fn next_price_check(now: Timestamp, tz: &TimeZone, tomorrow_complete: bool) -> D
     wait.unsigned_abs().max(Duration::from_secs(1))
 }
 
-async fn forecast_pv(
+/// Hourly: the weather forecast, and from it the PV forecast. Once a day's
+/// archive is complete, it's copied too, for training.
+async fn fetch_weather(
     shared: Arc<Shared>,
     client: reqwest::Client,
     mut stop: watch::Receiver<bool>,
 ) {
+    let mut location = None;
     loop {
-        let pv = planning::pv_forecast(&client, &shared.config).await;
-        if !pv.is_empty() {
-            shared.update_status(|s| s.pv_updated = Some(Timestamp::now()));
-            shared.pv.send_replace(Arc::new(pv));
+        if location.is_none() {
+            match planning::resolve_location(&client, &shared.config).await {
+                Ok(found) => location = Some(found),
+                Err(error) => warn!("no weather yet: {error:#}"),
+            }
+        }
+        if let Some(location) = location {
+            let now = Timestamp::now();
+            match crate::openmeteo::forecast(&client, location).await {
+                Ok(weather) => {
+                    if let Err(error) = tokio::task::block_in_place(|| {
+                        lock(&shared.store).save_weather(&weather, false, now)
+                    }) {
+                        error!(%error, "storing the weather forecast");
+                    }
+                    let pv = planning::pv_from_weather(&weather, &shared.config, location);
+                    shared.update_status(|s| s.pv_updated = Some(now));
+                    shared.pv.send_replace(Arc::new(pv));
+                }
+                Err(error) => warn!("weather forecast: {error:#}"),
+            }
+            if let Err(error) = archive_weather(&shared, &client, location, now).await {
+                warn!("weather archive: {error:#}");
+            }
         }
         tokio::select! {
             () = tokio::time::sleep(Duration::from_secs(3600)) => {}
             () = stopped(&mut stop) => return,
         }
     }
+}
+
+/// Copies the historical-forecast archive up to the day before yesterday
+/// (the archive lags a little), 90 days per request.
+async fn archive_weather(
+    shared: &Shared,
+    client: &reqwest::Client,
+    location: crate::config::LocationConfig,
+    now: Timestamp,
+) -> anyhow::Result<()> {
+    let tz = &shared.tz;
+    let last_day = now.to_zoned(tz.clone()).date().yesterday()?.yesterday()?;
+    let mut start = match lock(&shared.store).last_weather_history()? {
+        Some(slot) => slot.start().to_zoned(tz.clone()).date().tomorrow()?,
+        None => crate::openmeteo::HISTORY_START,
+    };
+    while start <= last_day {
+        let end = start.checked_add(jiff::ToSpan::days(89))?.min(last_day);
+        let weather = crate::openmeteo::history(client, location, start, end).await?;
+        tokio::task::block_in_place(|| lock(&shared.store).save_weather(&weather, true, now))?;
+        info!(from = %start, to = %end, slots = weather.len(), "archived weather");
+        start = end.tomorrow()?;
+    }
+    Ok(())
 }
 
 async fn plan_loop(

@@ -7,6 +7,7 @@ use anyhow::Context;
 use dess_core::efficiency::BinStats;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
+use dess_core::weather::Weather;
 use dess_core::{EurPerKwh, Slot, Watts};
 use rusqlite::{Connection, params};
 
@@ -86,6 +87,21 @@ const MIGRATIONS: &[&str] = &[
         hour_start INTEGER NOT NULL, -- unix seconds
         kwh        REAL NOT NULL,
         PRIMARY KEY (entity, hour_start)
+    ) STRICT;
+",
+    r"
+    -- Weather per slot: the forecast for future slots, the historical-forecast
+    -- archive for the past. Once a slot is past, forecasts no longer touch it.
+    CREATE TABLE weather (
+        slot_start  INTEGER PRIMARY KEY,
+        ghi         REAL NOT NULL, -- W/m²
+        dni         REAL NOT NULL,
+        dhi         REAL NOT NULL,
+        temperature REAL NOT NULL, -- °C
+        humidity    REAL NOT NULL, -- %
+        wind        REAL NOT NULL, -- m/s
+        kind        TEXT NOT NULL, -- 'forecast' or 'history'
+        issued_at   INTEGER NOT NULL
     ) STRICT;
 ",
 ];
@@ -407,6 +423,81 @@ impl Store {
         Ok(out)
     }
 
+    /// Stores weather. Forecasts only replace slots from `now` on; history
+    /// replaces anything.
+    pub fn save_weather(
+        &mut self,
+        weather: &BTreeMap<Slot, Weather>,
+        is_history: bool,
+        now: jiff::Timestamp,
+    ) -> anyhow::Result<()> {
+        let current = Slot::containing(now);
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO weather VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            )?;
+            for (slot, w) in weather {
+                if !is_history && *slot < current {
+                    continue;
+                }
+                insert.execute(params![
+                    slot.start_unix(),
+                    w.ghi,
+                    w.dni,
+                    w.dhi,
+                    w.temperature,
+                    w.humidity,
+                    w.wind,
+                    if is_history { "history" } else { "forecast" },
+                    now.as_second(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Weather for `[from, until)`.
+    #[allow(dead_code, reason = "read by the M2 training pipeline, next")]
+    pub fn weather(&self, from: Slot, until: Slot) -> anyhow::Result<BTreeMap<Slot, Weather>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, ghi, dni, dhi, temperature, humidity, wind FROM weather
+             WHERE slot_start >= ?1 AND slot_start < ?2",
+        )?;
+        let rows = query.query_map([from.start_unix(), until.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                Weather {
+                    ghi: row.get(1)?,
+                    dni: row.get(2)?,
+                    dhi: row.get(3)?,
+                    temperature: row.get(4)?,
+                    humidity: row.get(5)?,
+                    wind: row.get(6)?,
+                },
+            ))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (start, weather) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                out.insert(slot, weather);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The last slot with archived (historical) weather.
+    pub fn last_weather_history(&self) -> anyhow::Result<Option<Slot>> {
+        let last: Option<i64> = self.conn.query_row(
+            "SELECT max(slot_start) FROM weather WHERE kind = 'history'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(last.and_then(Slot::from_start_unix))
+    }
+
     /// Adds steady-state conversion samples to the day's bins.
     pub fn save_efficiency_bins(
         &mut self,
@@ -541,5 +632,41 @@ mod tests {
             .query_row("SELECT count(*) FROM plans", [], |r| r.get(0))
             .unwrap();
         assert_eq!(left, 2);
+    }
+
+    #[test]
+    fn forecasts_never_overwrite_the_past() {
+        let mut store = Store::in_memory().unwrap();
+        let now: jiff::Timestamp = "2026-09-27T12:05:00Z".parse().unwrap();
+        let past = Slot::containing(now - jiff::SignedDuration::from_mins(30));
+        let future = Slot::containing(now).next();
+        let sunny = Weather {
+            ghi: 800.0,
+            dni: 700.0,
+            dhi: 100.0,
+            temperature: 20.0,
+            humidity: 50.0,
+            wind: 2.0,
+        };
+        let cloudy = Weather {
+            ghi: 100.0,
+            dni: 0.0,
+            dhi: 100.0,
+            ..sunny
+        };
+        store
+            .save_weather(&BTreeMap::from([(past, sunny)]), true, now)
+            .unwrap();
+        store
+            .save_weather(
+                &BTreeMap::from([(past, cloudy), (future, cloudy)]),
+                false,
+                now,
+            )
+            .unwrap();
+        let stored = store.weather(past, future.next()).unwrap();
+        assert_eq!(stored[&past], sunny, "the archive keeps the past");
+        assert_eq!(stored[&future], cloudy);
+        assert_eq!(store.last_weather_history().unwrap(), Some(past));
     }
 }

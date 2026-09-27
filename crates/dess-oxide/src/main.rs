@@ -166,7 +166,20 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
 
     let nordpool = nordpool::NordPool::new(client.clone(), &config.prices.area);
     planning::update_prices(&store, &nordpool, now, &tariff.time_zone).await?;
-    let pv = planning::pv_forecast(&client, &config).await;
+    let pv = match planning::resolve_location(&client, &config).await {
+        Ok(location) if !config.pv.is_empty() => {
+            let weather = openmeteo::forecast(&client, location).await?;
+            planning::pv_from_weather(&weather, &config, location)
+        }
+        Ok(_) => {
+            tracing::warn!("no PV forecast: no [[pv]] arrays configured");
+            std::collections::BTreeMap::new()
+        }
+        Err(error) => {
+            tracing::warn!("no PV forecast: {error:#}");
+            std::collections::BTreeMap::new()
+        }
+    };
 
     let venus = Venus::connect(
         VenusOptions {
