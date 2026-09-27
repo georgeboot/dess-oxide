@@ -723,7 +723,7 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     html! {
         section {
             h2 { "Last 24 hours" }
-            p.muted { "What happened, what dess-oxide planned for it, and the setpoint DAO actually ran." }
+            p.muted { "What happened, what dess-oxide planned for it, and the setpoint DAO actually ran. No setpoint line: ESS was in external control (DAO's bypass, battery idle)." }
             (grid.render(&shared.tz))
             (load.render(&shared.tz))
             (forecast_errors(history))

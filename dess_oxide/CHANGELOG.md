@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.14.1
+
+- **Fix:** the "ESS setpoint" line showed the stored setpoint while ESS was
+  in external control (mode 3, DAO's bypass), where it means nothing. Now
+  there's no line then.
+- Control's status says so plainly when ESS is in external control.
+
 ## 0.14.0
 
 - **The AC battery options are gone:** `history.battery_in` and

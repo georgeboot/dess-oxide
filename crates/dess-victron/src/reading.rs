@@ -68,9 +68,16 @@ pub fn sample(snapshot: &Snapshot, at: Timestamp) -> Result<Sample, ReadingError
             .number(&format!("system/0/Relay/{i}/State"))
             .map(|s| s != 0.0)
     });
+    // ESS only regulates towards a grid setpoint in modes 1 and 2; in
+    // external control (3) the stored setpoint means nothing.
+    let regulating = matches!(
+        snapshot.number("settings/0/Settings/CGwacs/Hub4Mode"),
+        Some(mode) if mode == 1.0 || mode == 2.0
+    );
     let setpoint = snapshot
         .number("hub4/0/Overrides/Setpoint")
         .or_else(|| snapshot.number("settings/0/Settings/CGwacs/AcPowerSetPoint"))
+        .filter(|_| regulating)
         .map(Watts);
 
     Ok(Sample {
@@ -250,6 +257,7 @@ mod tests {
             ("hub4/0/Overrides/Setpoint", Value::Null),
             ("settings/0/Settings/CGwacs/RunWithoutGridMeter", n(1.0)),
             ("settings/0/Settings/CGwacs/AcPowerSetPoint", n(2189.0)),
+            ("settings/0/Settings/CGwacs/Hub4Mode", n(1.0)),
         ]
     }
 
@@ -273,6 +281,16 @@ mod tests {
             Some(Watts(2189.0)),
             "falls back to the setting without an override"
         );
+    }
+
+    #[test]
+    fn no_setpoint_in_external_control() {
+        // DAO's bypass: ESS mode 3, the stored setpoint left behind.
+        let mut values = georges_cerbo();
+        values.retain(|(k, _)| !k.ends_with("Hub4Mode"));
+        values.push(("settings/0/Settings/CGwacs/Hub4Mode", n(3.0)));
+        let s = sample(&snapshot(&values), Timestamp::UNIX_EPOCH).unwrap();
+        assert_eq!(s.setpoint, None);
     }
 
     #[test]

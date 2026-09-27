@@ -284,8 +284,12 @@ fn evaluate(
     {
         return Err("Victron Dynamic ESS is enabled; switch it off first".into());
     }
-    if snapshot.number("settings/0/Settings/CGwacs/Hub4Mode") != Some(1.0) {
-        return Err("ESS isn't set to regulate the total of all phases (Hub4Mode 1)".into());
+    match snapshot.number("settings/0/Settings/CGwacs/Hub4Mode") {
+        Some(1.0) => {}
+        Some(3.0) => {
+            return Err("ESS is in external control (Hub4Mode 3), such as DAO's bypass; set it back to \"Optimized, total of all phases\"".into());
+        }
+        _ => return Err("ESS isn't set to regulate the total of all phases (Hub4Mode 1)".into()),
     }
     if state
         .foreign_write
