@@ -76,6 +76,22 @@ fn sigmoid(x: f64) -> f64 {
 }
 
 impl HpModel {
+    /// Electricity for heating at a steady outdoor temperature, without wind,
+    /// sun or frost, kW. Only electricity is metered: the model's split into
+    /// heat and COP is arbitrary, this is what the data pins down.
+    pub fn heating_kw(&self, celsius: f64) -> f64 {
+        softplus(self.ua_kw_per_k * (self.balance_c - celsius), 2.0) / self.cop(celsius)
+    }
+
+    /// Hot water and standby over a day, kWh.
+    pub fn hot_water_daily_kwh(&self) -> f64 {
+        self.hot_water_kwh.iter().sum()
+    }
+
+    fn cop(&self, celsius: f64) -> f64 {
+        1.0 + softplus(self.cop_c0 + self.cop_c1 * celsius, 1.0)
+    }
+
     /// A generic starting point: a well-insulated house, COP ≈ 3.5 at 0 °C.
     pub fn initial() -> Self {
         Self {

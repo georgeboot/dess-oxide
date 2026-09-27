@@ -1,3 +1,4 @@
+mod accuracy;
 mod chart;
 mod comparison;
 mod config;

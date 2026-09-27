@@ -1,5 +1,7 @@
-//! Server-rendered SVG charts over 15-minute slots. No JavaScript: colours
-//! come from CSS classes, so light and dark themes are handled by the page.
+//! Server-rendered SVG charts over 15-minute slots. Colours come from CSS
+//! classes, so light and dark themes are handled by the page. Each chart
+//! also carries its values as JSON, for the page's small script to show a
+//! tooltip on hover; without the script it's a plain picture.
 
 use std::fmt::Write as _;
 
@@ -129,8 +131,10 @@ impl Chart<'_> {
                 self.height - 6.0
             );
         }
-        for series in &self.series {
+        for (i, series) in self.series.iter().enumerate() {
+            let _ = write!(svg, r#"<g data-i="{i}">"#);
             draw(&mut svg, series, &x, &y, slot_width);
+            svg.push_str("</g>");
         }
         if let (Some(now), Some(first)) = (self.now, self.slots.first()) {
             let offset = now.duration_since(*first).as_secs_f64() / 900.0;
@@ -143,19 +147,51 @@ impl Chart<'_> {
                 );
             }
         }
+        let _ = write!(
+            svg,
+            r#"<line class="cursor" x1="0" x2="0" y1="{TOP}" y2="{:.1}"/>"#,
+            TOP + plot_height
+        );
         svg.push_str("</svg>");
 
         html! {
-            figure {
+            figure data-chart=(self.data(tz, plot_width)) {
                 (PreEscaped(svg))
+                div.tip hidden {}
                 figcaption {
                     span.unit { (self.unit) }
-                    @for series in &self.series {
-                        span.legend { i class=(series.class) {} (series.label) }
+                    @for (i, series) in self.series.iter().enumerate() {
+                        span.legend data-i=(i) title="click to hide or show" { i class=(series.class) {} (series.label) }
                     }
                 }
             }
         }
+    }
+
+    /// The values as JSON for the page's hover script.
+    fn data(&self, tz: &TimeZone, plot_width: f64) -> String {
+        let round = |v: &Option<f64>| v.map(|v| (v * 1000.0).round() / 1000.0);
+        serde_json::json!({
+            "labels": self
+                .slots
+                .iter()
+                .map(|s| s.to_zoned(tz.clone()).strftime("%a %H:%M").to_string())
+                .collect::<Vec<_>>(),
+            "unit": self.unit,
+            "left": LEFT,
+            "plot": plot_width,
+            "width": WIDTH,
+            "series": self
+                .series
+                .iter()
+                .map(|s| serde_json::json!({
+                    "label": s.label,
+                    "class": s.class,
+                    "values": s.values.iter().map(round).collect::<Vec<_>>(),
+                }))
+                .collect::<Vec<_>>(),
+        })
+        .to_string()
     }
 
     fn value_range(&self) -> (f64, f64) {

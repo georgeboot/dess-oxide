@@ -122,6 +122,10 @@ const MIGRATIONS: &[&str] = &[
         value TEXT NOT NULL
     ) STRICT;
 ",
+    r"
+    -- The heat pump's part of load_w, when its model made it.
+    ALTER TABLE plans ADD COLUMN hp_w REAL;
+",
 ];
 
 pub struct Store {
@@ -166,6 +170,9 @@ pub struct SlotFlows {
     pub pv: WattHours,
     pub soc_start: f64,
     pub soc_end: f64,
+    /// Loads on the inverter input (part of `load`; the EV at some sites).
+    pub load_input: WattHours,
+    pub relay_closed_seconds: [f64; 2],
 }
 
 impl SlotFlows {
@@ -173,6 +180,28 @@ impl SlotFlows {
     pub fn mean(&self, energy: WattHours) -> Watts {
         Watts(energy.0 * 3600.0 / self.covered_seconds.max(1.0))
     }
+
+    /// Whether the PV relay kept the PV on all slot (see
+    /// [`Store::recorded_pv`]); `true` without a relay.
+    pub fn pv_on_throughout(&self, pv_relay: Option<(usize, bool)>) -> bool {
+        pv_relay.is_none_or(|(relay, closed_means_on)| {
+            let closed = self.relay_closed_seconds[relay.min(1)];
+            if closed_means_on {
+                closed >= self.covered_seconds - 1.0
+            } else {
+                closed <= 1.0
+            }
+        })
+    }
+}
+
+/// One slot of the latest plan made before some moment.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PlannedForecast {
+    pub slot: Slot,
+    pub load: Watts,
+    pub pv: Watts,
+    pub heat_pump: Option<Watts>,
 }
 
 /// Forecast errors for one range of lead times.
@@ -358,13 +387,14 @@ impl Store {
         planned_at: i64,
         slots: &[PlannedSlot],
         forecasts: &[SlotForecast],
+        heat_pump: &[Option<Watts>],
     ) -> anyhow::Result<()> {
         let tx = self.conn.transaction()?;
         {
             let mut insert = tx.prepare_cached(
-                "INSERT OR REPLACE INTO plans VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                "INSERT OR REPLACE INTO plans VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             )?;
-            for (s, f) in slots.iter().zip(forecasts) {
+            for (i, (s, f)) in slots.iter().zip(forecasts).enumerate() {
                 insert.execute(params![
                     planned_at,
                     s.slot.start_unix(),
@@ -378,6 +408,7 @@ impl Store {
                     s.pv_on,
                     s.soc_end,
                     s.stored_energy_value.0,
+                    heat_pump.get(i).copied().flatten().map(|w| w.0),
                 ])?;
             }
         }
@@ -718,7 +749,8 @@ impl Store {
     pub fn flows(&self, from: Slot) -> anyhow::Result<Vec<SlotFlows>> {
         let mut query = self.conn.prepare_cached(
             "SELECT slot_start, covered_seconds, grid_import_wh, grid_export_wh,
-                    load_out_wh + load_in_wh, pv_ac_wh + pv_dc_wh, soc_start, soc_end
+                    load_out_wh + load_in_wh, pv_ac_wh + pv_dc_wh, soc_start, soc_end,
+                    load_in_wh, relay1_closed_seconds, relay2_closed_seconds
              FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds > 60
              ORDER BY slot_start",
         )?;
@@ -734,6 +766,8 @@ impl Store {
                     pv: WattHours(row.get(5)?),
                     soc_start: row.get(6)?,
                     soc_end: row.get(7)?,
+                    load_input: WattHours(row.get(8)?),
+                    relay_closed_seconds: [row.get(9)?, row.get(10)?],
                 },
             ))
         })?;
@@ -746,6 +780,43 @@ impl Store {
             }
         }
         Ok(flows)
+    }
+
+    /// The forecasts for `[from, until)` of the last plan made before `from`
+    /// (within a day): what was expected the day before.
+    pub fn forecasts_made_before(
+        &self,
+        from: Slot,
+        until: Slot,
+    ) -> anyhow::Result<Vec<PlannedForecast>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, load_w, pv_w, hp_w FROM plans
+             WHERE planned_at = (SELECT max(planned_at) FROM plans
+                                 WHERE planned_at <= ?1 AND planned_at > ?1 - 86400)
+               AND slot_start >= ?1 AND slot_start < ?2
+             ORDER BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix(), until.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, f64>(1)?,
+                row.get::<_, f64>(2)?,
+                row.get::<_, Option<f64>>(3)?,
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (start, load, pv, heat_pump) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                out.push(PlannedForecast {
+                    slot,
+                    load: Watts(load),
+                    pv: Watts(pv),
+                    heat_pump: heat_pump.map(Watts),
+                });
+            }
+        }
+        Ok(out)
     }
 
     /// The forecasts of the first plan made in each slot since `from`, keyed
@@ -1005,7 +1076,7 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "INSERT INTO plans VALUES (?1, ?2, ?3, ?4, 0.2, 0.1, 0, 0, 0, 1, 50, 0.1)",
+                    "INSERT INTO plans VALUES (?1, ?2, ?3, ?4, 0.2, 0.1, 0, 0, 0, 1, 50, 0.1, NULL)",
                     params![start - ahead, start, load, pv],
                 )
                 .unwrap();
@@ -1083,7 +1154,7 @@ mod tests {
             store
                 .conn
                 .execute(
-                    "INSERT INTO plans VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, 0, 1, 50, 0)",
+                    "INSERT INTO plans VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, 0, 1, 50, 0, NULL)",
                     [planned_at, slot_start],
                 )
                 .unwrap();

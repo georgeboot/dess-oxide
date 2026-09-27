@@ -691,7 +691,7 @@ It's served through HA ingress, so it opens from the HA sidebar with HA's own lo
   - replan now
   - control on/off. This works only when the app option `dryrun: false` is also set: the two locks of §15.3.
 
-It's server-rendered by axum, with a vendored chart library and small forms for the controls. There's no JS build step. Control state is stored in SQLite, so it survives restarts.
+It's server-rendered by axum: SVG charts that work without JavaScript, plus a small inline script for hover tooltips and legend toggles, and small forms for the controls. There's no JS build step. Control state is stored in SQLite, so it survives restarts.
 
 ### 17.2 Optional HA entities
 

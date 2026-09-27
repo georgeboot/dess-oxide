@@ -241,7 +241,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
         error!(%error, "reading history");
         Vec::new()
     });
-    let (models, (losses, capacity), (accuracy, money)) = tokio::task::block_in_place(|| {
+    let (models, (losses, capacity), (accuracy, money, days)) = tokio::task::block_in_place(|| {
         let store = lock(&shared.store);
         let models = ["pv", "heat_pump", "load"].map(|name| {
             store.model(name).unwrap_or_else(|error| {
@@ -267,7 +267,12 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             error!(%error, "reading costs");
             Vec::new()
         });
-        (models, battery, (accuracy, money))
+        let days = crate::accuracy::daily(&store, &shared.config, &shared.tz, now, 7)
+            .unwrap_or_else(|error| {
+                error!(%error, "reading daily forecast accuracy");
+                Vec::new()
+            });
+        (models, battery, (accuracy, money, days))
     });
     Html(
         render(
@@ -278,6 +283,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
                 accuracy: &accuracy,
                 money: &money,
                 comparison: *shared.comparison.lock().expect("comparison lock poisoned"),
+                days: &days,
             },
             &models,
             (losses.as_ref(), capacity.as_ref()),
@@ -293,6 +299,7 @@ struct Recorded<'a> {
     accuracy: &'a [LeadAccuracy],
     money: &'a [(&'static str, Money)],
     comparison: Option<Comparison>,
+    days: &'a [crate::accuracy::Day],
 }
 
 /// Costs for today, yesterday, the last 7 days and this month.
@@ -345,9 +352,10 @@ fn render(
             head {
                 meta charset="utf-8";
                 meta name="viewport" content="width=device-width, initial-scale=1";
-                meta http-equiv="refresh" content="60";
+                noscript { meta http-equiv="refresh" content="60"; }
                 title { "dess-oxide" }
                 style { (PreEscaped(CSS)) }
+                script defer { (PreEscaped(SCRIPT)) }
             }
             body {
                 header {
@@ -372,7 +380,7 @@ fn render(
                 }
                 (history_section(shared, recorded.history, now))
                 (money_section(shared, recorded.money, recorded.comparison))
-                (accuracy_section(recorded.accuracy))
+                (accuracy_section(recorded.accuracy, recorded.days))
                 (models_section(shared, models))
                 @if let Some(view) = view { (battery_section(&view.battery, losses, capacity)) }
                 @if let Some(view) = view {
@@ -511,7 +519,7 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
             div.card { span.label { "This quarter hour" } span.value { (format!("{battery:+.1} kW")) } span.sub { (action) ", grid " (format!("{:+.1} kW", first.grid.0 / 1000.0)) } }
             div.card { span.label { "Price now" } span.value { (format!("€{:.3}", first.prices.buy.0)) } span.sub { "sell €" (format!("{:.3}", first.prices.sell.0)) } }
             div.card { span.label { "Stored energy is worth" } span.value { (format!("€{:.3}/kWh", first.stored_energy_value.0)) } span.sub { "what the last kWh in the battery will save or earn later — not what it cost" } }
-            div.card { span.label { "Expected over the horizon" } span.value { (format!("€{:.2}", view.plan.expected_cost)) } span.sub { "negative is money earned" } }
+            div.card { span.label { "Expected over the horizon" } span.value { (eur(view.plan.expected_cost)) } span.sub { "negative is money earned" } }
             (cheapest_start_card(shared))
         }
     }
@@ -587,6 +595,13 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
                 Kind::Line,
                 view.forecasts.iter().map(|f| kw(f.load.0)),
             ),
+            Series::new(
+                "of which heat pump",
+                "s-hp",
+                Kind::Line,
+                view.heat_pump.iter().map(|h| h.map(|w| w.0 / 1000.0)),
+            )
+            .dashed(),
             Series::new(
                 "grid (+ import)",
                 "s-grid",
@@ -788,10 +803,19 @@ fn eur(value: f64) -> String {
     }
 }
 
-fn accuracy_section(accuracy: &[LeadAccuracy]) -> Markup {
-    if accuracy.is_empty() {
+fn accuracy_section(accuracy: &[LeadAccuracy], days: &[crate::accuracy::Day]) -> Markup {
+    if accuracy.is_empty() && days.is_empty() {
         return html! {};
     }
+    let pair = |pair: Option<crate::accuracy::Pair>| match pair {
+        Some(p) if p.forecast.abs() + p.actual.abs() > 0.05 => html! {
+            td {
+                (format!("{:.1}", p.forecast)) " → " (format!("{:.1}", p.actual)) " kWh"
+                @if let Some(e) = p.error() { span.muted { (format!(" {:+.0} %", e * 100.0)) } }
+            }
+        },
+        _ => html! { td { "–" } },
+    };
     let cell = |stats: Option<ErrorStats>| match stats {
         None => html! { td { "–" } td { "–" } },
         Some(s) => {
@@ -811,6 +835,31 @@ fn accuracy_section(accuracy: &[LeadAccuracy]) -> Markup {
     html! {
         section {
             h2 { "Forecast accuracy" }
+            @if !days.is_empty() {
+                p.muted {
+                    "Per day: what the last plan before midnight expected → what happened, and the forecast's error. "
+                    "PV counts only quarter hours with the PV on. Base load and heat pump are split once the heat pump "
+                    "model makes the forecast and the meter's hourly statistics are in (they come in every six hours)."
+                }
+                div.scroll {
+                    table {
+                        thead { tr { th { "day" } th { "PV" } th { "base load" } th { "heat pump" } th { "house load" } th { "hours" } } }
+                        tbody {
+                            @for day in days {
+                                tr {
+                                    td { (day.date.strftime("%a %d %b")) }
+                                    (pair(Some(day.pv)))
+                                    (pair(day.base))
+                                    (pair(day.heat_pump))
+                                    (pair(Some(day.load)))
+                                    td { (format!("{:.0}", day.hours)) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            @if !accuracy.is_empty() {
             p.muted {
                 "The last 7 days, by how far ahead the forecast was made: mean absolute error, and bias "
                 "(positive = forecast too high), as a share of the actual mean. PV counts daylight slots with PV on."
@@ -829,6 +878,7 @@ fn accuracy_section(accuracy: &[LeadAccuracy]) -> Markup {
                         }
                     }
                 }
+            }
             }
         }
     }
@@ -861,9 +911,16 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                             }
                         }
                     }
+                    @let cap = number(&model.params["cap_kw"]);
+                    @let kwp: f64 = model.params["arrays"].as_array().into_iter().flatten().map(|a| number(&a["kwp"])).sum();
                     p.muted {
-                        "Inverter limit " (format!("{:.1}", number(&model.params["cap_kw"])))
-                        " kW. Effective kWp includes system losses; the learned arrays needn't match the physical strings."
+                        "Effective kWp includes system losses; the learned arrays needn't match the physical strings. "
+                        @if kwp * 1.1 < cap {
+                            "The output never gets near the inverter's limit, so the fitted limit ("
+                            (format!("{cap:.1} kW")) ") only sits above everything recorded and has no effect."
+                        } @else {
+                            "Output levels off at about " (format!("{cap:.1} kW")) ": the inverter's limit as the recordings show it."
+                        }
                     }
                 }
             }
@@ -874,11 +931,16 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                     (model_summary(shared, stored, "baseline_mae_kwh", "last week's same hours"))
                     ul {
                         li { "Heating stops above about " strong { (format!("{:.1} °C", hp.balance_c)) } " outdoors, smoothed by the house's thermal lag." }
-                        li { "Heat loss " (format!("{:.2}", hp.ua_kw_per_k)) " kW per degree below that, +" (format!("{:.0}", hp.wind_factor * 100.0)) " % per m/s of wind." }
-                        li { "COP " (format!("{:.1}", cop(&hp, 0.0))) " at 0 °C, " (format!("{:.1}", cop(&hp, -7.0))) " at −7 °C." }
-                        li { "Frost: the coil runs " (format!("{:.1}", hp.coil_delta_k)) " K below the air; +" (format!("{:.1}", hp.frost_factor * 100.0)) " % use per hPa of frost potential." }
-                        li { "Hot water peaks around " (hot_water_peak(&hp.hot_water_kwh)) "." }
+                        li {
+                            "Heating at a steady 0 °C takes about " strong { (format!("{:.1} kW", hp.heating_kw(0.0))) }
+                            " (" (format!("{:.0}", hp.heating_kw(0.0) * 24.0)) " kWh a day), at −7 °C about "
+                            (format!("{:.1} kW", hp.heating_kw(-7.0))) " (" (format!("{:.0}", hp.heating_kw(-7.0) * 24.0)) " kWh a day); wind adds "
+                            (format!("{:.0}", hp.wind_factor * 100.0)) " % per m/s."
+                        }
+                        li { "Frost: +" (format!("{:.1}", hp.frost_factor * 100.0)) " % use per hPa of frost potential." }
+                        li { "Hot water and standby: " (format!("{:.1}", hp.hot_water_daily_kwh())) " kWh a day, most around " (hot_water_peak(&hp.hot_water_kwh)) ". Learned from the total by time of day: nothing tells it which hours were hot water." }
                     }
+                    p.muted { "All of this is electricity: without a heat meter (such as a flow meter on OpenAmber) the heat output and the COP aren't known." }
                 }
             }
             (history_coverage(shared))
@@ -929,10 +991,6 @@ fn history_coverage(shared: &Shared) -> Markup {
             }
         }
     }
-}
-
-fn cop(hp: &dess_models::heatpump::HpModel, celsius: f64) -> f64 {
-    1.0 + (hp.cop_c0 + hp.cop_c1 * celsius).exp().ln_1p()
 }
 
 fn model_summary(
@@ -1095,17 +1153,65 @@ fn severity_label(severity: Severity) -> &'static str {
     }
 }
 
+/// Hover tooltips and legend toggles for the charts, and a refresh every
+/// minute that waits while someone is looking at a value. Progressive: the
+/// page works without it.
+const SCRIPT: &str = r#"
+document.addEventListener('DOMContentLoaded', () => {
+  const fmt = v => v == null ? '–' : Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2);
+  document.querySelectorAll('figure[data-chart]').forEach(fig => {
+    const d = JSON.parse(fig.dataset.chart);
+    const svg = fig.querySelector('svg'), cursor = svg.querySelector('.cursor'), tip = fig.querySelector('.tip');
+    const n = d.labels.length, hidden = new Set();
+    const hide = () => { cursor.style.display = 'none'; tip.hidden = true; };
+    const show = ev => {
+      const r = svg.getBoundingClientRect();
+      const i = Math.floor(((ev.clientX - r.left) / r.width * d.width - d.left) / d.plot * n);
+      if (i < 0 || i >= n) return hide();
+      const x = d.left + (i + 0.5) * d.plot / n;
+      cursor.setAttribute('x1', x); cursor.setAttribute('x2', x); cursor.style.display = 'inline';
+      tip.replaceChildren();
+      const title = document.createElement('b'); title.textContent = d.labels[i]; tip.append(title);
+      d.series.forEach((s, k) => {
+        if (hidden.has(k)) return;
+        const row = document.createElement('div'), swatch = document.createElement('i'), value = document.createElement('span');
+        swatch.className = s.class; value.textContent = fmt(s.values[i]) + ' ' + d.unit;
+        row.append(swatch, s.label + ' ', value); tip.append(row);
+      });
+      tip.hidden = false;
+      const left = ev.clientX - fig.getBoundingClientRect().left;
+      tip.style.left = (left + 14 + tip.offsetWidth > fig.clientWidth ? left - 14 - tip.offsetWidth : left + 14) + 'px';
+    };
+    svg.addEventListener('pointermove', show);
+    svg.addEventListener('pointerdown', show);
+    svg.addEventListener('pointerleave', hide);
+    fig.querySelectorAll('.legend[data-i]').forEach(el => el.addEventListener('click', () => {
+      const k = Number(el.dataset.i), off = !hidden.has(k);
+      off ? hidden.add(k) : hidden.delete(k);
+      el.classList.toggle('off', off);
+      svg.querySelectorAll('g[data-i="' + k + '"]').forEach(g => g.style.display = off ? 'none' : '');
+    }));
+  });
+  let busy = 0;
+  ['pointermove', 'pointerdown', 'keydown', 'scroll'].forEach(e => addEventListener(e, () => busy = Date.now(), { passive: true }));
+  setInterval(() => {
+    const idle = Date.now() - busy > 30000, focus = document.activeElement === document.body;
+    if (idle && focus && !document.hidden) location.reload();
+  }, 60000);
+});
+"#;
+
 const CSS: &str = r"
 :root {
   --bg: #f7f7f5; --card: #ffffff; --fg: #1d1d1b; --muted: #6b6b66; --line: #e2e2dc;
   --buy: #c2410c; --sell: #2563eb; --pv: #ca8a04; --load: #7c3aed; --bat: #059669;
-  --grid: #334155; --soc: #0d9488; --plan: #2563eb; --dao: #dc2626; --forecast: #7c3aed; --shade: #eef0f3;
+  --grid: #334155; --soc: #0d9488; --plan: #2563eb; --dao: #dc2626; --forecast: #7c3aed; --shade: #eef0f3; --hp: #db2777;
 }
 @media (prefers-color-scheme: dark) {
   :root {
     --bg: #111312; --card: #1b1d1c; --fg: #e8e8e3; --muted: #9a9a93; --line: #2d302e;
     --buy: #fb923c; --sell: #60a5fa; --pv: #facc15; --load: #a78bfa; --bat: #34d399;
-    --grid: #cbd5e1; --soc: #2dd4bf; --plan: #60a5fa; --dao: #f87171; --forecast: #a78bfa; --shade: #232625;
+    --grid: #cbd5e1; --soc: #2dd4bf; --plan: #60a5fa; --dao: #f87171; --forecast: #a78bfa; --shade: #232625; --hp: #f472b6;
   }
 }
 * { box-sizing: border-box; }
@@ -1119,7 +1225,13 @@ h1 { font-size: 22px; margin: 0; } h2 { font-size: 17px; margin: 28px 0 4px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin-top: 16px; }
 .card { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; display: flex; flex-direction: column; }
 .label { font-size: 12px; color: var(--muted); } .value { font-size: 22px; font-variant-numeric: tabular-nums; } .sub { font-size: 12px; color: var(--muted); }
-figure { margin: 10px 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px; }
+figure { margin: 10px 0; background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 6px; position: relative; }
+.cursor { stroke: var(--muted); stroke-width: 1; display: none; }
+.tip { position: absolute; top: 10px; z-index: 1; pointer-events: none; background: var(--card); border: 1px solid var(--line);
+  border-radius: 8px; padding: 6px 9px; font-size: 12px; line-height: 1.5; white-space: nowrap; box-shadow: 0 2px 8px rgba(0,0,0,.15); }
+.tip b { display: block; margin-bottom: 2px; } .tip i { display: inline-block; width: 10px; height: 3px; margin-right: 6px; vertical-align: middle; background: currentColor; }
+.tip span { font-variant-numeric: tabular-nums; }
+.legend[data-i] { cursor: pointer; user-select: none; } .legend.off { opacity: .35; text-decoration: line-through; }
 svg.chart { width: 100%; height: auto; display: block; }
 figcaption { font-size: 12px; color: var(--muted); padding: 2px 6px; display: flex; flex-wrap: wrap; gap: 12px; }
 .unit { font-weight: 600; }
@@ -1135,7 +1247,7 @@ figcaption { font-size: 12px; color: var(--muted); padding: 2px 6px; display: fl
 .s-load { color: var(--load); stroke: var(--load); } .s-forecast { color: var(--forecast); stroke: var(--forecast); }
 .s-bat { color: var(--bat); fill: var(--bat); } .s-grid { color: var(--grid); stroke: var(--grid); }
 .s-soc { color: var(--soc); stroke: var(--soc); } .s-plan { color: var(--plan); stroke: var(--plan); }
-.s-dao { color: var(--dao); stroke: var(--dao); }
+.s-dao { color: var(--dao); stroke: var(--dao); } .s-hp { color: var(--hp); stroke: var(--hp); }
 details { margin-top: 20px; } summary { cursor: pointer; }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; margin-top: 8px; }

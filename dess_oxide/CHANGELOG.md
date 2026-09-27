@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.12.0
+
+- **Fix: the heat pump model is used on its own.** Before, a heat pump model
+  that beat its baseline was only used together with a base-load model, so
+  the load forecast fell back to plain history. Now the load is base load
+  (the model, or history without the heat pump) plus the heat pump model.
+- **Interactive charts:** hover (or tap) for every series' value at that
+  time; click a legend entry to hide or show it. The page no longer
+  reloads while you're looking at it.
+- **Forecast accuracy per day:** what the last plan before midnight expected
+  against what happened, for PV, base load, heat pump and the whole house.
+  The plan chart also shows the heat pump's share of the load forecast.
+- **Honest heat pump figures:** without a heat meter only electricity is
+  known, so the page no longer shows a COP or a heat loss. It shows the
+  electricity heating takes at 0 °C and −7 °C, the wind and frost effects,
+  and hot water per day.
+- The PV section explains the fitted inverter limit: with arrays that never
+  reach it, it only sits above everything recorded and has no effect.
+
 ## 0.11.0
 
 - **`control` is now `dryrun`**, and inverted: dess-oxide never writes to

@@ -175,6 +175,8 @@ pub struct PlanView {
     pub soc: f64,
     pub battery: BatteryModel,
     pub forecasts: Vec<SlotForecast>,
+    /// The heat pump's part of each forecast's load, when modelled.
+    pub heat_pump: Vec<Option<Watts>>,
     pub settings: PlannerSettings,
     pub min_soc: f64,
     pub plan: Plan,
@@ -228,8 +230,9 @@ pub fn make_plan(
         Slot::containing(now + SignedDuration::from_hours(72)),
     )?;
     let history = load_history(store, &config.history, config.ev.on_input, lookback)?;
+    let mut heat_pump = Vec::new();
     let loads = |slots: &[Slot]| {
-        house_load(
+        let loads = house_load(
             slots,
             store,
             config,
@@ -237,7 +240,9 @@ pub fn make_plan(
             now,
             inputs,
             &history,
-        )
+        )?;
+        heat_pump = loads.iter().map(|l| l.heat_pump).collect();
+        Ok(loads.into_iter().map(|l| l.total).collect())
     };
     let min_soc = min_soc(&info, config);
     let forecasts = slot_forecasts(
@@ -272,6 +277,7 @@ pub fn make_plan(
         soc,
         battery,
         forecasts,
+        heat_pump,
         settings,
         min_soc,
         plan,
@@ -479,6 +485,18 @@ pub fn slot_forecasts(
 
 /// House load per slot: the learned base-load and heat pump models where
 /// they're in use and there's weather for the hour, else the history baseline.
+/// The load forecast for one slot, and the heat pump's part of it when a
+/// heat pump model made it.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct LoadForecast {
+    total: Watts,
+    heat_pump: Option<Watts>,
+}
+
+/// House load per slot. With a metered heat pump whose model is in use, the
+/// load is base load (the base-load model, or else history without the heat
+/// pump) plus the heat pump model. Otherwise it's the base-load model if in
+/// use, else history.
 fn house_load(
     slots: &[Slot],
     store: &Store,
@@ -487,19 +505,58 @@ fn house_load(
     now: Timestamp,
     inputs: ForecastInputs<'_>,
     history: &[(Slot, Watts)],
-) -> anyhow::Result<Vec<Watts>> {
-    let baseline = forecast::baseline_load(history, slots, tz, FALLBACK_LOAD);
-    let heat_pump_metered = config
+) -> anyhow::Result<Vec<LoadForecast>> {
+    let heat_pump_entity = config
         .history
         .heat_pump
         .as_deref()
-        .is_some_and(|e| !e.is_empty());
-    let Some(load) = inputs.models.load else {
-        return Ok(baseline);
+        .filter(|e| !e.is_empty());
+    let heat_pump_model = inputs
+        .models
+        .heat_pump
+        .filter(|_| heat_pump_entity.is_some());
+    // The base-load model is trained without the heat pump, so it needs the
+    // heat pump model next to it when the heat pump is metered.
+    let load_model = inputs
+        .models
+        .load
+        .filter(|_| heat_pump_entity.is_none() || heat_pump_model.is_some());
+    let plain = |loads: Vec<Watts>| {
+        loads
+            .into_iter()
+            .map(|total| LoadForecast {
+                total,
+                heat_pump: None,
+            })
+            .collect()
     };
-    if heat_pump_metered && inputs.models.heat_pump.is_none() {
-        return Ok(baseline);
+    if heat_pump_model.is_none() && load_model.is_none() {
+        return Ok(plain(forecast::baseline_load(
+            history,
+            slots,
+            tz,
+            FALLBACK_LOAD,
+        )));
     }
+
+    // History without the heat pump, for base load where the model isn't in use.
+    let baseline = match (heat_pump_entity, heat_pump_model) {
+        (Some(entity), Some(_)) => {
+            let from = history.first().map_or(Slot::containing(now), |(s, _)| *s);
+            let hourly = store.ha_hourly(&[entity], from.start())?;
+            let base: Vec<(Slot, Watts)> = history
+                .iter()
+                .filter_map(|&(slot, total)| {
+                    let hour = slot.start_unix().div_euclid(3600) * 3600;
+                    let kwh = hourly.get(&hour)?.get(entity)?;
+                    Some((slot, Watts((total.0 - kwh * 1000.0).max(0.0))))
+                })
+                .collect();
+            forecast::baseline_load(&base, slots, tz, FALLBACK_LOAD)
+        }
+        _ => forecast::baseline_load(history, slots, tz, FALLBACK_LOAD),
+    };
+
     // Stored recent weather first, so the moving averages carry on into the forecast.
     let mut weather = store.weather(
         Slot::containing(now - SignedDuration::from_hours(24 * 10)),
@@ -514,15 +571,24 @@ fn house_load(
     Ok(slots
         .iter()
         .zip(baseline)
-        .map(|(slot, fallback)| {
-            let Some(w) = hours.get(&(slot.start_unix().div_euclid(3600) * 3600)) else {
-                return fallback;
+        .map(|(slot, base_history)| {
+            let features = hours
+                .get(&(slot.start_unix().div_euclid(3600) * 3600))
+                .and_then(|w| Some((w, crate::training::house_features(w, tz)?)));
+            let Some((w, (hour, weekday, holiday))) = features else {
+                return LoadForecast {
+                    total: base_history,
+                    heat_pump: None,
+                };
             };
-            let Some((hour, weekday, holiday)) = crate::training::house_features(w, tz) else {
-                return fallback;
-            };
-            let heat_pump = inputs.models.heat_pump.map_or(0.0, |m| m.hour_kwh(w, hour));
-            Watts((load.hour_kwh(w, hour, weekday, holiday) + heat_pump) * 1000.0)
+            let base = load_model.map_or(base_history.0, |m| {
+                m.hour_kwh(w, hour, weekday, holiday) * 1000.0
+            });
+            let heat_pump = heat_pump_model.map(|m| Watts(m.hour_kwh(w, hour) * 1000.0));
+            LoadForecast {
+                total: Watts(base + heat_pump.map_or(0.0, |h| h.0)),
+                heat_pump,
+            }
         })
         .collect())
 }
@@ -664,6 +730,8 @@ mod tests {
             pv: WattHours(500.0),
             soc_start: 50.0,
             soc_end: 50.0,
+            load_input: WattHours(0.0),
+            relay_closed_seconds: [0.0, 0.0],
         }];
         let m = money(&flows, &spot, &tariff);
         assert!((m.actual - buy).abs() < 1e-9);

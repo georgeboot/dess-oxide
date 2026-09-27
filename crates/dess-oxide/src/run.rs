@@ -719,7 +719,12 @@ fn replan(venus: &Venus, shared: &Shared) {
                 let mut store = lock(&shared.store);
                 let view =
                     planning::make_plan(now, &snapshot, &store, &shared.config, tariff, inputs)?;
-                store.save_plan(now.as_second(), &view.plan.slots, &view.forecasts)?;
+                store.save_plan(
+                    now.as_second(),
+                    &view.plan.slots,
+                    &view.forecasts,
+                    &view.heat_pump,
+                )?;
                 store.prune_plans((now - PLAN_RETENTION).as_second())?;
                 anyhow::Ok(view)
             })

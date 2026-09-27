@@ -219,7 +219,7 @@ mod tests {
         for (i, slot) in slots.iter().enumerate() {
             let (forecasts, plan) = plan_at(i);
             store
-                .save_plan(slot.start_unix() + 5, &plan.slots, &forecasts)
+                .save_plan(slot.start_unix() + 5, &plan.slots, &forecasts, &[])
                 .unwrap();
         }
         let (forecasts, plan) = plan_at(0);
@@ -228,6 +228,7 @@ mod tests {
             soc: 60.0,
             battery,
             forecasts,
+            heat_pump: Vec::new(),
             settings,
             min_soc: 10.0,
             plan,
