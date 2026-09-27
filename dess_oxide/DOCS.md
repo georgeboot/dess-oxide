@@ -64,7 +64,19 @@ tariff:                     # each component takes effect on its date
   vat_on_export: false
 pv:                         # optional: your arrays, for the PV forecast
   - {kwp: 5.59, tilt: 33, azimuth: 193}   # compass degrees, 180 = south
+history:                    # optional: HA energy sensors (cumulative kWh)
+  grid_import: sensor.p1_meter_energy_import
+  grid_export: sensor.p1_meter_energy_export
+  pv: sensor.pv_inverter_energy
+  battery_in: sensor.battery_ac_charge_energy
+  battery_out: sensor.battery_ac_discharge_energy
+  heat_pump: sensor.heat_pump_energy
 ```
+
+**`history`** gives the forecasts real history on day one. dess-oxide
+copies these sensors' hourly statistics from Home Assistant: up to three
+years at first, then every six hours. House load is derived as
+`import − export + pv − battery_in + battery_out`. This only reads from HA.
 
 - **Set your supplier's markups.** The defaults are typical values, not
   yours.

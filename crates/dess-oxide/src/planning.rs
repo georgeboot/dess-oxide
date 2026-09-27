@@ -17,7 +17,7 @@ use jiff::tz::TimeZone;
 use jiff::{SignedDuration, Timestamp, ToSpan};
 use tracing::{debug, warn};
 
-use crate::config::{Config, RelayAction};
+use crate::config::{Config, HistoryConfig, RelayAction};
 use crate::nordpool::NordPool;
 use crate::store::Store;
 
@@ -101,7 +101,7 @@ pub fn make_plan(
         lookback,
         Slot::containing(now + SignedDuration::from_hours(72)),
     )?;
-    let load_history = store.load_history(lookback)?;
+    let load_history = load_history(store, &config.history, lookback)?;
     let forecasts = slot_forecasts(
         now,
         &prices,
@@ -126,6 +126,55 @@ pub fn make_plan(
         forecasts,
         plan,
     })
+}
+
+/// Mean load per slot since `from`: recorded slots, plus hours from Home
+/// Assistant's statistics where nothing was recorded (each hour's mean
+/// spread over its four slots).
+pub fn load_history(
+    store: &Store,
+    history: &HistoryConfig,
+    from: Slot,
+) -> anyhow::Result<Vec<(Slot, Watts)>> {
+    let mut by_slot: BTreeMap<Slot, Watts> = store.load_history(from)?.into_iter().collect();
+    let entity = |role: &str| {
+        history
+            .entities()
+            .into_iter()
+            .find(|(r, _)| *r == role)
+            .map(|(_, e)| e.to_owned())
+    };
+    let (Some(import), Some(export)) = (entity("grid_import"), entity("grid_export")) else {
+        return Ok(by_slot.into_iter().collect());
+    };
+    let optional = ["pv", "battery_in", "battery_out"].map(entity);
+    let mut entities = vec![import.as_str(), export.as_str()];
+    entities.extend(optional.iter().flatten().map(String::as_str));
+    for (hour, values) in store.ha_hourly(&entities, from.start())? {
+        let get = |e: &Option<String>| e.as_ref().and_then(|e| values.get(e)).copied();
+        let (Some(imported), Some(exported)) = (values.get(&import), values.get(&export)) else {
+            continue;
+        };
+        // Every configured sensor must have a value, or the load would be wrong.
+        if optional
+            .iter()
+            .zip(optional.iter().map(get))
+            .any(|(e, v)| e.is_some() && v.is_none())
+        {
+            continue;
+        }
+        let [pv, battery_in, battery_out] = optional.each_ref().map(|e| get(e).unwrap_or(0.0));
+        let load_kwh = imported - exported + pv - battery_in + battery_out;
+        let Some(first) = Slot::from_start_unix(hour) else {
+            continue;
+        };
+        let mut slot = first;
+        for _ in 0..4 {
+            by_slot.entry(slot).or_insert(Watts(load_kwh * 1000.0));
+            slot = slot.next();
+        }
+    }
+    Ok(by_slot.into_iter().collect())
 }
 
 /// The battery model and current state, from the GX device.
@@ -274,19 +323,67 @@ pub async fn pv_forecast(
         tracing::warn!("no PV forecast: no [[pv]] arrays configured");
         return std::collections::BTreeMap::new();
     }
-    let location = match config.location {
-        Some(location) => Ok(Some(location)),
-        None => crate::homeassistant::location(client).await,
+    let location = match (
+        config.location,
+        crate::homeassistant::Endpoint::resolve(config),
+    ) {
+        (Some(location), _) => Ok(location),
+        (None, Some(endpoint)) => crate::homeassistant::location(client, &endpoint).await,
+        (None, None) => Err(anyhow::anyhow!(
+            "no location: set [location] or [homeassistant]"
+        )),
     };
     let result = match location {
-        Ok(Some(location)) => crate::openmeteo::pv_forecast(client, location, &config.pv).await,
-        Ok(None) => Err(anyhow::anyhow!(
-            "no location: set [location] outside Home Assistant"
-        )),
+        Ok(location) => crate::openmeteo::pv_forecast(client, location, &config.pv).await,
         Err(error) => Err(error),
     };
     result.unwrap_or_else(|error| {
         tracing::warn!("no PV forecast: {error:#}");
         std::collections::BTreeMap::new()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hourly_history_fills_gaps_but_recorded_slots_win() {
+        let mut store = Store::in_memory().unwrap();
+        let hour: Timestamp = "2026-09-26T10:00:00Z".parse().unwrap();
+        let rows: Vec<(String, Timestamp, f64)> = [
+            ("sensor.import", 1.0),
+            ("sensor.export", 0.2),
+            ("sensor.pv", 1.5),
+            ("sensor.bat_in", 0.8),
+            ("sensor.bat_out", 0.1),
+        ]
+        .into_iter()
+        .map(|(e, kwh)| (e.to_owned(), hour, kwh))
+        .collect();
+        store.save_ha_hourly(&rows).unwrap();
+        let history = HistoryConfig {
+            grid_import: Some("sensor.import".into()),
+            grid_export: Some("sensor.export".into()),
+            pv: Some("sensor.pv".into()),
+            battery_in: Some("sensor.bat_in".into()),
+            battery_out: Some("sensor.bat_out".into()),
+            heat_pump: None,
+        };
+        let from = Slot::containing("2026-09-26T00:00:00Z".parse().unwrap());
+        let loads = load_history(&store, &history, from).unwrap();
+        assert_eq!(loads.len(), 4);
+        // 1.0 − 0.2 + 1.5 − 0.8 + 0.1 = 1.6 kWh in an hour.
+        assert!(loads.iter().all(|(_, w)| (w.0 - 1600.0).abs() < 1e-9));
+
+        // A sensor without a value for the hour makes the hour unusable.
+        store
+            .save_ha_hourly(&[(
+                "sensor.import".into(),
+                hour + SignedDuration::from_hours(1),
+                1.0,
+            )])
+            .unwrap();
+        assert_eq!(load_history(&store, &history, from).unwrap().len(), 4);
+    }
 }

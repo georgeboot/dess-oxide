@@ -40,6 +40,21 @@ vat_on_export = false
 # latitude = 52.09
 # longitude = 5.12
 
+# Optional: HA energy sensors (cumulative kWh) whose long-term statistics
+# bootstrap the history. Load = import − export + pv − battery_in + battery_out.
+[history]
+grid_import = "sensor.p1_meter_energy_import"
+grid_export = "sensor.p1_meter_energy_export"
+pv = "sensor.pv_omvormer_energie"
+battery_in = "sensor.accu_ac_laadenergie"
+battery_out = "sensor.accu_ac_ontlaadenergie"
+heat_pump = "sensor.kwh_meter_warmtepomp_energy_import"
+
+# Standalone only (the app uses the Supervisor): where Home Assistant is.
+# [homeassistant]
+# url = "http://homeassistant.local:8123"
+# token = "…"   # a long-lived access token
+
 # Optional: PV arrays as a starting point for the forecast; M2 learns the real values.
 [[pv]]
 kwp = 5.59

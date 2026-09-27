@@ -51,6 +51,7 @@ options:
     net_exporter: false
     vat_on_export: false
   pv: []
+  history: {}
 schema:
   victron:
     host: str
@@ -87,3 +88,10 @@ schema:
     - kwp: float
       tilt: float(0,90)
       azimuth: float(0,360)
+  history:
+    grid_import: str?
+    grid_export: str?
+    pv: str?
+    battery_in: str?
+    battery_out: str?
+    heat_pump: str?

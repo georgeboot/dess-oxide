@@ -31,6 +31,58 @@ pub struct Config {
     /// Optional starting point for the PV model; M2 learns the real values.
     #[serde(default)]
     pub pv: Vec<PvArrayConfig>,
+    /// HA energy sensors whose long-term statistics bootstrap the history.
+    #[serde(default)]
+    pub history: HistoryConfig,
+    /// Standalone only: where Home Assistant is. The app uses the Supervisor.
+    #[serde(default)]
+    pub homeassistant: Option<HomeAssistantConfig>,
+}
+
+/// Energy sensors (cumulative kWh, as in HA's energy dashboard). House load
+/// is derived as `grid_import − grid_export + pv − battery_in + battery_out`.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HistoryConfig {
+    pub grid_import: Option<String>,
+    pub grid_export: Option<String>,
+    pub pv: Option<String>,
+    /// AC energy into the battery system.
+    pub battery_in: Option<String>,
+    /// AC energy out of the battery system.
+    pub battery_out: Option<String>,
+    pub heat_pump: Option<String>,
+}
+
+impl HistoryConfig {
+    /// `(role, entity)` for every configured sensor.
+    pub fn entities(&self) -> Vec<(&'static str, &str)> {
+        [
+            ("grid_import", &self.grid_import),
+            ("grid_export", &self.grid_export),
+            ("pv", &self.pv),
+            ("battery_in", &self.battery_in),
+            ("battery_out", &self.battery_out),
+            ("heat_pump", &self.heat_pump),
+        ]
+        .into_iter()
+        .filter_map(|(role, entity)| {
+            entity
+                .as_deref()
+                .filter(|e| !e.is_empty())
+                .map(|e| (role, e))
+        })
+        .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HomeAssistantConfig {
+    /// e.g. `http://homeassistant.local:8123`
+    pub url: String,
+    /// A long-lived access token.
+    pub token: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]

@@ -79,6 +79,15 @@ const MIGRATIONS: &[&str] = &[
         PRIMARY KEY (planned_at, slot_start)
     ) STRICT;
 ",
+    r"
+    -- Hourly energy from Home Assistant's long-term statistics.
+    CREATE TABLE ha_hourly (
+        entity     TEXT NOT NULL,
+        hour_start INTEGER NOT NULL, -- unix seconds
+        kwh        REAL NOT NULL,
+        PRIMARY KEY (entity, hour_start)
+    ) STRICT;
+",
 ];
 
 pub struct Store {
@@ -109,7 +118,7 @@ impl Store {
     }
 
     #[cfg(test)]
-    fn in_memory() -> anyhow::Result<Self> {
+    pub fn in_memory() -> anyhow::Result<Self> {
         Self::init(Connection::open_in_memory()?)
     }
 
@@ -341,6 +350,61 @@ impl Store {
             }
         }
         Ok(history)
+    }
+
+    /// Stores hourly energy (kWh) per HA entity, replacing earlier values.
+    pub fn save_ha_hourly(
+        &mut self,
+        rows: &[(String, jiff::Timestamp, f64)],
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR REPLACE INTO ha_hourly VALUES (?1, ?2, ?3)")?;
+            for (entity, start, kwh) in rows {
+                insert.execute(params![entity, start.as_second(), kwh])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// The start of the latest imported hour for `entity`.
+    pub fn last_ha_hour(&self, entity: &str) -> anyhow::Result<Option<jiff::Timestamp>> {
+        let last: Option<i64> = self.conn.query_row(
+            "SELECT max(hour_start) FROM ha_hourly WHERE entity = ?1",
+            [entity],
+            |row| row.get(0),
+        )?;
+        last.map(jiff::Timestamp::from_second)
+            .transpose()
+            .map_err(Into::into)
+    }
+
+    /// Hourly kWh per entity since `from`: `hour → entity → kWh`.
+    pub fn ha_hourly(
+        &self,
+        entities: &[&str],
+        from: jiff::Timestamp,
+    ) -> anyhow::Result<BTreeMap<i64, std::collections::HashMap<String, f64>>> {
+        let mut out: BTreeMap<i64, std::collections::HashMap<String, f64>> = BTreeMap::new();
+        let mut query = self.conn.prepare_cached(
+            "SELECT entity, hour_start, kwh FROM ha_hourly WHERE entity = ?1 AND hour_start >= ?2",
+        )?;
+        for entity in entities {
+            let rows = query.query_map(params![entity, from.as_second()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, f64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (entity, hour, kwh) = row?;
+                out.entry(hour).or_default().insert(entity, kwh);
+            }
+        }
+        Ok(out)
     }
 
     /// Adds steady-state conversion samples to the day's bins.

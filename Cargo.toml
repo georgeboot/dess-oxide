@@ -15,6 +15,7 @@ dess-victron = { path = "crates/dess-victron" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 clap = { version = "4.6.7", features = ["derive"] }
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 jiff = { version = "0.2.37", features = ["serde", "tzdb-bundle-always"] }
 maud = "0.27.0"
 proptest = "1.11.0"
@@ -27,6 +28,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "signal", "sync"] }
+tokio-tungstenite = "0.30.0"
 toml = "1.1.6"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

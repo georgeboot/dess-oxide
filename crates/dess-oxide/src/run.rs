@@ -6,6 +6,7 @@
 //! - **PV forecast:** refreshes the baseline PV forecast hourly;
 //! - **planner:** replans at every slot boundary and whenever prices or the PV
 //!   forecast change, and stores each plan (shadow mode);
+//! - **history import:** copies hourly energy statistics from Home Assistant;
 //! - **web:** serves the dess-oxide page.
 //!
 //! Nothing here writes to the GX device.
@@ -118,11 +119,14 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
     wait_for_heartbeat(&venus, Duration::from_secs(10)).await;
     shared.update_status(|s| s.problem = None);
 
-    let mut tasks: Vec<JoinHandle<()>> = vec![tokio::spawn(record(
-        Arc::clone(&venus),
-        Arc::clone(&shared),
-        stopped.clone(),
-    ))];
+    let mut tasks: Vec<JoinHandle<()>> = vec![
+        tokio::spawn(record(
+            Arc::clone(&venus),
+            Arc::clone(&shared),
+            stopped.clone(),
+        )),
+        tokio::spawn(import_history(Arc::clone(&shared), stopped.clone())),
+    ];
     if shared.tariff.is_some() {
         let client = crate::http_client()?;
         let (prices_changed, prices_rx) = watch::channel(0u64);
@@ -374,6 +378,68 @@ fn replan(venus: &Venus, shared: &Shared) {
             shared.update_status(|s| s.problem = Some(format!("planning: {error:#}")));
         }
     }
+}
+
+/// Copies hourly energy statistics from Home Assistant: a backfill on the
+/// first run, then every six hours whatever is new.
+async fn import_history(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
+    let entities: Vec<String> = shared
+        .config
+        .history
+        .entities()
+        .into_iter()
+        .map(|(_, e)| e.to_owned())
+        .collect();
+    if entities.is_empty() {
+        return;
+    }
+    let Some(endpoint) = crate::homeassistant::Endpoint::resolve(&shared.config) else {
+        info!("history sensors configured but no Home Assistant connection; not importing");
+        return;
+    };
+    loop {
+        match import_statistics(&shared, &endpoint, &entities).await {
+            Ok(0) => {}
+            Ok(rows) => info!(rows, "imported Home Assistant statistics"),
+            Err(error) => warn!("importing Home Assistant statistics: {error:#}"),
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(6 * 3600)) => {}
+            () = stopped(&mut stop) => return,
+        }
+    }
+}
+
+async fn import_statistics(
+    shared: &Shared,
+    endpoint: &crate::homeassistant::Endpoint,
+    entities: &[String],
+) -> anyhow::Result<usize> {
+    const BACKFILL: SignedDuration = SignedDuration::from_hours(24 * 365 * 3);
+    const CHUNK: SignedDuration = SignedDuration::from_hours(24 * 30);
+    let mut connection = crate::homeassistant::Connection::connect(endpoint).await?;
+    let now = Timestamp::now();
+    // Only complete hours.
+    let end = Timestamp::from_second(now.as_second().div_euclid(3600) * 3600)?;
+    let mut total = 0;
+    for entity in entities {
+        let last = lock(&shared.store).last_ha_hour(entity)?;
+        let mut start = last.map_or(now - BACKFILL, |hour| hour + SignedDuration::from_hours(1));
+        while start < end {
+            let chunk_end = (start + CHUNK).min(end);
+            let rows = crate::homeassistant::hourly_energy(
+                &mut connection,
+                std::slice::from_ref(entity),
+                start,
+                chunk_end,
+            )
+            .await?;
+            total += rows.len();
+            tokio::task::block_in_place(|| lock(&shared.store).save_ha_hourly(&rows))?;
+            start = chunk_end;
+        }
+    }
+    Ok(total)
 }
 
 /// Keeps trying: after a power cut the GX device may boot slower than Home Assistant.
