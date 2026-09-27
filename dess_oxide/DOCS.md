@@ -132,6 +132,7 @@ weather_station:            # optional: a local station in HA, such as an Ecowit
   wind_speed: sensor.ws90_wind_speed
   solar_radiation: sensor.ws90_solar_radiation
 language: auto              # the page's language: auto (Home Assistant's), en or nl
+ned_api_key: ""             # optional: a free key from ned.nl, for better price forecasts
 ```
 
 **`history`** gives the forecasts real history on day one. dess-oxide
@@ -199,6 +200,18 @@ recent past gets the measured temperatures, so the heat pump model's
 thermal lag starts from what happened. Wind isn't corrected: a station a
 few metres up doesn't measure the 10 m wind the models use. Every sensor is
 optional; units are converted.
+
+**Prices not yet published** (beyond tomorrow, or tomorrow before about
+13:00) are forecast by a model of what drives them: wind and sun in the
+Netherlands and Germany, temperature, the time of day and week, holidays,
+and the recent price level. It learns from the last half year of EPEX NL
+prices (from EnergyZero) and Open-Meteo's weather forecasts, retrains
+nightly, and is only used while it beats the old estimate (the recent
+median of the same hour) on held-out days. On half a year of history it
+roughly halves the error: 1.6 ct/kWh against 3.4. With **`ned_api_key`**
+(free from [ned.nl](https://ned.nl/nl/handleiding-api)) it also uses NED's
+forecasts of Dutch wind and solar production, which brings it to about
+1.5 ct/kWh.
 
 **`ev.on_input`**: if the charger sits between the grid meter and the
 Victrons, what the Victron sees as loads on its input is the EV. It's then

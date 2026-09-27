@@ -6,6 +6,7 @@ mod control;
 mod entities;
 mod homeassistant;
 mod i18n;
+mod market;
 mod nordpool;
 mod openamber;
 mod openmeteo;
@@ -67,6 +68,14 @@ enum Command {
         #[arg(long, default_value_t = 32)]
         rows: usize,
     },
+    /// Train the price model on recent history and report how it does on
+    /// held-out days, against the recent-median estimate. Reads a NED key
+    /// from `NED_API_KEY`, if set.
+    PriceBacktest {
+        /// Days of history to train on.
+        #[arg(long, default_value_t = 180)]
+        days: i64,
+    },
     /// Run the service: record, learn, plan and serve the page. It writes to
     /// the GX device only with `dryrun: false` and the page's switch on.
     Run {
@@ -120,6 +129,7 @@ async fn main() -> anyhow::Result<()> {
             data_dir,
             rows,
         } => plan(Config::load(&config)?, &data_dir, rows).await,
+        Command::PriceBacktest { days } => price_backtest(days).await,
         Command::Run {
             config,
             data_dir,
@@ -217,6 +227,7 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
                 outage: planning::outage_window(&planning::lock(&store), now),
                 soc: None,
                 next_legionella: None,
+                price_forecast: &std::collections::BTreeMap::new(),
             },
         )
     })?;
@@ -234,5 +245,56 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
         "{}",
         planning::render(&view.plan, &view.forecasts, &tariff.time_zone, rows)
     );
+    Ok(())
+}
+
+async fn price_backtest(days: i64) -> anyhow::Result<()> {
+    use dess_models::price::{self, PriceHour};
+    let client = http_client()?;
+    let tz = jiff::tz::TimeZone::get("Europe/Amsterdam")?;
+    let until = Timestamp::now().to_zoned(jiff::tz::TimeZone::UTC).date();
+    let from = until.checked_sub(jiff::ToSpan::days(days))?;
+    let prices = market::prices(&client, from, until).await?;
+    let weather = market::weather(&client, Some((from, until.yesterday()?))).await?;
+    let ned = match std::env::var("NED_API_KEY") {
+        Ok(key) if !key.is_empty() => Some(market::ned(&client, &key, from, until).await?),
+        _ => None,
+    };
+    eprintln!(
+        "{} hours of prices, {} of weather, {} of NED",
+        prices.len(),
+        weather.len(),
+        ned.as_ref().map_or(0, std::collections::BTreeMap::len)
+    );
+    let hours = |with_ned: bool| -> Vec<PriceHour> {
+        prices
+            .iter()
+            .filter_map(|(&hour, &p)| {
+                let mut inputs = weather.get(&hour)?.clone();
+                if with_ned {
+                    inputs.extend(ned.as_ref()?.get(&hour)?);
+                }
+                Some(PriceHour {
+                    hour,
+                    inputs,
+                    level: price::level(&prices, hour)?,
+                    price: p,
+                })
+            })
+            .collect()
+    };
+    let report = |name: &str, hours: &[PriceHour]| match price::fit(hours, &tz) {
+        Some(fit) => println!(
+            "{name}: {} hours, held-out error {:.2} ct/kWh, recent median {:.2} ct/kWh",
+            fit.hours,
+            fit.validation_mae / 10.0,
+            fit.baseline_mae / 10.0
+        ),
+        None => println!("{name}: not enough hours"),
+    };
+    report("weather", &hours(false));
+    if ned.is_some() {
+        report("weather + NED", &hours(true));
+    }
     Ok(())
 }

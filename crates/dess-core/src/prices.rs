@@ -22,12 +22,13 @@ pub struct SpotPrice {
     pub estimated: bool,
 }
 
-/// Spot prices for `[from, until)`: known where published, estimated after.
-///
-/// Estimates use up to `lookback_days` of `known` history before the slot.
-/// Returns `None` if nothing is known at all.
+/// Spot prices for `[from, until)`: known where published, estimated after:
+/// from `forecast` where it has the slot (the price model), else from up to
+/// `lookback_days` of `known` history before the slot. Returns `None` if
+/// nothing is known at all.
 pub fn horizon(
     known: &BTreeMap<Slot, EurPerKwh>,
+    forecast: &BTreeMap<Slot, EurPerKwh>,
     from: Slot,
     until: Slot,
     lookback_days: u32,
@@ -46,7 +47,10 @@ pub fn horizon(
             },
             None => SpotPrice {
                 slot,
-                spot: estimate(known, slot, lookback_days),
+                spot: forecast
+                    .get(&slot)
+                    .copied()
+                    .unwrap_or_else(|| estimate(known, slot, lookback_days)),
                 estimated: true,
             },
         };
@@ -112,6 +116,7 @@ mod tests {
         let known = history();
         let h = horizon(
             &known,
+            &BTreeMap::new(),
             slot("2026-09-26T18:00:00Z"),
             slot("2026-09-26T18:30:00Z"),
             14,
@@ -127,6 +132,7 @@ mod tests {
         let known = history();
         let h = horizon(
             &known,
+            &BTreeMap::new(),
             slot("2026-09-27T17:45:00Z"),
             slot("2026-09-27T18:15:00Z"),
             14,
@@ -141,9 +147,24 @@ mod tests {
     }
 
     #[test]
+    fn the_price_model_fills_in_where_it_can() {
+        let known = history();
+        let from = slot("2026-09-27T17:45:00Z");
+        let forecast = BTreeMap::from([(from, EurPerKwh(0.33))]);
+        let h = horizon(&known, &forecast, from, slot("2026-09-27T18:15:00Z"), 14).unwrap();
+        assert_eq!(h[0].spot, EurPerKwh(0.33));
+        assert!(h[0].estimated);
+        assert!(
+            (h[1].spot.0 - 0.25).abs() < 1e-12,
+            "no forecast: the median"
+        );
+    }
+
+    #[test]
     fn nothing_known_means_no_horizon() {
         assert!(
             horizon(
+                &BTreeMap::new(),
                 &BTreeMap::new(),
                 slot("2026-09-27T00:00:00Z"),
                 slot("2026-09-27T01:00:00Z"),

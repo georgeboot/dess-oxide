@@ -205,6 +205,8 @@ pub struct ForecastInputs<'a> {
     pub soc: Option<f64>,
     /// When OpenAmber's next legionella run is due.
     pub next_legionella: Option<Timestamp>,
+    /// The price model's prices for slots not yet published.
+    pub price_forecast: &'a BTreeMap<Slot, EurPerKwh>,
 }
 
 /// During an expected outage, plan for more load and less PV than forecast,
@@ -269,7 +271,7 @@ pub fn make_plan(
         &prices,
         tariff,
         loads,
-        inputs.pv,
+        (inputs.pv, inputs.price_forecast),
         (min_soc, OUTAGE_MIN_SOC.min(min_soc)),
         inputs.outage,
     )?;
@@ -535,7 +537,7 @@ pub fn slot_forecasts(
     prices: &BTreeMap<Slot, EurPerKwh>,
     tariff: &Tariff,
     loads: impl FnOnce(&[Slot]) -> anyhow::Result<Vec<Watts>>,
-    pv: &BTreeMap<Slot, Watts>,
+    (pv, price_forecast): (&BTreeMap<Slot, Watts>, &BTreeMap<Slot, EurPerKwh>),
     (min_soc, outage_min_soc): (f64, f64),
     outage: Option<(Timestamp, Timestamp)>,
 ) -> anyhow::Result<Vec<SlotForecast>> {
@@ -545,8 +547,14 @@ pub fn slot_forecasts(
         .keys()
         .next_back()
         .map_or(min_end, |last| last.next().max(min_end));
-    let spot = prices::horizon(prices, first, until, PRICE_LOOKBACK_DAYS.unsigned_abs())
-        .ok_or(NoPrices)?;
+    let spot = prices::horizon(
+        prices,
+        price_forecast,
+        first,
+        until,
+        PRICE_LOOKBACK_DAYS.unsigned_abs(),
+    )
+    .ok_or(NoPrices)?;
     let slots: Vec<Slot> = spot.iter().map(|p| p.slot).collect();
     let loads = loads(&slots)?;
     spot.iter()

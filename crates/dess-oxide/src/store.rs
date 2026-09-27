@@ -154,6 +154,21 @@ const MIGRATIONS: &[&str] = &[
         ghi         REAL  -- W/m²
     ) STRICT;
 ",
+    r"
+    -- The price forecast's inputs: EPEX NL hourly prices, and per hour the
+    -- weather at the market points (the forecast archive, then the forecast)
+    -- and NED's Dutch wind and solar forecasts, as JSON arrays.
+    CREATE TABLE market_prices (
+        hour_start  INTEGER PRIMARY KEY,
+        eur_per_mwh REAL NOT NULL
+    ) STRICT;
+    CREATE TABLE market_inputs (
+        hour_start INTEGER NOT NULL,
+        source     TEXT NOT NULL, -- 'weather' or 'ned'
+        vals       TEXT NOT NULL, -- JSON array
+        PRIMARY KEY (hour_start, source)
+    ) STRICT;
+",
 ];
 
 pub struct Store {
@@ -997,6 +1012,67 @@ impl Store {
                     legionella_wh: legionella,
                 });
             }
+        }
+        Ok(out)
+    }
+
+    /// Stores hourly market prices (€/MWh), replacing those hours.
+    pub fn save_market_prices(&mut self, prices: &BTreeMap<i64, f64>) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR REPLACE INTO market_prices VALUES (?1, ?2)")?;
+            for (hour, price) in prices {
+                insert.execute(params![hour, price])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Hourly market prices since `from` (unix seconds), €/MWh.
+    pub fn market_prices(&self, from: i64) -> anyhow::Result<BTreeMap<i64, f64>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT hour_start, eur_per_mwh FROM market_prices WHERE hour_start >= ?1",
+        )?;
+        let rows = query.query_map([from], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// Stores a source's inputs per hour, replacing those hours.
+    pub fn save_market_inputs(
+        &mut self,
+        source: &str,
+        inputs: &BTreeMap<i64, Vec<f64>>,
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR REPLACE INTO market_inputs VALUES (?1, ?2, ?3)")?;
+            for (hour, values) in inputs {
+                insert.execute(params![hour, source, serde_json::to_string(values)?])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// A source's inputs per hour since `from` (unix seconds).
+    pub fn market_inputs(
+        &self,
+        source: &str,
+        from: i64,
+    ) -> anyhow::Result<BTreeMap<i64, Vec<f64>>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT hour_start, vals FROM market_inputs WHERE source = ?1 AND hour_start >= ?2",
+        )?;
+        let rows = query.query_map(params![source, from], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut out = BTreeMap::new();
+        for row in rows {
+            let (hour, json) = row?;
+            out.insert(hour, serde_json::from_str(&json)?);
         }
         Ok(out)
     }

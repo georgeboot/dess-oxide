@@ -61,6 +61,10 @@ pub struct Config {
     /// Ecowitt WS90), to correct the forecast for the next hours.
     #[serde(default)]
     pub weather_station: WeatherStationConfig,
+    /// A key for NED (the Dutch energy dashboard): its wind and solar
+    /// forecasts improve the price forecast. Optional.
+    #[serde(default)]
+    pub ned_api_key: Option<String>,
     /// The page's language: `auto` (Home Assistant's), `en` or `nl`.
     #[serde(default = "default_language")]
     pub language: String,
@@ -474,7 +478,7 @@ mod tests {
                 let kind = kind.trim_end_matches('?');
                 match kind {
                     "bool" => false.into(),
-                    "str" => "192.168.1.20".into(),
+                    "str" | "password" => "192.168.1.20".into(),
                     "port" => 1883.into(),
                     // A range's middle, else 1.
                     _ if kind.starts_with("float") => kind

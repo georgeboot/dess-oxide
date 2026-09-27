@@ -47,3 +47,9 @@ configuration:
     name: Language
     description: >-
       The dess-oxide page's language: auto (Home Assistant's), en or nl.
+  ned_api_key:
+    name: NED API key
+    description: >-
+      Optional: a free key from ned.nl (Nationaal Energie Dashboard). Its
+      forecasts of Dutch wind and solar production make the forecast of
+      prices not yet published more accurate.

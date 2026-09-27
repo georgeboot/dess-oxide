@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.20.0
+
+- **Price forecast:** prices that aren't published yet are now forecast
+  from what drives them: wind and sun in NL and Germany, temperature, the
+  time of day and week, holidays and the recent price level. A model
+  trained nightly on the last half year of EPEX NL prices (EnergyZero) and
+  weather forecasts (Open-Meteo), used while it beats the old estimate (the
+  recent median) on held-out days. On real data it roughly halves the
+  error: 1.6 ct/kWh against 3.4. So the plan knows sooner whether to keep
+  energy for a dear morning or evening beyond tomorrow.
+- **`ned_api_key`** (optional, free from ned.nl): NED's forecasts of Dutch
+  wind and solar production make it better still (about 1.5 ct/kWh).
+- `dess-oxide price-backtest` trains the model on recent history and
+  reports how it does.
+
 ## 0.19.0
 
 - **The battery's own losses count too:** what goes into the cells doesn't

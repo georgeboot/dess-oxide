@@ -1092,12 +1092,40 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                 }
             }
             (hot_water_section(shared))
+            (price_model_section(shared))
             (history_coverage(shared))
             h3 { (l.t("Base load", "Basisverbruik")) }
             @match load {
                 None => p.muted { (l.t("Not trained yet: it needs two weeks of load history.", "Nog niet getraind: het heeft twee weken verbruikshistorie nodig.")) },
                 Some(model) => (model_summary(shared, model, "baseline_mae_kwh", l.t("the same hour on the same weekday over the last four weeks", "hetzelfde uur op dezelfde weekdag over de afgelopen vier weken"))),
             }
+        }
+    }
+}
+
+/// The price model: how it does against the recent median.
+fn price_model_section(shared: &Shared) -> Markup {
+    let l = shared.lang();
+    let stored = lock(&shared.store).model("price").ok().flatten();
+    let ct = |key: &str, m: &StoredModel| m.metrics[key].as_f64().map_or(f64::NAN, |v| v / 10.0);
+    html! {
+        h3 { (l.t("Prices not yet published", "Nog niet gepubliceerde prijzen")) }
+        @match &stored {
+            None => p.muted { (l.t(
+                "Not trained yet: it fetches half a year of prices and weather first (a few minutes after startup).",
+                "Nog niet getraind: eerst haalt het een half jaar aan prijzen en weer op (een paar minuten na het opstarten).")) },
+            Some(m) => p {
+                (l.t("Forecast from wind and sun in NL and Germany, temperature, the time of day and week, holidays and the recent price level",
+                     "Voorspeld uit wind en zon in NL en Duitsland, temperatuur, het tijdstip, de dag, feestdagen en het recente prijsniveau"))
+                @if m.metrics["with_ned"].as_bool() == Some(true) { (l.t(", plus NED's Dutch wind and solar forecasts", ", plus de Nederlandse wind- en zonvoorspellingen van NED")) }
+                ". " (l.t("Trained ", "Getraind ")) (local(shared, m.trained_at, "%a %d %b %H:%M"))
+                (l.t(" on ", " op ")) (m.metrics["hours"]) (l.t(" hours. Held-out error ", " uur. Fout op achtergehouden dagen "))
+                (format!("{:.2} ct/kWh", ct("validation_mae_eur_mwh", m)))
+                (l.t(", against ", ", tegen ")) (format!("{:.2} ct/kWh", ct("baseline_mae_eur_mwh", m)))
+                (l.t(" for the recent median: ", " voor de recente mediaan: "))
+                @if m.promoted { strong { (l.t("in use", "in gebruik")) } } @else { (l.t("not better yet, so not used", "nog niet beter, dus niet in gebruik")) }
+                "."
+            },
         }
     }
 }

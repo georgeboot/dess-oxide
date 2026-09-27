@@ -798,7 +798,7 @@ These are off by default, enabled with an app option. They're for automations th
 **M4: Brother's site and polish.**
 - [x] EV awareness
 - [x] cheapest-start sensor, and the optional HA entities
-- better price tail
+- [x] better price tail: a price model (gradient-boosted trees, EpexPredictor-style) on wind and sun in NL and DE (Open-Meteo), temperature, calendar, the sun's position and the recent price level, plus NED's NL wind and solar forecasts with a key; 1.5–1.6 ct/kWh held-out error against 3.4 for the recent median
 - quantile-aware reserve
 - docs
 

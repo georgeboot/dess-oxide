@@ -1,2 +1,2 @@
 # Domain terms that are not code identifiers.
-doc-valid-idents = ["SoC", "kWh", "MWh", "kWp", "MultiPlus", "DVCC", "OpenAmber", "ESPHome", "BatteryLife", "..", "SQLite"]
+doc-valid-idents = ["SoC", "kWh", "MWh", "kWp", "MultiPlus", "DVCC", "OpenAmber", "ESPHome", "BatteryLife", "LightGBM", "EpexPredictor", "EnergyZero", "Open-Meteo", "..", "SQLite"]

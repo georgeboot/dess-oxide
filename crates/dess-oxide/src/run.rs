@@ -86,6 +86,10 @@ pub struct Shared {
     pub weather_correction: Mutex<Option<dess_core::weather_correction::Correction>>,
     /// The page's language.
     pub lang: Mutex<crate::i18n::Lang>,
+    /// The price model, when it beats the recent median.
+    pub price_model: watch::Sender<Option<Arc<dess_models::price::PriceModel>>>,
+    /// Its prices for the hours not yet published, per slot.
+    pub price_forecast: watch::Sender<Arc<BTreeMap<Slot, dess_core::EurPerKwh>>>,
 }
 
 impl Shared {
@@ -208,6 +212,8 @@ impl Shared {
             next_legionella: Mutex::new(None),
             station: Mutex::new(None),
             weather_correction: Mutex::new(None),
+            price_model: watch::Sender::new(None),
+            price_forecast: watch::Sender::new(Arc::new(BTreeMap::new())),
             lang: Mutex::new(match config_language.as_str() {
                 "auto" => crate::i18n::Lang::En,
                 code => crate::i18n::Lang::from_code(code),
@@ -243,6 +249,11 @@ fn spawn_tasks(
         stopped.clone(),
     )));
     tasks.push(tokio::spawn(fetch_weather(
+        Arc::clone(shared),
+        client.clone(),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(crate::market::run(
         Arc::clone(shared),
         client.clone(),
         stopped.clone(),
@@ -778,6 +789,7 @@ async fn plan_loop(
     let mut hp_model = shared.hp_model.subscribe();
     let mut load_model = shared.load_model.subscribe();
     let mut hot_water_model = shared.hot_water_model.subscribe();
+    let mut price_forecast = shared.price_forecast.subscribe();
     let mut replan_now = shared.replan_now.subscribe();
     loop {
         replan(&venus, &shared);
@@ -791,6 +803,7 @@ async fn plan_loop(
             _ = hp_model.changed() => true,
             _ = load_model.changed() => true,
             _ = hot_water_model.changed() => true,
+            _ = price_forecast.changed() => true,
             _ = replan_now.changed() => true,
             () = stopped(&mut stop) => return,
         };
@@ -807,6 +820,7 @@ async fn plan_loop(
             hp_model.mark_unchanged();
             load_model.mark_unchanged();
             hot_water_model.mark_unchanged();
+            price_forecast.mark_unchanged();
             replan_now.mark_unchanged();
         }
     }
@@ -816,6 +830,7 @@ fn replan(venus: &Venus, shared: &Shared) {
     let Some(tariff) = &shared.tariff else { return };
     let now = Timestamp::now();
     let snapshot = venus.snapshot();
+    let price_forecast = shared.price_forecast.borrow().clone();
     let weather = corrected_weather(shared, now);
     let (pv_model, hp_model, load_model, hot_water_model) = (
         shared.pv_model.borrow().clone(),
@@ -841,6 +856,7 @@ fn replan(venus: &Venus, shared: &Shared) {
         outage,
         soc: shared.soc(now),
         next_legionella: *shared.next_legionella.lock().expect("lock poisoned"),
+        price_forecast: &price_forecast,
     };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)
