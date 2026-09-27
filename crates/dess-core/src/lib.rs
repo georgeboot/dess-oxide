@@ -5,6 +5,7 @@
 //! backtests.
 
 pub mod battery;
+pub mod calendar;
 pub mod efficiency;
 pub mod forecast;
 pub mod planner;

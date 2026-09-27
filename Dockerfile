@@ -2,7 +2,7 @@
 # Image for the Home Assistant app. CI builds it natively per architecture
 # (amd64, arm64) and publishes a multi-arch manifest to ghcr.io.
 
-FROM rust:1.97-alpine AS build
+FROM rust:1.97.1-alpine AS build
 RUN apk add --no-cache musl-dev
 WORKDIR /src
 COPY Cargo.toml Cargo.lock ./

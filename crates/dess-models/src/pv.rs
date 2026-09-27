@@ -295,7 +295,7 @@ impl<B: Backend> Net<B> {
         let azimuth = self.azimuth.val();
         let mut total = x.dni.zeros_like();
         for i in 0..kwp.dims()[0] {
-            let one = |t: &Tensor<B, 1>| t.clone().slice([i..=i]).reshape([1, 1]);
+            let one = |t: &Tensor<B, 1>| t.clone().narrow(0, i, 1).reshape([1, 1]);
             let (kwp, tilt, azimuth) = (one(&kwp), one(&tilt), one(&azimuth));
             let (cos_tilt, sin_tilt) = (tilt.clone().cos(), tilt.sin());
             let cos_incidence = activation::relu(

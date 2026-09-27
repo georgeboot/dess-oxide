@@ -522,6 +522,10 @@ fn replan(venus: &Venus, shared: &Shared) {
             });
         }
         Err(error) => {
+            if error.is::<planning::NoPrices>() {
+                info!("waiting for day-ahead prices before planning");
+                return;
+            }
             warn!("planning: {error:#}");
             shared.update_status(|s| s.problem = Some(format!("planning: {error:#}")));
         }

@@ -30,6 +30,11 @@ const MIN_HORIZON_HOURS: i64 = 48;
 /// Load used before any history has been recorded.
 const FALLBACK_LOAD: Watts = Watts(600.0);
 
+/// Nothing to plan with yet: normal right after a first start.
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[error("no day-ahead prices yet")]
+pub struct NoPrices;
+
 /// What a price update found.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PriceUpdate {
@@ -233,7 +238,7 @@ pub fn slot_forecasts(
         .next_back()
         .map_or(min_end, |last| last.next().max(min_end));
     let spot = prices::horizon(prices, first, until, PRICE_LOOKBACK_DAYS.unsigned_abs())
-        .context("no day-ahead prices yet")?;
+        .ok_or(NoPrices)?;
     let slots: Vec<Slot> = spot.iter().map(|p| p.slot).collect();
     let loads = forecast::baseline_load(load_history, &slots, &tariff.time_zone, FALLBACK_LOAD);
     spot.iter()

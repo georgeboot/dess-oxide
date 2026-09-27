@@ -1,0 +1,5 @@
+# Pinned so a new Rust release can't break a release: bump deliberately,
+# together with the Dockerfile's rust image.
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
