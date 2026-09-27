@@ -13,9 +13,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && cp target/release/dess-oxide /dess-oxide
 
 FROM alpine:3.23
+# CA certificates for HTTPS (prices, weather).
+RUN apk add --no-cache ca-certificates
 COPY --from=build /dess-oxide /usr/local/bin/dess-oxide
 LABEL io.hass.type="addon" \
       org.opencontainers.image.source="https://github.com/georgeboot/dess-oxide" \
       org.opencontainers.image.description="Plans and runs a Victron ESS against Dutch day-ahead prices"
 ENTRYPOINT ["dess-oxide"]
-CMD ["run", "--config", "/data/options.json", "--data-dir", "/data"]
+CMD ["run", "--config", "/data/options.json", "--data-dir", "/data", "--listen", "0.0.0.0:8099"]

@@ -1,0 +1,49 @@
+{
+ "deliveryDateCET": "2026-09-27",
+ "version": 2,
+ "updatedAt": "2026-09-26T11:01:33.1774222Z",
+ "deliveryAreas": [
+  "NL"
+ ],
+ "market": "DayAhead",
+ "multiAreaEntries": [
+  {
+   "deliveryStart": "2026-09-26T22:00:00Z",
+   "deliveryEnd": "2026-09-26T22:15:00Z",
+   "entryPerArea": {
+    "NL": 192.07
+   }
+  },
+  {
+   "deliveryStart": "2026-09-26T22:15:00Z",
+   "deliveryEnd": "2026-09-26T22:30:00Z",
+   "entryPerArea": {
+    "NL": 186.33
+   }
+  },
+  {
+   "deliveryStart": "2026-09-26T22:30:00Z",
+   "deliveryEnd": "2026-09-26T22:45:00Z",
+   "entryPerArea": {
+    "NL": 182.92
+   }
+  },
+  {
+   "deliveryStart": "2026-09-26T22:45:00Z",
+   "deliveryEnd": "2026-09-26T23:00:00Z",
+   "entryPerArea": {
+    "NL": 172.42
+   }
+  }
+ ],
+ "currency": "EUR",
+ "exchangeRate": 1,
+ "areaStates": [
+  {
+   "state": "Final",
+   "areas": [
+    "NL"
+   ]
+  }
+ ]
+}

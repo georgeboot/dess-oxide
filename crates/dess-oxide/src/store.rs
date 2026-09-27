@@ -5,11 +5,14 @@ use std::path::Path;
 
 use anyhow::Context;
 use dess_core::efficiency::BinStats;
+use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
+use dess_core::{EurPerKwh, Slot, Watts};
 use rusqlite::{Connection, params};
 
 /// Schema migrations, applied in order; `PRAGMA user_version` counts how many ran.
-const MIGRATIONS: &[&str] = &[r"
+const MIGRATIONS: &[&str] = &[
+    r"
     CREATE TABLE slot_measurements (
         slot_start            INTEGER PRIMARY KEY, -- unix seconds, UTC, quarter-hour aligned
         covered_seconds       REAL NOT NULL,       -- seconds of the slot backed by samples
@@ -47,10 +50,56 @@ const MIGRATIONS: &[&str] = &[r"
         sum_voltage REAL NOT NULL,
         PRIMARY KEY (day, bin)
     ) STRICT;
-"];
+",
+    r"
+    CREATE TABLE prices (
+        slot_start  INTEGER PRIMARY KEY, -- unix seconds, UTC
+        eur_per_mwh REAL NOT NULL,       -- day-ahead spot price
+        is_final    INTEGER NOT NULL,    -- 0 while the exchange marks it preliminary
+        source      TEXT NOT NULL,
+        fetched_at  INTEGER NOT NULL
+    ) STRICT;
+",
+    r"
+    -- Every plan, with the forecasts it was made from. Doubles as the archive
+    -- for judging forecast accuracy per lead time.
+    CREATE TABLE plans (
+        planned_at    INTEGER NOT NULL, -- unix seconds
+        slot_start    INTEGER NOT NULL,
+        load_w        REAL NOT NULL,    -- forecast
+        pv_w          REAL NOT NULL,    -- forecast, if PV is on
+        buy           REAL NOT NULL,    -- €/kWh
+        sell          REAL NOT NULL,
+        estimated     INTEGER NOT NULL, -- price is an estimate
+        battery_ac_w  REAL NOT NULL,    -- planned, positive = charging
+        grid_w        REAL NOT NULL,    -- planned, positive = import
+        pv_on         INTEGER NOT NULL,
+        soc_end       REAL NOT NULL,
+        stored_value  REAL NOT NULL,    -- €/kWh of the last stored kWh
+        PRIMARY KEY (planned_at, slot_start)
+    ) STRICT;
+",
+];
 
 pub struct Store {
     conn: Connection,
+}
+
+/// One recorded slot, with what was planned and forecast for it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistorySlot {
+    pub slot: Slot,
+    /// Measured means over the slot.
+    pub grid: Watts,
+    pub load: Watts,
+    pub pv: Watts,
+    pub soc_end: f64,
+    /// The ESS setpoint in effect (whoever set it; DAO during the rollout).
+    pub setpoint: Option<Watts>,
+    /// dess-oxide's plan for the slot, made when it started.
+    pub planned_grid: Option<Watts>,
+    pub forecast_load: Option<Watts>,
+    pub forecast_pv: Option<Watts>,
 }
 
 impl Store {
@@ -133,6 +182,167 @@ impl Store {
         Ok(())
     }
 
+    /// Stores spot prices in €/MWh, replacing earlier values for the same slots.
+    pub fn save_prices(
+        &mut self,
+        prices: &[(Slot, f64)],
+        is_final: bool,
+        source: &str,
+        now_unix: i64,
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert =
+                tx.prepare_cached("INSERT OR REPLACE INTO prices VALUES (?1, ?2, ?3, ?4, ?5)")?;
+            for (slot, price) in prices {
+                insert.execute(params![
+                    slot.start_unix(),
+                    price,
+                    is_final,
+                    source,
+                    now_unix
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Spot prices for `[from, until)`.
+    pub fn prices(&self, from: Slot, until: Slot) -> anyhow::Result<BTreeMap<Slot, EurPerKwh>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, eur_per_mwh FROM prices WHERE slot_start >= ?1 AND slot_start < ?2",
+        )?;
+        let rows = query.query_map([from.start_unix(), until.start_unix()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut prices = BTreeMap::new();
+        for row in rows {
+            let (start, price) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                prices.insert(slot, EurPerKwh::from_eur_per_mwh(price));
+            }
+        }
+        Ok(prices)
+    }
+
+    /// How many final prices are stored for `[from, until)`.
+    pub fn final_price_count(&self, from: Slot, until: Slot) -> anyhow::Result<usize> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*) FROM prices WHERE slot_start >= ?1 AND slot_start < ?2 AND is_final",
+            [from.start_unix(), until.start_unix()],
+            |row| row.get(0),
+        )?;
+        Ok(usize::try_from(count)?)
+    }
+
+    /// Mean power of all loads per recorded slot since `from`, for slots with
+    /// at least half their time covered.
+    pub fn load_history(&self, from: Slot) -> anyhow::Result<Vec<(Slot, Watts)>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT slot_start, (load_out_wh + load_in_wh) * 3600.0 / covered_seconds
+             FROM slot_measurements WHERE slot_start >= ?1 AND covered_seconds >= 450 ORDER BY slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, f64>(1)?))
+        })?;
+        let mut history = Vec::new();
+        for row in rows {
+            let (start, watts) = row?;
+            if let Some(slot) = Slot::from_start_unix(start) {
+                history.push((slot, Watts(watts)));
+            }
+        }
+        Ok(history)
+    }
+
+    /// Stores a plan and the forecasts it was made from.
+    pub fn save_plan(
+        &mut self,
+        planned_at: i64,
+        slots: &[PlannedSlot],
+        forecasts: &[SlotForecast],
+    ) -> anyhow::Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare_cached(
+                "INSERT OR REPLACE INTO plans VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            )?;
+            for (s, f) in slots.iter().zip(forecasts) {
+                insert.execute(params![
+                    planned_at,
+                    s.slot.start_unix(),
+                    f.load.0,
+                    f.pv.0,
+                    s.prices.buy.0,
+                    s.prices.sell.0,
+                    s.estimated_price,
+                    s.battery_ac.0,
+                    s.grid.0,
+                    s.pv_on,
+                    s.soc_end,
+                    s.stored_energy_value.0,
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Deletes plans made before `keep_since` (unix seconds), except each
+    /// plan's first slot, which records what was decided for that slot.
+    pub fn prune_plans(&self, keep_since: i64) -> anyhow::Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM plans WHERE planned_at < ?1 AND slot_start > planned_at",
+            [keep_since],
+        )?)
+    }
+
+    /// Recorded slots since `from` (at least a minute covered), joined with the
+    /// plan made at the start of each.
+    pub fn history(&self, from: Slot) -> anyhow::Result<Vec<HistorySlot>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT m.slot_start,
+                    (m.grid_import_wh - m.grid_export_wh) * 3600.0 / m.covered_seconds,
+                    (m.load_out_wh + m.load_in_wh) * 3600.0 / m.covered_seconds,
+                    (m.pv_ac_wh + m.pv_dc_wh) * 3600.0 / m.covered_seconds,
+                    m.soc_end,
+                    CASE WHEN m.setpoint_seconds > 0 THEN m.setpoint_integral_wh * 3600.0 / m.setpoint_seconds END,
+                    p.grid_w, p.load_w, p.pv_w
+             FROM slot_measurements m
+             LEFT JOIN (SELECT slot_start, grid_w, load_w, pv_w, min(planned_at)
+                        FROM plans WHERE slot_start <= planned_at GROUP BY slot_start) p
+               USING (slot_start)
+             WHERE m.slot_start >= ?1 AND m.covered_seconds > 60
+             ORDER BY m.slot_start",
+        )?;
+        let rows = query.query_map([from.start_unix()], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                HistorySlot {
+                    slot: Slot::containing(jiff::Timestamp::UNIX_EPOCH),
+                    grid: Watts(row.get(1)?),
+                    load: Watts(row.get(2)?),
+                    pv: Watts(row.get(3)?),
+                    soc_end: row.get(4)?,
+                    setpoint: row.get::<_, Option<f64>>(5)?.map(Watts),
+                    planned_grid: row.get::<_, Option<f64>>(6)?.map(Watts),
+                    forecast_load: row.get::<_, Option<f64>>(7)?.map(Watts),
+                    forecast_pv: row.get::<_, Option<f64>>(8)?.map(Watts),
+                },
+            ))
+        })?;
+        let mut history = Vec::new();
+        for row in rows {
+            let (start, mut slot) = row?;
+            if let Some(s) = Slot::from_start_unix(start) {
+                slot.slot = s;
+                history.push(slot);
+            }
+        }
+        Ok(history)
+    }
+
     /// Adds steady-state conversion samples to the day's bins.
     pub fn save_efficiency_bins(
         &mut self,
@@ -175,7 +385,6 @@ impl Store {
 mod tests {
     use super::*;
     use dess_core::record::{Recorder, Sample};
-    use dess_core::{Slot, Watts};
     use jiff::{SignedDuration, Timestamp};
 
     fn record(start: &str, seconds: i64) -> SlotRecord {
@@ -232,5 +441,41 @@ mod tests {
             .unwrap();
         assert_eq!(usize::try_from(version).unwrap(), MIGRATIONS.len());
         assert!(Store::init(conn).is_ok());
+    }
+
+    #[test]
+    fn prices_round_trip_and_count_finals() {
+        let mut store = Store::in_memory().unwrap();
+        let first = Slot::containing("2026-09-27T12:00:00Z".parse().unwrap());
+        let second = first.next();
+        store
+            .save_prices(&[(first, 100.0)], false, "test", 0)
+            .unwrap();
+        store
+            .save_prices(&[(first, 110.0), (second, 90.0)], true, "test", 1)
+            .unwrap();
+        let prices = store.prices(first, second.next()).unwrap();
+        assert_eq!(prices[&first], EurPerKwh(0.11));
+        assert_eq!(store.final_price_count(first, second.next()).unwrap(), 2);
+    }
+
+    #[test]
+    fn pruning_keeps_the_decided_slot() {
+        let store = Store::in_memory().unwrap();
+        for (planned_at, slot_start) in [(900, 900), (900, 1800), (1800, 1800)] {
+            store
+                .conn
+                .execute(
+                    "INSERT INTO plans VALUES (?1, ?2, 0, 0, 0, 0, 0, 0, 0, 1, 50, 0)",
+                    [planned_at, slot_start],
+                )
+                .unwrap();
+        }
+        assert_eq!(store.prune_plans(1800).unwrap(), 1);
+        let left: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM plans", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(left, 2);
     }
 }

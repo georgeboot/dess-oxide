@@ -9,15 +9,15 @@ system's own history. It talks to the Cerbo GX directly over the Cerbo's
 local MQTT, and ships as a Home Assistant app. The full design is in
 [docs/PLAN.md](docs/PLAN.md).
 
-**Status: M0.** For now it records, read-only.
+**Status: M1, shadow mode.** It records, fetches prices, forecasts and plans, and shows it all on its own page. It never writes to the Victron yet.
 
 ## Layout
 
 | Path | What |
 |---|---|
-| `crates/dess-core` | Pure domain logic: 15-minute slots, units, energy recording, efficiency sampling |
+| `crates/dess-core` | Pure domain logic: slots, units, recording, efficiency sampling, tariff, price horizon, baseline forecasts, the DP planner |
 | `crates/dess-victron` | Read-only client for the GX device's MQTT, typed readings, `probe` report |
-| `crates/dess-oxide` | The binary: config, `SQLite` store, `probe` and `run` commands |
+| `crates/dess-oxide` | The binary: config, SQLite store, Nord Pool and Open-Meteo clients, the service, the web page |
 | `dess_oxide/` | The Home Assistant app definition |
 
 ## Usage
@@ -29,10 +29,17 @@ sends MQTT read requests.
 cargo run -- probe --host 192.168.1.20
 ```
 
-Record energy flows into `data/dess.db`. Also read-only.
+Print the plan the optimiser would follow right now. Read-only.
 
 ```bash
-cp dess.example.toml dess.toml   # then set the host
+cp dess.example.toml dess.toml   # then set the host, tariff, location and PV arrays
+cargo run -- plan --config dess.toml --data-dir data
+```
+
+Run the service in shadow mode: it records, plans every quarter hour, and
+serves its page on http://127.0.0.1:8099. Also read-only.
+
+```bash
 cargo run -- run --config dess.toml --data-dir data
 ```
 

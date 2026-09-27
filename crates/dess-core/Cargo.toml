@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 jiff.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 proptest.workspace = true

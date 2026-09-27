@@ -2,8 +2,51 @@
 #   cp dess.example.toml dess.toml
 #   cargo run -- run --config dess.toml --data-dir data
 # The Home Assistant app uses the same schema in /data/options.json.
+# Units: kW, kWh, €/kWh (excluding VAT), degrees.
 
 [victron]
 host = "192.168.1.20"   # the GX device; "MQTT on LAN" must be enabled
 # port = 1883
 # portal_id = "0123456789ab"   # discovered automatically when not set
+pv_relay = 2                  # Cerbo relay driving a PV contactor (function: Manual)
+pv_relay_energized = "pv_off" # what a closed relay does
+
+[grid]
+max_import_kw = 17
+max_export_kw = 17
+
+[battery]
+# capacity_kwh = 32            # default: Venus's Dynamic ESS capacity, or the BMS's Ah
+wear_cost_eur_per_kwh = 0.0
+reserve_soc = 0                # kept on top of ESS's minimum SoC
+
+[prices]
+area = "NL"
+
+# Each component changes on the given dates; the latest one on or before a day applies.
+[tariff]
+vat = [{ from = "2023-01-01", value = 0.21 }]
+energy_tax = [{ from = "2025-01-01", value = 0.10154 }, { from = "2026-01-01", value = 0.09161 }]
+markup_buy = [{ from = "2025-12-14", value = 0.01504 }]
+markup_sell = [{ from = "2025-12-14", value = 0.01504 }]
+net_metering_until = "2026-12-31"
+# Over the netting period, do exports exceed imports? Then the energy tax
+# isn't at stake on the marginal kWh and exports earn only the feed-in rate.
+net_exporter = false
+vat_on_export = false
+
+# Home Assistant's location is used when running as an app.
+# [location]
+# latitude = 52.09
+# longitude = 5.12
+
+# Optional: PV arrays as a starting point for the forecast; M2 learns the real values.
+[[pv]]
+kwp = 5.59
+tilt = 33
+azimuth = 193   # compass degrees, 180 = south
+
+[[pv]]
+kwp = 3.44
+tilt = 9
+azimuth = 193

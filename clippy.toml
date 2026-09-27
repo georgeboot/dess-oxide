@@ -1,0 +1,2 @@
+# Domain terms that are not code identifiers.
+doc-valid-idents = ["SoC", "kWh", "MWh", "kWp", "MultiPlus", "DVCC", "..", "SQLite"]

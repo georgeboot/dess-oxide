@@ -90,6 +90,67 @@ pub fn sample(snapshot: &Snapshot, at: Timestamp) -> Result<Sample, ReadingError
     })
 }
 
+/// What the planner needs to know about the battery and inverters.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BatteryInfo {
+    /// Usable capacity: Venus's Dynamic ESS capacity setting, or the BMS's
+    /// installed Ah at nominal LFP voltage.
+    pub capacity_wh: Option<f64>,
+    /// Number of inverter/charger units on the VE.Bus.
+    pub inverter_units: u32,
+    /// BMS charge and discharge current limits (CCL/DCL), A.
+    pub max_charge_current: Option<f64>,
+    pub max_discharge_current: Option<f64>,
+    pub voltage: Option<f64>,
+    /// The minimum SoC ESS enforces right now, %.
+    pub active_min_soc: Option<f64>,
+}
+
+pub fn battery_info(snapshot: &Snapshot) -> BatteryInfo {
+    // "com.victronenergy.battery/512"
+    let instance = snapshot
+        .text("system/0/ActiveBatteryService")
+        .and_then(|service| service.rsplit_once('/'))
+        .map(|(_, instance)| instance.to_owned());
+    let battery = |path: &str| {
+        instance
+            .as_ref()
+            .and_then(|i| snapshot.number(&format!("battery/{i}/{path}")))
+    };
+    let from_bms = || {
+        let ah = battery("InstalledCapacity")?;
+        // LFP: about 3.5 V per cell at the charge voltage, 3.2 V nominal.
+        let cells = (battery("Info/MaxChargeVoltage")? / 3.5).round();
+        Some(ah * cells * 3.2)
+    };
+    let capacity_wh = snapshot
+        .number("settings/0/Settings/DynamicEss/BatteryCapacity")
+        .filter(|kwh| *kwh > 0.0)
+        .map(|kwh| kwh * 1000.0)
+        .or_else(from_bms);
+    let vebus = snapshot
+        .number("system/0/VebusInstance")
+        .map(|i| format!("vebus/{i}"));
+    let inverter_units = vebus.map_or(1, |vebus| {
+        (0..32)
+            .take_while(|n| {
+                snapshot
+                    .get(&format!("{vebus}/Devices/{n}/ProductId"))
+                    .is_some()
+            })
+            .count()
+            .max(1) as u32
+    });
+    BatteryInfo {
+        capacity_wh,
+        inverter_units,
+        max_charge_current: battery("Info/MaxChargeCurrent"),
+        max_discharge_current: battery("Info/MaxDischargeCurrent"),
+        voltage: snapshot.number("system/0/Dc/Battery/Voltage"),
+        active_min_soc: snapshot.number("system/0/Control/ActiveSocLimit"),
+    }
+}
+
 fn missing(key: &str) -> ReadingError {
     ReadingError::Missing(key.to_owned())
 }
@@ -242,5 +303,31 @@ mod tests {
         values.push(("system/0/Ac/ActiveIn/Source", n(240.0)));
         let s = sample(&snapshot(&values), Timestamp::UNIX_EPOCH).unwrap();
         assert!(!s.grid_connected);
+    }
+
+    #[test]
+    fn battery_info_prefers_the_dess_capacity_setting() {
+        let mut values = georges_cerbo();
+        values.extend([
+            (
+                "system/0/ActiveBatteryService",
+                Value::Text("com.victronenergy.battery/512".into()),
+            ),
+            ("battery/512/InstalledCapacity", n(628.0)),
+            ("battery/512/Info/MaxChargeVoltage", n(56.8)),
+            ("battery/512/Info/MaxChargeCurrent", n(247.0)),
+            ("vebus/276/Devices/0/ProductId", n(9763.0)),
+            ("vebus/276/Devices/1/ProductId", n(9763.0)),
+            ("vebus/276/Devices/2/ProductId", n(9763.0)),
+            ("system/0/Control/ActiveSocLimit", n(5.0)),
+        ]);
+        let info = battery_info(&snapshot(&values));
+        assert_eq!(info.inverter_units, 3);
+        assert_eq!(info.max_charge_current, Some(247.0));
+        // 628 Ah × 16 cells × 3.2 V without the DESS setting…
+        assert!((info.capacity_wh.unwrap() - 32_153.6).abs() < 1e-6);
+        // …and the setting when it's there.
+        values.push(("settings/0/Settings/DynamicEss/BatteryCapacity", n(32.0)));
+        assert_eq!(battery_info(&snapshot(&values)).capacity_wh, Some(32_000.0));
     }
 }

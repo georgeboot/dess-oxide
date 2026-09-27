@@ -9,10 +9,14 @@ publish = false
 
 [dependencies]
 anyhow.workspace = true
+axum.workspace = true
 clap.workspace = true
 dess-core.workspace = true
 dess-victron.workspace = true
 jiff.workspace = true
+maud.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true

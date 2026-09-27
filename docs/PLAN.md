@@ -1,6 +1,6 @@
 # dess-oxide: design and plan
 
-Status (2026-09-27): M0 built. The workspace, the read-only Venus MQTT client, `probe`, the recorder and the app packaging exist; the app has not been released yet.
+Status (2026-09-27): M0 released as v0.1.0 and running at George's site. M1 mostly built: prices, tariff, the DP planner in shadow mode, baseline forecasts and the dess-oxide page.
 
 dess-oxide runs a Victron ESS against Dutch 15-minute day-ahead prices. Every quarter hour it:
 
@@ -8,7 +8,7 @@ dess-oxide runs a Victron ESS against Dutch 15-minute day-ahead prices. Every qu
 2. computes the cheapest battery schedule over the known price horizon,
 3. executes it directly on the Cerbo GX over the Cerbo's local MQTT, with a one-second control loop.
 
-It ships as a Home Assistant app (formerly "add-on"). HA is its UI: it gets entities for status, the plan, forecasts and a few controls. HA is not in the control path.
+It ships as a Home Assistant app (formerly "add-on"). Its UI is its own page in the HA sidebar (ingress): the plan, forecasts, accuracy and controls. It creates no HA entities unless asked to (§17), and HA is not in the control path.
 
 It replaces the Day Ahead Optimizer ([DAO](https://github.com/corneel27/day-ahead)) and the HA helper and automation chain that currently executes DAO's output.
 
@@ -17,7 +17,7 @@ It replaces the Day Ahead Optimizer ([DAO](https://github.com/corneel27/day-ahea
 ## 1. Goals
 
 - **Minimise the electricity bill.** That is import cost minus export revenue, plus battery wear, for a three-phase Victron ESS with AC-coupled PV, a heat pump and, at one site, an EV.
-- **Talk to the Victron system directly** over the Cerbo's local MQTT. HA is only used for UI, a few toggles and optional extra sensors.
+- **Talk to the Victron system directly** over the Cerbo's local MQTT. HA hosts the UI page and provides optional extra sensors (weather station, heat pump meter).
 - **Need almost no configuration.** Anything that can be measured is learned.
 - **Be safe to leave running.** Crashes, stale data and missing prices must lead to bounded, predictable behaviour.
 - **Be provably better.** Every change to a model or the planner is judged by a backtest on our own history.
@@ -88,7 +88,7 @@ What DAO gets right, and we keep:
 - weather forecasts (KNMI Harmonie via Open-Meteo), with optional WS90 observations
 - forecasters for PV, base load and heat pump, plus battery and inverter identification
 - a DP planner with PV curtailment and outage reserve
-- HA entities via MQTT discovery; the HA WebSocket for input sensors and history bootstrap
+- the dess-oxide page (HA ingress) for plan, forecasts and controls; the HA WebSocket for input sensors and history bootstrap; optional MQTT entities
 - shadow mode, a backtester, and the `probe` CLI
 
 **Later, maybe:**
@@ -231,7 +231,7 @@ Location (lat/lon/elevation) and time zone come from HA's core config. Where eac
 | `scheduler` | gone; event-driven |
 | `database_ha`, `database_da` | HA WebSocket; own SQLite in `/data` |
 | `graphics`, `report`, `notifications`, `dashboard` | HA |
-| `machines` | `sensor.dess_cheapest_start` (§14.4) |
+| `machines` | a "cheapest start" time on the page, optionally an HA entity for automations (§14.4) |
 | `meteoserver_key`, `tibber` | not needed |
 
 ## 9. Victron interface
@@ -557,7 +557,7 @@ If multiple storage units ever arrive, for example with EV smart charging, the p
 
 ### 14.4 Cheapest start (replaces DAO's `machines`)
 
-`sensor.dess_cheapest_start` gives the start time of a flexible run (default 3 h at about 1 kWh, within a 20:00–08:00 window; both configurable).
+"Cheapest start" gives the start time of a flexible run (default 3 h at about 1 kWh, within a 20:00–08:00 window; both configurable).
 
 - It's computed by re-running the DP with that extra load added at each candidate start, which takes about 40 runs × a few ms.
 - So it reflects the *true* marginal cost, battery and PV included, not just the spot price.
@@ -622,7 +622,8 @@ A volatile override stays in force until it is released or the Cerbo reboots. Vi
 
 | Situation | Behaviour |
 |---|---|
-| Fresh install | shadow mode: plan and publish, no writes |
+| Fresh install | shadow mode: plan and publish, no writes. Writing needs **two locks**: `control: true` in the app options (which no HA automation can flip) and the control toggle on the dess-oxide page |
+| Another controller writes the ESS setpoint | refuse to take control, and drop back to shadow if already active. This catches a DAO chain (or VRM DESS) that is still running. `probe` already detects these writes |
 | Control switched off, or SIGTERM (app update, HA restart, backup) | release the override, which means plain ESS; relay to PV on; restore minimum SoC |
 | Task panic | the supervisor restarts the task. A panic hook releases the override if the whole process goes down |
 | Inputs stale for > 10 s, or no price for the current slot | release the override: plain ESS |
@@ -648,10 +649,10 @@ Kept behind the same trait.
 
 ## 16. Outage preparedness
 
-**HA controls:**
-- `switch.dess_outage_expected`
-- `datetime.dess_outage_start` (defaults to tomorrow 08:00 when the switch is turned on without a time)
-- `number.dess_outage_duration` (hours, default 4)
+**Controls** (on the dess-oxide page; optionally mirrored as HA entities, §17):
+- outage expected: on/off
+- outage start (defaults to tomorrow 08:00 when switched on without a time)
+- outage duration (hours, default 4)
 
 **Behaviour:**
 - **Reserve:** `R = Σ_window (P90 base load + P90 backed-up heat pump − P10 PV) / η_discharge + ESS minimum SoC`, capped at capacity. The EV is not backed up and is left out.
@@ -661,54 +662,43 @@ Kept behind the same trait.
 - **Backstop:** once the plan reaches R, Victron's ESS minimum SoC (`BatteryLife/MinimumSocLimit`) is raised to R. Plain ESS, our setpoint override and the DESS controller all honour it, so the Victron keeps the reserve even if dess-oxide or HA dies. The minimum is restored after the window.
 - **PV:** the relay is forced on during the window. The Victron can then throttle the AC-coupled PV while islanded (frequency shifting), and PV can recharge the battery.
 - **Grid-loss detection:**
-  - When the active input reads 240 (disconnected) or VE.Bus raises its grid-lost alarm, `binary_sensor.dess_grid` turns off and control drops to "island": PV on, no other actions.
-  - A notification can come from a plain HA automation. This also covers outages nobody announced.
-- **Always-on reserve:** `number.dess_reserve_soc` (default from config).
+  - When the active input reads 240 (disconnected) or VE.Bus raises its grid-lost alarm, the page shows it (and `binary_sensor.dess_grid`, if enabled, turns off) and control drops to "island": PV on, no other actions.
+  - With the optional entities enabled, an HA automation can send a notification. This also covers outages nobody announced.
+- **Always-on reserve:** a reserve SoC on the page (default from config).
 - **Later:** automatic triggers, such as KNMI code orange/red warnings or grid-operator planned-outage notices.
 
-## 17. Home Assistant entities
+## 17. Home Assistant integration
 
-The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/config`) for one device, "dess-oxide".
-- Config messages are retained.
-- Availability runs through a last-will `offline` message.
-- Discovery is republished whenever `homeassistant/status` goes `online`.
-- MQTT credentials come from the Supervisor (`services: mqtt:need`).
-- `datetime` entities need HA 2026.5 or later.
+George doesn't want HA cluttered with entities and their recorder history. So dess-oxide's UI is its own page, and HA entities are opt-in.
 
-**Status and plan**
+### 17.1 The dess-oxide page (default)
 
-| Entity | Content |
-|---|---|
-| `sensor.dess_status` | shadow / active / fallback / island / error. Attributes: last Victron update, last price fetch, last plan, model states |
-| `sensor.dess_mode` | current slot action: self-consume / charge / hold / discharge / export PV |
-| `sensor.dess_battery_setpoint` | planned battery AC power, W |
-| `sensor.dess_target_soc` | planned SoC at slot end, % |
-| `sensor.dess_price_buy`, `sensor.dess_price_sell` | current €/kWh |
-| `sensor.dess_plan` | 15-minute plan in attributes (time, buy, sell, SoC, battery, grid, PV, load, HP) for an ApexCharts card. Excluded from the recorder; split per series if it approaches 16 KB |
-| `sensor.dess_cheapest_start` | timestamp (§14.4) |
-| `binary_sensor.dess_pv_curtailed`, `binary_sensor.dess_grid` | relay state; grid present |
+It's served through HA ingress, so it opens from the HA sidebar with HA's own login. There's no exposed port. It has:
+- **Plan:**
+  - a chart of prices, SoC, battery power, PV, load and heat pump over the horizon;
+  - the current slot's decision, and why it was made.
+- **Forecasts:** PV, load and heat pump for today and tomorrow, and their accuracy per lead time (§12.7).
+- **Money:** today's and this month's cost, and savings against the baselines. During the rollout (§18), the side-by-side comparison with DAO goes here too.
+- **Learned values:** the efficiency curve, usable capacity, standby loss, PV orientation, and the heat pump parameters.
+- **Status:** shadow / active / fallback / island / error; the last Victron update, price fetch and plan; the probe findings.
+- **Controls:**
+  - the outage window (§16)
+  - reserve SoC
+  - a manual override (auto / self-consumption / hold / charge / discharge), which reverts at midnight
+  - replan now
+  - control on/off. This works only when the app option `control: true` is also set: the two locks of §15.3.
 
-**Forecasts and learned values**
+It's server-rendered by axum, with a vendored chart library and small forms for the controls. There's no JS build step. Control state is stored in SQLite, so it survives restarts.
 
-| Entity | Content |
-|---|---|
-| `sensor.dess_pv_today` / `_tomorrow`, `sensor.dess_load_today` / `_tomorrow`, `sensor.dess_heatpump_today` / `_tomorrow` | kWh |
-| `sensor.dess_battery_capacity`, `sensor.dess_roundtrip_efficiency`, `sensor.dess_idle_loss` | learned battery and inverter values |
-| `sensor.dess_pv_effective_kwp` | attributes: orientation per virtual array, temperature coefficient |
-| `sensor.dess_forecast_error_{pv,load,heatpump}` | 7-day MAE |
-| `sensor.dess_cost_today`, `sensor.dess_savings_today`, `sensor.dess_savings_month` | vs plain ESS self-consumption |
+### 17.2 Optional HA entities
 
-**Controls**
-
-| Entity | Effect |
-|---|---|
-| `switch.dess_control` | Off = shadow mode: plan and publish, never write to the Victron. **Off by default on install.** |
-| `switch.dess_outage_expected`, `datetime.dess_outage_start`, `number.dess_outage_duration` | §16 |
-| `number.dess_reserve_soc` | always-on reserve |
-| `select.dess_override` | auto / self-consumption / hold / charge / discharge. Reverts to auto at midnight |
-| `button.dess_replan` | replan now |
-
-`docs/dashboard.yaml` will ship a ready-made dashboard: an ApexCharts card with prices, SoC, battery and PV plan, plus the controls.
+These are off by default, enabled with an app option. They're for automations that need dess-oxide's state, such as starting the dishwasher at `cheapest_start` or a notification when the grid is lost.
+- **A small fixed set:** status, current mode, SoC target, `cheapest_start`, grid present, the outage switch and start time, and today's savings.
+- **Low update rate:** at most every 15 minutes, or when a value changes. Nothing updates every second.
+- **No large attributes:** the plan itself stays on the page.
+- **Delivery:** MQTT device-based discovery (`homeassistant/device/dess_oxide/config`) on the broker HA's MQTT integration already uses. At George's site that's the Cerbo; no Mosquitto app is needed.
+  - It's a separate connection from the Victron client, and it can only publish under `homeassistant/…` and `dess_oxide/…`.
+  - Discovery is republished on every connect and whenever HA announces itself on `homeassistant/status`, so it doesn't depend on the broker keeping retained messages.
 
 ## 18. Testing, simulation and backtesting
 
@@ -728,9 +718,17 @@ The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/confi
   - Replays history slot by slot, with forecasts as they were available at the time (historical forecast API).
   - Reports realised cost against the three baselines in §12.7, plus forecast errors.
   - A fixed fixture runs in CI as a regression gate: one anonymised month from each site, with the expected numbers checked in.
-- **Rollout:**
-  1. Shadow mode first at George's site, compared day by day with what DAO did.
-  2. Then control, with DAO's Victron automations disabled.
+- **Rollout alongside DAO** (at least a week at George's site before any writes):
+  1. dess-oxide runs in shadow mode next to DAO. DAO keeps control.
+  2. Every slot, compare:
+     - **Forecasts:** PV, base load and heat pump against actuals, per lead-time bucket (§12.7).
+     - **Decisions:** dess-oxide's planned setpoint against the setpoint DAO actually ran. The recorder logs the setpoint in effect for every slot from M0 on.
+     - **Cost:** the actual cost under DAO against a simulation of dess-oxide's plan, replayed against the same measured loads, PV and prices with the learned battery model.
+  3. A daily comparison goes to the dess-oxide page.
+  4. Handover, once George is satisfied:
+     - disable DAO's Victron automations,
+     - set `control: true` in the app options,
+     - turn control on from the dess-oxide page.
 - **CI:** `cargo fmt --check`, `clippy -D warnings`, tests, the backtest gate, and the multi-arch image build.
 
 ## 19. Packaging and deployment
@@ -740,7 +738,6 @@ The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/confi
   - `image: ghcr.io/<owner>/dess-oxide`, a multi-arch manifest
   - `ingress: true` on port 8099
   - `homeassistant_api: true`
-  - `services: [mqtt:need]`
   - `init: false`
   - `options`/`schema` for §8
 - **Image:**
@@ -751,8 +748,7 @@ The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/confi
 - **Distribution:** `repository.yaml` at the repo root, so both sites add the repo URL in HA and install the same app.
 - **Web:**
   - axum on the ingress port, accepting only 172.30.32.2 and honouring `X-Ingress-Path`.
-  - One page: the plan chart, forecast accuracy and learned parameters.
-  - Server-rendered, with a vendored chart library (uPlot) and no JS build step.
+  - The dess-oxide page (§17.1). It's server-rendered, with a vendored chart library (uPlot) and no JS build step.
 - **Standalone:** `dess-oxide run --config dess.toml` with an HA URL, a long-lived token and MQTT settings. Used for development from a laptop against the real Cerbo, in shadow mode.
 
 ## 20. Milestones
@@ -762,14 +758,17 @@ The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/confi
 - [x] `dess-victron` reads and `probe` (tested read-only against both Cerbos)
 - [x] recorder to SQLite, including efficiency bins
 - [x] app packaging and CI
-- [ ] install read-only at both sites (needs the GitHub repo and a `v0.1.0` release)
+- [x] released as v0.1.0; installed at George's site (brother's pending)
 
 **M1: Prices, tariff, planner in shadow mode.**
-- Nord Pool and ENTSO-E, tariff
-- DP planner on baseline forecasts
-- MQTT entities and the plan page
-- `import` backfill
-- backtest harness
+- [x] Nord Pool prices; ENTSO-E fallback still to do
+- [x] date-effective tariff, including the net-exporter case during net metering
+- [x] DP planner (a 48-hour plan takes about 40 ms)
+- [x] baseline forecasts: load from recorded history, PV from Open-Meteo GTI
+- [x] shadow planning every slot, with every plan stored
+- [x] the dess-oxide page: plan, last 24 hours against DAO's setpoint, forecast errors
+- [ ] `import` backfill from HA statistics
+- [ ] backtest harness
 
 **M2: Learned models.**
 - battery and inverter identification
@@ -779,7 +778,8 @@ The app uses MQTT device-based discovery (`homeassistant/device/dess_oxide/confi
 **M3: Control.**
 - executor with fail-safe, relay curtailment, overrides
 - outage mode with the Victron minimum-SoC backstop
-- takes over from DAO at George's site after a shadow period
+- the "another controller is active" interlock and the two-lock enable
+- shadow-mode comparison against DAO (forecasts, decisions, cost), then handover at George's site (§18)
 
 **M4: Brother's site and polish.**
 - EV awareness

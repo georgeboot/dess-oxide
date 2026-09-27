@@ -1,11 +1,18 @@
+mod chart;
 mod config;
+mod homeassistant;
+mod nordpool;
+mod openmeteo;
+mod planning;
 mod run;
 mod store;
+mod web;
 
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use anyhow::Context;
 use clap::{Parser, Subcommand};
 use dess_victron::probe::ProbeReport;
 use dess_victron::{Venus, VenusOptions};
@@ -40,6 +47,18 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print the plan the optimiser would follow right now. Read-only.
+    Plan {
+        /// `options.json` (Home Assistant app) or a TOML file.
+        #[arg(long, default_value = "dess.toml")]
+        config: PathBuf,
+        /// Where the database lives (prices and recorded history).
+        #[arg(long, default_value = "data")]
+        data_dir: PathBuf,
+        /// How many slots to print.
+        #[arg(long, default_value_t = 32)]
+        rows: usize,
+    },
     /// Run the service: record the system's energy flows. Read-only for now.
     Run {
         /// `options.json` (Home Assistant app) or a TOML file.
@@ -48,6 +67,9 @@ enum Command {
         /// Where the database lives.
         #[arg(long, default_value = "data")]
         data_dir: PathBuf,
+        /// Address for the web page (Home Assistant ingress uses port 8099).
+        #[arg(long, default_value = "127.0.0.1:8099")]
+        listen: std::net::SocketAddr,
     },
 }
 
@@ -61,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
         .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
+
+    // ring as the TLS crypto provider (see the rustls dependency).
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     match Cli::parse().command {
         Command::Probe {
@@ -81,7 +106,16 @@ async fn main() -> anyhow::Result<()> {
             )
             .await
         }
-        Command::Run { config, data_dir } => run::run(Config::load(&config)?, &data_dir).await,
+        Command::Plan {
+            config,
+            data_dir,
+            rows,
+        } => plan(Config::load(&config)?, &data_dir, rows).await,
+        Command::Run {
+            config,
+            data_dir,
+            listen,
+        } => run::run(Config::load(&config)?, &data_dir, listen).await,
     }
 }
 
@@ -104,5 +138,70 @@ async fn probe(options: VenusOptions, watch: Duration, json: bool) -> anyhow::Re
     } else {
         print!("{report}");
     }
+    Ok(())
+}
+
+/// The HTTP client for prices and weather.
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent(concat!(
+            "dess-oxide/",
+            env!("CARGO_PKG_VERSION"),
+            " (+https://github.com/georgeboot/dess-oxide)"
+        ))
+        .timeout(Duration::from_secs(30))
+        .build()?)
+}
+
+async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow::Result<()> {
+    let tariff = config
+        .tariff
+        .as_ref()
+        .context("planning needs a [tariff] section")?
+        .to_tariff()?;
+    std::fs::create_dir_all(data_dir)?;
+    let store = std::sync::Mutex::new(store::Store::open(&data_dir.join("dess.db"))?);
+    let client = http_client()?;
+    let now = Timestamp::now();
+
+    let nordpool = nordpool::NordPool::new(client.clone(), &config.prices.area);
+    planning::update_prices(&store, &nordpool, now, &tariff.time_zone).await?;
+    let pv = planning::pv_forecast(&client, &config).await;
+
+    let venus = Venus::connect(
+        VenusOptions {
+            host: config.victron.host.clone(),
+            port: config.victron.port,
+            portal_id: config.victron.portal_id.clone(),
+        },
+        Duration::from_secs(15),
+    )
+    .await?;
+    venus.full_publish(Duration::from_secs(30)).await?;
+    let started = Instant::now();
+    let view = venus.with_snapshot(|snapshot| {
+        planning::make_plan(
+            now,
+            snapshot,
+            &planning::lock(&store),
+            &config,
+            &tariff,
+            &pv,
+        )
+    })?;
+    let elapsed = started.elapsed();
+    venus.close().await;
+
+    println!(
+        "SoC {:.0} %, capacity {:.1} kWh, charge ≤ {:.1} kW, discharge ≤ {:.1} kW; planned in {elapsed:?}\n",
+        view.soc,
+        view.battery.capacity.0 / 1000.0,
+        view.battery.max_charge_ac.0 / 1000.0,
+        view.battery.max_discharge_ac.0 / 1000.0,
+    );
+    print!(
+        "{}",
+        planning::render(&view.plan, &view.forecasts, &tariff.time_zone, rows)
+    );
     Ok(())
 }

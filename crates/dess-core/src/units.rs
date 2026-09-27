@@ -43,6 +43,25 @@ impl WattHours {
     pub const ZERO: Self = Self(0.0);
 }
 
+/// A price or value per kWh, in euro.
+#[derive(Debug, Clone, Copy, Default, PartialEq, PartialOrd)]
+#[must_use]
+pub struct EurPerKwh(pub f64);
+
+impl EurPerKwh {
+    pub const ZERO: Self = Self(0.0);
+
+    /// Converts a market price in €/MWh.
+    pub fn from_eur_per_mwh(value: f64) -> Self {
+        Self(value / 1000.0)
+    }
+
+    /// The cost of `energy` at this price, in euro.
+    pub fn cost(self, energy: WattHours) -> f64 {
+        self.0 * energy.0 / 1000.0
+    }
+}
+
 macro_rules! impl_arith {
     ($t:ty) => {
         impl Add for $t {
@@ -78,6 +97,7 @@ macro_rules! impl_arith {
 
 impl_arith!(Watts);
 impl_arith!(WattHours);
+impl_arith!(EurPerKwh);
 
 #[cfg(test)]
 mod tests {

@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.90"
 repository = "https://github.com/georgeboot/dess-oxide"
@@ -13,11 +13,16 @@ dess-core = { path = "crates/dess-core" }
 dess-victron = { path = "crates/dess-victron" }
 
 anyhow = "1.0.104"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
 clap = { version = "4.6.7", features = ["derive"] }
-jiff = { version = "0.2.37", features = ["serde"] }
+jiff = { version = "0.2.37", features = ["serde", "tzdb-bundle-always"] }
+maud = "0.27.0"
 proptest = "1.11.0"
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls-no-provider", "json", "http2", "query"] }
 rumqttc = { version = "0.25.1", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+# ring instead of aws-lc-rs: no cmake/clang needed to build for musl.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 thiserror = "2.0.21"
@@ -39,6 +44,8 @@ cast_possible_truncation = "allow"
 cast_sign_loss = "allow"
 # Exact comparisons are intended where they appear (parsed values, tests).
 float_cmp = "allow"
+# Domain names like slot/spot and buy/sell are fine.
+similar_names = "allow"
 # Only lock poisoning, which is a bug elsewhere, can panic.
 missing_panics_doc = "allow"
 
