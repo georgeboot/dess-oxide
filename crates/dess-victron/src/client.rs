@@ -164,6 +164,23 @@ impl Venus {
         })
     }
 
+    pub(crate) fn client(&self) -> &AsyncClient {
+        &self.client
+    }
+
+    /// Asks the GX device to republish one value.
+    pub(crate) async fn request(&self, path: &str) -> Result<(), VenusError> {
+        self.client
+            .publish(
+                format!("R/{}/{path}", self.portal_id),
+                QoS::AtMostOnce,
+                false,
+                "",
+            )
+            .await?;
+        Ok(())
+    }
+
     /// Disconnects cleanly.
     pub async fn close(self) {
         self.shared.closing.store(true, Ordering::Relaxed);

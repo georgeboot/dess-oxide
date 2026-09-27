@@ -773,9 +773,13 @@ These are off by default, enabled with an app option. They're for automations th
 - [ ] backtest harness
 
 **M2: Learned models.**
-- battery and inverter identification
-- PV, base load, heat pump (with the OpenAmber DHW schedule)
-- accuracy tracking and the promotion gate
+- [x] battery and inverter losses from steady-state samples (standby + quadratic curve per direction)
+- [x] PV (burn): effective kWp, tilt and azimuth per array, inverter cap
+- [x] heat pump (burn): balance temperature, thermal lag, wind, solar, COP(T), humidity-driven frost, hot water profile
+- [x] base load (burn MLP) with Dutch holidays
+- [x] promotion gate against baselines on held-out days; learned values on the page
+- [ ] usable capacity and SoC estimator (the JK-BMS reports whole percent)
+- [ ] OpenAmber's DHW schedule as a feature; forecast accuracy per lead time
 
 **M3: Control.**
 - executor with fail-safe, relay curtailment, overrides

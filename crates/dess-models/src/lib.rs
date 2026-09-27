@@ -5,4 +5,5 @@
 
 pub mod features;
 pub mod heatpump;
+pub mod load;
 pub mod pv;

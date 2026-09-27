@@ -114,6 +114,13 @@ const MIGRATIONS: &[&str] = &[
         promoted   INTEGER NOT NULL -- beats its baseline, so it's used
     ) STRICT;
 ",
+    r"
+    -- Settings changed on the dess-oxide page.
+    CREATE TABLE settings (
+        key   TEXT PRIMARY KEY,
+        value TEXT NOT NULL
+    ) STRICT;
+",
 ];
 
 pub struct Store {
@@ -602,6 +609,60 @@ impl Store {
             }
         }
         Ok(out)
+    }
+
+    /// Steady-state conversion bins since `since_day` (days since the epoch),
+    /// as `(age in days, bin, stats)` relative to `today`.
+    pub fn efficiency_bins(
+        &self,
+        since_day: i64,
+        today: i64,
+    ) -> anyhow::Result<Vec<(f64, i32, BinStats)>> {
+        let mut query = self.conn.prepare_cached(
+            "SELECT day, bin, n, sum_ac, sum_dc, sum_ac2, sum_dc2, sum_ac_dc, sum_voltage
+             FROM efficiency_bins WHERE day >= ?1",
+        )?;
+        let rows = query.query_map([since_day], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i32>(1)?,
+                BinStats {
+                    n: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                    sum_ac: row.get(3)?,
+                    sum_dc: row.get(4)?,
+                    sum_ac2: row.get(5)?,
+                    sum_dc2: row.get(6)?,
+                    sum_ac_dc: row.get(7)?,
+                    sum_voltage: row.get(8)?,
+                },
+            ))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (day, bin, stats) = row?;
+            out.push(((today - day) as f64, bin, stats));
+        }
+        Ok(out)
+    }
+
+    pub fn setting(&self, key: &str) -> anyhow::Result<Option<String>> {
+        match self
+            .conn
+            .query_row("SELECT value FROM settings WHERE key = ?1", [key], |row| {
+                row.get(0)
+            }) {
+            Ok(value) => Ok(Some(value)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    pub fn set_setting(&self, key: &str, value: &str) -> anyhow::Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO settings VALUES (?1, ?2)",
+            [key, value],
+        )?;
+        Ok(())
     }
 
     /// Adds steady-state conversion samples to the day's bins.

@@ -4,9 +4,9 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.4.0"
+version: "0.5.0"
 slug: dess_oxide
-description: Plans a Victron ESS against Dutch day-ahead prices. Shadow mode — it never writes to the Victron yet.
+description: Plans and (once you allow it) runs a Victron ESS against Dutch day-ahead prices.
 url: https://github.com/georgeboot/dess-oxide
 arch:
   - aarch64
@@ -24,6 +24,7 @@ homeassistant_api: true
 options:
   victron:
     host: ""
+  control: false
   grid:
     max_import_kw: 17
     max_export_kw: 17
@@ -53,6 +54,7 @@ options:
   pv: []
   history: {}
 schema:
+  control: bool
   victron:
     host: str
     port: port?

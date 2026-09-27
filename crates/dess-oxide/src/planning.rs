@@ -8,6 +8,7 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use dess_core::battery::BatteryModel;
+use dess_core::efficiency::LearnedLosses;
 use dess_core::planner::{self, Plan, PlanRequest, PlannerSettings, SlotForecast};
 use dess_core::solar::Orientation;
 use dess_core::tariff::Tariff;
@@ -22,6 +23,9 @@ use tracing::{debug, warn};
 use crate::config::{Config, HistoryConfig, LocationConfig, RelayAction};
 use crate::nordpool::NordPool;
 use crate::store::Store;
+use dess_models::features::HourWeather;
+use dess_models::heatpump::HpModel;
+use dess_models::load::LoadModel;
 
 /// Days of price history used to estimate prices beyond the published ones.
 pub const PRICE_LOOKBACK_DAYS: i32 = 14;
@@ -87,7 +91,25 @@ pub struct PlanView {
     pub soc: f64,
     pub battery: BatteryModel,
     pub forecasts: Vec<SlotForecast>,
+    pub settings: PlannerSettings,
+    pub min_soc: f64,
     pub plan: Plan,
+}
+
+/// Learned models in use (each only once it beat its baseline).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Models<'a> {
+    pub heat_pump: Option<&'a HpModel>,
+    pub load: Option<&'a LoadModel>,
+}
+
+/// What the plan's forecasts are made from.
+#[derive(Debug, Clone, Copy)]
+pub struct ForecastInputs<'a> {
+    pub pv: &'a BTreeMap<Slot, Watts>,
+    /// The latest weather forecast.
+    pub weather: &'a BTreeMap<Slot, Weather>,
+    pub models: Models<'a>,
 }
 
 /// Plans from the current snapshot, stored prices and history.
@@ -97,26 +119,31 @@ pub fn make_plan(
     store: &Store,
     config: &Config,
     tariff: &Tariff,
-    pv: &BTreeMap<Slot, Watts>,
+    inputs: ForecastInputs<'_>,
 ) -> anyhow::Result<PlanView> {
     let soc = reading::sample(snapshot, now)?.soc_pct;
     let info = reading::battery_info(snapshot);
-    let battery = battery_model(&info, config)?;
+    let battery = battery_model(&info, config, &learned_losses(store, now)?)?;
     let lookback =
         Slot::containing(now - SignedDuration::from_hours(24 * i64::from(PRICE_LOOKBACK_DAYS + 1)));
     let prices = store.prices(
         lookback,
         Slot::containing(now + SignedDuration::from_hours(72)),
     )?;
-    let load_history = load_history(store, &config.history, lookback)?;
-    let forecasts = slot_forecasts(
-        now,
-        &prices,
-        tariff,
-        &load_history,
-        pv,
-        min_soc(&info, config),
-    )?;
+    let history = load_history(store, &config.history, lookback)?;
+    let loads = |slots: &[Slot]| {
+        house_load(
+            slots,
+            store,
+            config,
+            &tariff.time_zone,
+            now,
+            inputs,
+            &history,
+        )
+    };
+    let min_soc = min_soc(&info, config);
+    let forecasts = slot_forecasts(now, &prices, tariff, loads, inputs.pv, min_soc)?;
     let settings = planner_settings(config, &forecasts);
     let plan = planner::plan(&PlanRequest {
         now,
@@ -131,6 +158,8 @@ pub fn make_plan(
         soc,
         battery,
         forecasts,
+        settings,
+        min_soc,
         plan,
     })
 }
@@ -184,8 +213,21 @@ pub fn load_history(
     Ok(by_slot.into_iter().collect())
 }
 
-/// The battery model and current state, from the GX device.
-pub fn battery_model(info: &BatteryInfo, config: &Config) -> anyhow::Result<BatteryModel> {
+/// Losses learned from the last half year of steady-state samples.
+pub fn learned_losses(store: &Store, now: Timestamp) -> anyhow::Result<LearnedLosses> {
+    let today = now.as_second().div_euclid(86_400);
+    Ok(dess_core::efficiency::fit_losses(
+        &store.efficiency_bins(today - 180, today)?,
+    ))
+}
+
+/// The battery model and current state, from the GX device, with learned
+/// losses where there's enough data.
+pub fn battery_model(
+    info: &BatteryInfo,
+    config: &Config,
+    learned: &LearnedLosses,
+) -> anyhow::Result<BatteryModel> {
     let capacity_wh = config
         .battery
         .capacity_kwh
@@ -202,12 +244,18 @@ pub fn battery_model(info: &BatteryInfo, config: &Config) -> anyhow::Result<Batt
     let discharge_limit = info
         .max_discharge_current
         .map_or(f64::INFINITY, |a| a * voltage);
-    Ok(BatteryModel::multiplus_ii_prior(
+    let mut model = BatteryModel::multiplus_ii_prior(
         WattHours(capacity_wh),
         units,
         Watts(charge_current * voltage / 0.95),
         Watts(discharge_limit.min(4000.0 * f64::from(units))),
-    ))
+    );
+    if let Some(standby) = learned.standby {
+        model.standby = Watts(standby);
+    }
+    model.charge_loss = learned.charge.unwrap_or(model.charge_loss);
+    model.discharge_loss = learned.discharge.unwrap_or(model.discharge_loss);
+    Ok(model)
 }
 
 /// Whether PV is on right now, from the configured relay.
@@ -227,7 +275,7 @@ pub fn slot_forecasts(
     now: Timestamp,
     prices: &BTreeMap<Slot, EurPerKwh>,
     tariff: &Tariff,
-    load_history: &[(Slot, Watts)],
+    loads: impl FnOnce(&[Slot]) -> anyhow::Result<Vec<Watts>>,
     pv: &BTreeMap<Slot, Watts>,
     min_soc: f64,
 ) -> anyhow::Result<Vec<SlotForecast>> {
@@ -240,7 +288,7 @@ pub fn slot_forecasts(
     let spot = prices::horizon(prices, first, until, PRICE_LOOKBACK_DAYS.unsigned_abs())
         .ok_or(NoPrices)?;
     let slots: Vec<Slot> = spot.iter().map(|p| p.slot).collect();
-    let loads = forecast::baseline_load(load_history, &slots, &tariff.time_zone, FALLBACK_LOAD);
+    let loads = loads(&slots)?;
     spot.iter()
         .zip(loads)
         .map(|(price, load)| {
@@ -254,6 +302,56 @@ pub fn slot_forecasts(
             })
         })
         .collect()
+}
+
+/// House load per slot: the learned base-load and heat pump models where
+/// they're in use and there's weather for the hour, else the history baseline.
+fn house_load(
+    slots: &[Slot],
+    store: &Store,
+    config: &Config,
+    tz: &TimeZone,
+    now: Timestamp,
+    inputs: ForecastInputs<'_>,
+    history: &[(Slot, Watts)],
+) -> anyhow::Result<Vec<Watts>> {
+    let baseline = forecast::baseline_load(history, slots, tz, FALLBACK_LOAD);
+    let heat_pump_metered = config
+        .history
+        .heat_pump
+        .as_deref()
+        .is_some_and(|e| !e.is_empty());
+    let Some(load) = inputs.models.load else {
+        return Ok(baseline);
+    };
+    if heat_pump_metered && inputs.models.heat_pump.is_none() {
+        return Ok(baseline);
+    }
+    // Stored recent weather first, so the moving averages carry on into the forecast.
+    let mut weather = store.weather(
+        Slot::containing(now - SignedDuration::from_hours(24 * 10)),
+        Slot::containing(now),
+    )?;
+    weather.extend(inputs.weather.iter().map(|(slot, w)| (*slot, *w)));
+    let hours: std::collections::HashMap<i64, HourWeather> =
+        dess_models::features::hourly(&weather)
+            .into_iter()
+            .map(|h| (h.hour, h))
+            .collect();
+    Ok(slots
+        .iter()
+        .zip(baseline)
+        .map(|(slot, fallback)| {
+            let Some(w) = hours.get(&(slot.start_unix().div_euclid(3600) * 3600)) else {
+                return fallback;
+            };
+            let Some((hour, weekday, holiday)) = crate::training::house_features(w, tz) else {
+                return fallback;
+            };
+            let heat_pump = inputs.models.heat_pump.map_or(0.0, |m| m.hour_kwh(w, hour));
+            Watts((load.hour_kwh(w, hour, weekday, holiday) + heat_pump) * 1000.0)
+        })
+        .collect())
 }
 
 /// Planner settings from the config. Energy left at the end of the horizon is

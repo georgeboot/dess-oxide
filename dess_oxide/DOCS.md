@@ -6,9 +6,24 @@ The design is in
 
 ## What this version does
 
-It runs in **shadow mode**: it plans, records and shows, but **never
-writes anything to the Victron system**. It's meant to run next to your
-current setup (such as DAO) until you trust its plans.
+By default it runs in **shadow mode**: it plans, records and shows, but
+**never writes anything to the Victron system**. It's meant to run next to
+your current setup (such as DAO) until you trust its plans.
+
+**Taking control** needs two locks:
+1. `control: true` in the options.
+2. The switch on the dess-oxide page.
+
+It then moves ESS's grid setpoint once a second (a volatile override, not
+the stored setting) and switches the PV relay per quarter hour. It releases
+control back to plain ESS whenever:
+- the switch goes off;
+- the Victron Dynamic ESS is enabled;
+- something else wrote the ESS setpoint in the last five minutes (turn
+  DAO's automations off first);
+- data is stale;
+- the grid is down;
+- the app stops.
 
 - **Records** the system once a second from the Cerbo GX's local MQTT. It
   stores 15-minute energy totals and steady-state efficiency samples in
@@ -19,7 +34,10 @@ current setup (such as DAO) until you trust its plans.
   - PV from KNMI Harmonie (via Open-Meteo), at Home Assistant's location,
     through a **learned PV model**. It's trained nightly on your history and
     the archived weather, and starts from your configured arrays.
-  - load from history: recorded, plus HA's statistics.
+  - house load from a **learned base-load model plus a learned heat pump
+    model**. The heat pump model includes frost losses in humid air. Until
+    they beat the naive forecast, load comes from history.
+- **Learns the battery and inverter losses** from what it records.
 - **Plans** the cheapest battery schedule for the next 48 hours or more, at
   every quarter hour and whenever prices or forecasts change. Every plan is
   stored.

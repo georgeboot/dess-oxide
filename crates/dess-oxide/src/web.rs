@@ -23,6 +23,7 @@ use crate::chart::{Chart, Kind, Series};
 use crate::planning::{PlanView, lock};
 use crate::run::Shared;
 use crate::store::{HistorySlot, StoredModel};
+use dess_core::efficiency::LearnedLosses;
 
 /// Home Assistant's ingress proxy; the only client allowed inside HA.
 const INGRESS_PROXY: IpAddr = IpAddr::V4(Ipv4Addr::new(172, 30, 32, 2));
@@ -39,6 +40,7 @@ pub async fn serve(listen: SocketAddr, shared: Arc<Shared>, mut stop: watch::Rec
     let app = Router::new()
         .route("/", get(page))
         .route("/api/plan", get(plan_json))
+        .route("/api/control", axum::routing::post(set_control))
         .layer(middleware::from_fn(ingress_only))
         .with_state(shared);
     let result = axum::serve(
@@ -64,6 +66,34 @@ async fn ingress_only(
         return StatusCode::FORBIDDEN.into_response();
     }
     next.run(request).await
+}
+
+#[derive(serde::Deserialize)]
+struct ControlForm {
+    enabled: String,
+}
+
+/// The page switch. It only matters when `control: true` is set in the options.
+async fn set_control(
+    State(shared): State<Arc<Shared>>,
+    headers: axum::http::HeaderMap,
+    axum::Form(form): axum::Form<ControlForm>,
+) -> Response {
+    let on = form.enabled == "on";
+    let saved = tokio::task::block_in_place(|| {
+        lock(&shared.store).set_setting(crate::control::SWITCH, if on { "on" } else { "off" })
+    });
+    if let Err(error) = saved {
+        error!(%error, "saving the control switch");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+    info!(on, "control switched on the page");
+    // Back to the page, under Home Assistant's ingress path when there is one.
+    let base = headers
+        .get("x-ingress-path")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    axum::response::Redirect::to(&format!("{base}/")).into_response()
 }
 
 async fn plan_json(State(shared): State<Arc<Shared>>) -> Response {
@@ -109,19 +139,35 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
             error!(%error, "reading history");
             Vec::new()
         });
-    let pv_model =
-        tokio::task::block_in_place(|| lock(&shared.store).model("pv")).unwrap_or_else(|error| {
-            error!(%error, "reading the PV model");
-            None
+    let (models, losses) = tokio::task::block_in_place(|| {
+        let store = lock(&shared.store);
+        let models = ["pv", "heat_pump", "load"].map(|name| {
+            store.model(name).unwrap_or_else(|error| {
+                error!(%error, name, "reading a model");
+                None
+            })
         });
-    Html(render(&shared, view.as_deref(), &history, pv_model.as_ref(), now).into_string())
+        (models, crate::planning::learned_losses(&store, now).ok())
+    });
+    Html(
+        render(
+            &shared,
+            view.as_deref(),
+            &history,
+            &models,
+            losses.as_ref(),
+            now,
+        )
+        .into_string(),
+    )
 }
 
 fn render(
     shared: &Shared,
     view: Option<&PlanView>,
     history: &[HistorySlot],
-    pv_model: Option<&StoredModel>,
+    models: &[Option<StoredModel>; 3],
+    losses: Option<&LearnedLosses>,
     now: Timestamp,
 ) -> Markup {
     let status = shared.status.lock().expect("status lock poisoned").clone();
@@ -138,20 +184,26 @@ fn render(
             body {
                 header {
                     h1 { "dess-oxide" }
-                    span.badge { "shadow mode · never writes to the Victron" }
+                    @if shared.config.control {
+                        span.badge { "control allowed by the options" }
+                    } @else {
+                        span.badge { "shadow mode · never writes to the Victron" }
+                    }
                 }
                 @if let Some(problem) = &status.problem {
                     p.problem { (problem) }
                 }
                 @match view {
                     Some(view) => {
+                        (control_card(shared))
                         (now_cards(view))
                         (plan_section(shared, view, now))
                     }
                     None => p.muted { "No plan yet: waiting for the Victron data and day-ahead prices." },
                 }
                 (history_section(shared, history, now))
-                (models_section(shared, pv_model))
+                (models_section(shared, models))
+                @if let Some(view) = view { (battery_section(&view.battery, losses)) }
                 @if let Some(view) = view {
                     (slot_table(shared, view))
                 }
@@ -180,6 +232,41 @@ fn render(
     }
 }
 
+fn control_card(shared: &Shared) -> Markup {
+    use crate::control::ControlStatus;
+    let switched_on = crate::control::switched_on(shared);
+    let switch = |on: bool, label: &str| {
+        html! {
+            form.inline method="post" action="api/control" {
+                input type="hidden" name="enabled" value=(if on { "on" } else { "off" });
+                button type="submit" { (label) }
+            }
+        }
+    };
+    html! {
+        section.control {
+            @match shared.control_status() {
+                ControlStatus::Shadow => {
+                    strong { "Shadow mode." }
+                    " dess-oxide plans but never writes to the Victron. To let it take control, set "
+                    code { "control: true" } " in the app's options, then switch it on here."
+                }
+                ControlStatus::Idle(reason) => {
+                    strong { "Not in control: " } (reason) ". "
+                    @if switched_on { (switch(false, "Switch control off")) } @else { (switch(true, "Switch control on")) }
+                }
+                ControlStatus::Active(decision) => {
+                    strong.active { "In control." }
+                    " Grid setpoint " (format!("{:+.1} kW", decision.setpoint.0 / 1000.0))
+                    ", battery " (format!("{:+.1} kW", decision.battery_ac.0 / 1000.0))
+                    ", PV " (if decision.pv_on { "on" } else { "off" }) ". "
+                    (switch(false, "Switch control off"))
+                }
+            }
+        }
+    }
+}
+
 fn now_cards(view: &PlanView) -> Markup {
     let Some(first) = view.plan.slots.first() else {
         return html! {};
@@ -197,7 +284,7 @@ fn now_cards(view: &PlanView) -> Markup {
             div.card { span.label { "Battery" } span.value { (format!("{:.0} %", view.soc)) } span.sub { (format!("{:.1} kWh usable", view.battery.capacity.0 / 1000.0)) } }
             div.card { span.label { "This quarter hour" } span.value { (format!("{battery:+.1} kW")) } span.sub { (action) ", grid " (format!("{:+.1} kW", first.grid.0 / 1000.0)) } }
             div.card { span.label { "Price now" } span.value { (format!("€{:.3}", first.prices.buy.0)) } span.sub { "sell €" (format!("{:.3}", first.prices.sell.0)) } }
-            div.card { span.label { "Stored energy worth" } span.value { (format!("€{:.3}", first.stored_energy_value.0)) } span.sub { "per kWh, at the end of this slot" } }
+            div.card { span.label { "Stored energy is worth" } span.value { (format!("€{:.3}/kWh", first.stored_energy_value.0)) } span.sub { "what the last kWh in the battery will save or earn later — not what it cost" } }
             div.card { span.label { "Expected over the horizon" } span.value { (format!("€{:.2}", view.plan.expected_cost)) } span.sub { "negative is money earned" } }
         }
     }
@@ -379,23 +466,18 @@ fn history_section(shared: &Shared, history: &[HistorySlot], now: Timestamp) -> 
     }
 }
 
-fn models_section(shared: &Shared, pv: Option<&StoredModel>) -> Markup {
+fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup {
+    let [pv, heat_pump, load] = models;
+    let number = |v: &serde_json::Value| v.as_f64().unwrap_or(f64::NAN);
     html! {
         section {
             h2 { "Learned models" }
+            p.muted { "Trained shortly after startup and nightly. A model is only used when it beats its baseline on held-out days." }
+            h3 { "PV" }
             @match pv {
-                None => p.muted { "PV: not trained yet. It needs two weeks of history with weather, and [[pv]] arrays to start from." },
+                None => p.muted { "Not trained yet: it needs two weeks of history with weather, and [[pv]] arrays to start from." },
                 Some(model) => {
-                    p {
-                        strong { "PV" } " — trained " (local(shared, model.trained_at, "%a %d %b %H:%M"))
-                        " on " (model.metrics["hours"]) " hours. Held-out error "
-                        (format!("{:.3}", model.metrics["validation_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
-                        " kWh/h, against "
-                        (format!("{:.3}", model.metrics["configured_validation_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
-                        " for the configured arrays: "
-                        @if model.promoted { strong { "in use" } } @else { "not better, so not used" }
-                        "."
-                    }
+                    (model_summary(shared, model, "configured_validation_mae_kwh", "the configured arrays"))
                     div.scroll {
                         table {
                             thead { tr { th { "array" } th { "effective kWp" } th { "tilt" } th { "azimuth" } } }
@@ -403,21 +485,119 @@ fn models_section(shared: &Shared, pv: Option<&StoredModel>) -> Markup {
                                 @for (i, array) in model.params["arrays"].as_array().into_iter().flatten().enumerate() {
                                     tr {
                                         td { (i + 1) }
-                                        td { (format!("{:.2}", array["kwp"].as_f64().unwrap_or(f64::NAN))) }
-                                        td { (format!("{:.0}°", array["tilt"].as_f64().unwrap_or(f64::NAN))) }
-                                        td { (format!("{:.0}°", array["azimuth"].as_f64().unwrap_or(f64::NAN))) }
+                                        td { (format!("{:.2}", number(&array["kwp"]))) }
+                                        td { (format!("{:.0}°", number(&array["tilt"]))) }
+                                        td { (format!("{:.0}°", number(&array["azimuth"]))) }
                                     }
                                 }
                             }
                         }
                     }
                     p.muted {
-                        "Inverter limit " (format!("{:.1}", model.params["cap_kw"].as_f64().unwrap_or(f64::NAN)))
+                        "Inverter limit " (format!("{:.1}", number(&model.params["cap_kw"])))
                         " kW. Effective kWp includes system losses; the learned arrays needn't match the physical strings."
                     }
                 }
             }
+            h3 { "Heat pump" }
+            @match heat_pump.as_ref().and_then(|m| crate::training::hp_model_from_json(&m.params).map(|hp| (m, hp))) {
+                None => p.muted { "Not trained yet: it needs two weeks of the heat pump meter's history (history.heat_pump)." },
+                Some((stored, hp)) => {
+                    (model_summary(shared, stored, "baseline_mae_kwh", "last week's same hours"))
+                    ul {
+                        li { "Heating stops above about " strong { (format!("{:.1} °C", hp.balance_c)) } " outdoors, smoothed by the house's thermal lag." }
+                        li { "Heat loss " (format!("{:.2}", hp.ua_kw_per_k)) " kW per degree below that, +" (format!("{:.0}", hp.wind_factor * 100.0)) " % per m/s of wind." }
+                        li { "COP " (format!("{:.1}", cop(&hp, 0.0))) " at 0 °C, " (format!("{:.1}", cop(&hp, -7.0))) " at −7 °C." }
+                        li { "Frost: the coil runs " (format!("{:.1}", hp.coil_delta_k)) " K below the air; +" (format!("{:.1}", hp.frost_factor * 100.0)) " % use per hPa of frost potential." }
+                        li { "Hot water peaks around " (hot_water_peak(&hp.hot_water_kwh)) "." }
+                    }
+                }
+            }
+            h3 { "Base load" }
+            @match load {
+                None => p.muted { "Not trained yet: it needs two weeks of load history." },
+                Some(model) => (model_summary(shared, model, "baseline_mae_kwh", "the same hour on the same weekday over the last four weeks")),
+            }
         }
+    }
+}
+
+fn cop(hp: &dess_models::heatpump::HpModel, celsius: f64) -> f64 {
+    1.0 + (hp.cop_c0 + hp.cop_c1 * celsius).exp().ln_1p()
+}
+
+fn model_summary(
+    shared: &Shared,
+    model: &StoredModel,
+    baseline_key: &str,
+    baseline: &str,
+) -> Markup {
+    let number = |key: &str| model.metrics[key].as_f64().unwrap_or(f64::NAN);
+    html! {
+        p {
+            "Trained " (local(shared, model.trained_at, "%a %d %b %H:%M")) " on " (model.metrics["hours"]) " hours. Held-out error "
+            (format!("{:.3}", number("validation_mae_kwh"))) " kWh/h, against " (format!("{:.3}", number(baseline_key)))
+            " for " (baseline) ": "
+            @if model.promoted { strong { "in use" } } @else { "not better yet, so not used" }
+            "."
+        }
+    }
+}
+
+fn hot_water_peak(profile: &[f64; 24]) -> String {
+    let (hour, _) =
+        profile.iter().enumerate().fold(
+            (0, f64::MIN),
+            |best, (h, &v)| if v > best.1 { (h, v) } else { best },
+        );
+    format!("{hour:02}:00")
+}
+
+/// The inverter/charger losses the planner uses: learned or the prior.
+fn battery_section(
+    battery: &dess_core::battery::BatteryModel,
+    losses: Option<&LearnedLosses>,
+) -> Markup {
+    let learned = |side: bool| {
+        losses.is_some_and(|l| {
+            if side {
+                l.charge.is_some()
+            } else {
+                l.discharge.is_some()
+            }
+        })
+    };
+    let charge = |p: f64| {
+        let c = battery.charge_loss;
+        (p - c.linear * p - c.quadratic * p * p) / p * 100.0
+    };
+    let discharge = |p: f64| {
+        let dc = p + battery.discharge_loss.linear * p + battery.discharge_loss.quadratic * p * p;
+        p / dc * 100.0
+    };
+    html! {
+        h3 { "Battery and inverters" }
+        p {
+            "Charging curve: " (if learned(true) { "learned" } else { "prior (not enough steady data yet)" })
+            "; discharging: " (if learned(false) { "learned" } else { "prior" })
+            ". Standby " (format!("{:.0} W", battery.standby.0))
+            (if losses.is_some_and(|l| l.standby.is_some()) { " (learned)" } else { " (prior)" }) "."
+        }
+        div.scroll {
+            table {
+                thead { tr { th { "AC power" } th { "charge efficiency" } th { "discharge efficiency" } } }
+                tbody {
+                    @for kw in [1.0, 3.0, 6.0, 10.0] {
+                        tr {
+                            td { (format!("{kw:.0} kW")) }
+                            td { (format!("{:.1} %", charge(kw * 1000.0))) }
+                            td { (format!("{:.1} %", discharge(kw * 1000.0))) }
+                        }
+                    }
+                }
+            }
+        }
+        p.muted { "Conversion efficiency without the standby draw, which the planner counts separately." }
     }
 }
 
@@ -444,7 +624,7 @@ fn forecast_errors(history: &[HistorySlot]) -> Markup {
             @match load { Some((e, n)) => { "load " (format!("{e:.2} kW")) " over " (n) " slots" }, None => "load –" }
             "; "
             @match pv { Some((e, n)) => { "PV " (format!("{e:.2} kW")) " over " (n) " slots" }, None => "PV –" }
-            ". These are the baseline forecasts; M2 replaces them."
+            ". Each uses the learned model once it's in use (see below), else the baseline."
         }
     }
 }
@@ -537,4 +717,10 @@ th, td { padding: 3px 10px; text-align: right; border-bottom: 1px solid var(--li
 th:first-child, td:first-child { text-align: left; }
 tr.estimated td { color: var(--muted); }
 footer { margin-top: 28px; }
+.control { margin-top: 16px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--card); }
+.control .active { color: var(--bat); }
+form.inline { display: inline; }
+button { font: inherit; padding: 3px 10px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--fg); cursor: pointer; }
+h3 { font-size: 15px; margin: 18px 0 4px; }
+ul { margin: 4px 0; padding-left: 20px; }
 ";

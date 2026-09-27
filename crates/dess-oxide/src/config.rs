@@ -18,6 +18,10 @@ use serde::Deserialize;
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Config {
     pub victron: VictronConfig,
+    /// Lets dess-oxide write to the GX device at all. The first of two locks;
+    /// the second is the switch on the dess-oxide page. Off by default.
+    #[serde(default)]
+    pub control: bool,
     #[serde(default)]
     pub grid: GridConfig,
     #[serde(default)]

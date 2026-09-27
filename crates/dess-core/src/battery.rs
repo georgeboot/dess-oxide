@@ -83,6 +83,18 @@ impl BatteryModel {
         }
     }
 
+    /// DC power at the battery for AC power `ac` (positive = charging).
+    pub fn dc_for_ac(&self, ac: Watts) -> Watts {
+        let p = ac.0.abs();
+        if ac.0 >= 0.0 {
+            let c = self.charge_loss;
+            Watts(p - c.linear * p - c.quadratic * p * p)
+        } else {
+            let d = self.discharge_loss;
+            Watts(-(p + d.linear * p + d.quadratic * p * p))
+        }
+    }
+
     /// AC power (positive = charging) that changes the stored energy by
     /// `delta` over `hours`, or `None` if that exceeds the limits.
     pub fn ac_power_for(&self, delta: WattHours, hours: f64) -> Option<Watts> {

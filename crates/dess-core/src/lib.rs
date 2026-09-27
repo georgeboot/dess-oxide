@@ -6,6 +6,7 @@
 
 pub mod battery;
 pub mod calendar;
+pub mod control;
 pub mod efficiency;
 pub mod forecast;
 pub mod planner;

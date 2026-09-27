@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.0
+
+- **Heat pump model:** learns your heat pump's electricity use from its meter
+  (`history.heat_pump`) and the archived weather:
+  - the temperature where heating stops, and your house's thermal lag;
+  - wind and solar effects, and the COP falling with the cold;
+  - **frost losses in humid air near freezing**, which is why a foggy 0 °C
+    day can cost more than a clear −8 °C one;
+  - your hot water times.
+- **Base load model:** a small neural network for everything else in the
+  house, from time of day, weekday, Dutch public holidays, temperature and
+  daylight.
+- **Load forecast = base load + heat pump**, used once both models beat their
+  naive baselines on held-out days.
+- **Battery and inverter losses** are now learned from the recorded
+  steady-state samples (standby draw plus a charge and a discharge curve),
+  replacing the prior as soon as there's enough data.
+- The dess-oxide page shows everything that was learned.
+- **Control** (off by default). Set `control: true` and switch it on on the
+  page. Once a second it applies the plan's policy to the measured load and
+  PV: surprises go to the battery or the grid, whichever is cheaper. It moves
+  the volatile setpoint override and the PV relay, and releases control to
+  plain ESS on any doubt, including while something else (DAO) still writes
+  the setpoint.
+
 ## 0.4.0
 
 - **Learned PV model:** dess-oxide trains a PV model on your history (HA

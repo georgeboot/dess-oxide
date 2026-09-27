@@ -3,9 +3,14 @@
 use std::collections::BTreeMap;
 
 use dess_core::Slot;
+use dess_core::calendar;
 use dess_core::weather::Weather;
+use dess_models::features::{self, HourWeather};
+use dess_models::heatpump::{self, HpFit, HpHour, HpModel};
+use dess_models::load::{self, Dense, LoadFit, LoadHour, LoadModel};
 use dess_models::pv::{self, Array, FitReport, Hour, PvModel, Quarter};
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 use serde_json::json;
 
 use crate::config::{Config, LocationConfig, RelayAction};
@@ -135,6 +140,223 @@ pub fn train_pv(
     Ok(Some(pv::fit(&hours, &initial, ITERATIONS)))
 }
 
+/// The promoted models in the store.
+#[derive(Debug, Default)]
+pub struct StoredModels {
+    pub pv: Option<PvModel>,
+    pub heat_pump: Option<HpModel>,
+    pub load: Option<LoadModel>,
+}
+
+impl StoredModels {
+    pub fn load(store: &Store) -> Self {
+        fn promoted<T>(
+            store: &Store,
+            name: &str,
+            parse: fn(&serde_json::Value) -> Option<T>,
+        ) -> Option<T> {
+            match store.model(name) {
+                Ok(Some(stored)) if stored.promoted => parse(&stored.params),
+                Ok(_) => None,
+                Err(error) => {
+                    tracing::warn!("loading the {name} model: {error:#}");
+                    None
+                }
+            }
+        }
+        Self {
+            pv: promoted(store, "pv", pv_model_from_json),
+            heat_pump: promoted(store, "heat_pump", hp_model_from_json),
+            load: promoted(store, "load", load_model_from_json),
+        }
+    }
+
+    pub fn as_models(&self) -> crate::planning::Models<'_> {
+        crate::planning::Models {
+            heat_pump: self.heat_pump.as_ref(),
+            load: self.load.as_ref(),
+        }
+    }
+}
+
+/// Hourly training data for the house: base load (everything but the heat
+/// pump) and the heat pump, each with the hour's weather.
+#[derive(Debug, Default)]
+pub struct HouseHours {
+    pub load: Vec<LoadHour>,
+    pub heat_pump: Vec<HpHour>,
+}
+
+pub fn house_hours(
+    store: &Store,
+    config: &Config,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> anyhow::Result<HouseHours> {
+    let from = Slot::containing(
+        crate::openmeteo::HISTORY_START
+            .to_zoned(TimeZone::UTC)?
+            .timestamp(),
+    );
+    let weather = features::hourly(&store.weather(from, Slot::containing(now))?);
+
+    // Total house load per hour, where all four slots are known.
+    let mut totals: BTreeMap<i64, (f64, u8)> = BTreeMap::new();
+    for (slot, watts) in crate::planning::load_history(store, &config.history, from)? {
+        let entry = totals
+            .entry(slot.start_unix().div_euclid(3600) * 3600)
+            .or_default();
+        entry.0 += watts.0 * 0.25 / 1000.0;
+        entry.1 += 1;
+    }
+    let heat_pump_entity = config
+        .history
+        .heat_pump
+        .as_deref()
+        .filter(|e| !e.is_empty());
+    let heat_pump: BTreeMap<i64, f64> = match heat_pump_entity {
+        Some(entity) => store
+            .ha_hourly(&[entity], from.start())?
+            .into_iter()
+            .filter_map(|(hour, values)| values.get(entity).map(|kwh| (hour, *kwh)))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+
+    let mut out = HouseHours::default();
+    for w in weather {
+        let local = Timestamp::from_second(w.hour)?.to_zoned(tz.clone());
+        let local_hour = local.hour().unsigned_abs();
+        if let Some(&kwh) = heat_pump.get(&w.hour) {
+            out.heat_pump.push(HpHour {
+                weather: w,
+                local_hour,
+                energy_kwh: kwh,
+            });
+        }
+        let Some(&(total, 4)) = totals.get(&w.hour) else {
+            continue;
+        };
+        let base = match heat_pump_entity {
+            Some(_) => match heat_pump.get(&w.hour) {
+                Some(hp) => total - hp,
+                None => continue,
+            },
+            None => total,
+        };
+        if base >= 0.0 {
+            out.load.push(LoadHour {
+                weather: w,
+                local_hour,
+                weekday: local.weekday().to_monday_zero_offset().unsigned_abs(),
+                holiday: calendar::is_holiday(local.date()),
+                energy_kwh: base,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// Fits the heat pump and base-load models, each when there's enough history.
+pub fn train_house(
+    store: &Store,
+    config: &Config,
+    tz: &TimeZone,
+    now: Timestamp,
+) -> anyhow::Result<(Option<HpFit>, Option<LoadFit>)> {
+    let hours = house_hours(store, config, tz, now)?;
+    let heat_pump =
+        (hours.heat_pump.len() >= MIN_HOURS).then(|| heatpump::fit(&hours.heat_pump, 1500));
+    let load = (hours.load.len() >= MIN_HOURS).then(|| load::fit(&hours.load, 1500));
+    Ok((heat_pump, load))
+}
+
+/// The weather features the house models need for a given hour.
+pub fn house_features(hour: &HourWeather, tz: &TimeZone) -> Option<(u8, u8, bool)> {
+    let local = Timestamp::from_second(hour.hour).ok()?.to_zoned(tz.clone());
+    Some((
+        local.hour().unsigned_abs(),
+        local.weekday().to_monday_zero_offset().unsigned_abs(),
+        calendar::is_holiday(local.date()),
+    ))
+}
+
+pub fn hp_model_json(m: &HpModel) -> serde_json::Value {
+    json!({
+        "lag_weights": m.lag_weights,
+        "ua_kw_per_k": m.ua_kw_per_k,
+        "balance_c": m.balance_c,
+        "wind_factor": m.wind_factor,
+        "solar_gain": m.solar_gain,
+        "cop_c0": m.cop_c0,
+        "cop_c1": m.cop_c1,
+        "frost_factor": m.frost_factor,
+        "coil_delta_k": m.coil_delta_k,
+        "hot_water_kwh": m.hot_water_kwh,
+    })
+}
+
+pub fn hp_model_from_json(v: &serde_json::Value) -> Option<HpModel> {
+    let array = |key: &str| -> Option<Vec<f64>> {
+        v[key]
+            .as_array()?
+            .iter()
+            .map(serde_json::Value::as_f64)
+            .collect()
+    };
+    let number = |key: &str| v[key].as_f64();
+    Some(HpModel {
+        lag_weights: array("lag_weights")?.try_into().ok()?,
+        ua_kw_per_k: number("ua_kw_per_k")?,
+        balance_c: number("balance_c")?,
+        wind_factor: number("wind_factor")?,
+        solar_gain: number("solar_gain")?,
+        cop_c0: number("cop_c0")?,
+        cop_c1: number("cop_c1")?,
+        frost_factor: number("frost_factor")?,
+        coil_delta_k: number("coil_delta_k")?,
+        hot_water_kwh: array("hot_water_kwh")?.try_into().ok()?,
+    })
+}
+
+pub fn load_model_json(m: &LoadModel) -> serde_json::Value {
+    json!({
+        "layers": m.layers.iter().map(|d| json!({
+            "inputs": d.inputs, "outputs": d.outputs, "weights": d.weights, "bias": d.bias,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+pub fn load_model_from_json(v: &serde_json::Value) -> Option<LoadModel> {
+    let layers: Vec<Dense> = v["layers"]
+        .as_array()?
+        .iter()
+        .map(|d| {
+            let numbers = |key: &str| -> Option<Vec<f64>> {
+                d[key]
+                    .as_array()?
+                    .iter()
+                    .map(serde_json::Value::as_f64)
+                    .collect()
+            };
+            Some(Dense {
+                inputs: usize::try_from(d["inputs"].as_u64()?).ok()?,
+                outputs: usize::try_from(d["outputs"].as_u64()?).ok()?,
+                weights: numbers("weights")?,
+                bias: numbers("bias")?,
+            })
+        })
+        .collect::<Option<_>>()?;
+    Some(LoadModel {
+        layers: layers.try_into().ok()?,
+    })
+}
+
+/// Metrics for a model with a naive baseline to beat.
+pub fn baseline_metrics(hours: usize, validation_mae: f64, baseline_mae: f64) -> serde_json::Value {
+    json!({ "hours": hours, "validation_mae_kwh": validation_mae, "baseline_mae_kwh": baseline_mae })
+}
+
 pub fn pv_model_json(model: &PvModel) -> serde_json::Value {
     json!({
         "arrays": model.arrays.iter().map(|a| json!({ "kwp": a.kwp, "tilt": a.tilt, "azimuth": a.azimuth })).collect::<Vec<_>>(),
@@ -242,5 +464,21 @@ mod tests {
             cap_kw: 8.1,
         };
         assert_eq!(pv_model_from_json(&pv_model_json(&model)), Some(model));
+    }
+
+    #[test]
+    fn house_models_round_trip_through_json() {
+        let hp = HpModel::initial();
+        assert_eq!(hp_model_from_json(&hp_model_json(&hp)), Some(hp));
+        let layer = |i: usize, o: usize| Dense {
+            inputs: i,
+            outputs: o,
+            weights: vec![0.5; i * o],
+            bias: vec![0.1; o],
+        };
+        let load = LoadModel {
+            layers: [layer(16, 32), layer(32, 32), layer(32, 1)],
+        };
+        assert_eq!(load_model_from_json(&load_model_json(&load)), Some(load));
     }
 }

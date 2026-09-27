@@ -1,5 +1,6 @@
 mod chart;
 mod config;
+mod control;
 mod homeassistant;
 mod nordpool;
 mod openmeteo;
@@ -167,18 +168,17 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
 
     let nordpool = nordpool::NordPool::new(client.clone(), &config.prices.area);
     planning::update_prices(&store, &nordpool, now, &tariff.time_zone).await?;
-    let pv = match planning::resolve_location(&client, &config).await {
-        Ok(location) if !config.pv.is_empty() => {
+    // The models the service trained, when they're in use.
+    let models = training::StoredModels::load(&planning::lock(&store));
+    let (weather, pv) = match planning::resolve_location(&client, &config).await {
+        Ok(location) => {
             let weather = openmeteo::forecast(&client, location).await?;
-            planning::pv_from_weather(&weather, &config, location, None)
-        }
-        Ok(_) => {
-            tracing::warn!("no PV forecast: no [[pv]] arrays configured");
-            std::collections::BTreeMap::new()
+            let pv = planning::pv_from_weather(&weather, &config, location, models.pv.as_ref());
+            (weather, pv)
         }
         Err(error) => {
-            tracing::warn!("no PV forecast: {error:#}");
-            std::collections::BTreeMap::new()
+            tracing::warn!("no weather: {error:#}");
+            Default::default()
         }
     };
 
@@ -200,7 +200,11 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
             &planning::lock(&store),
             &config,
             &tariff,
-            &pv,
+            planning::ForecastInputs {
+                pv: &pv,
+                weather: &weather,
+                models: models.as_models(),
+            },
         )
     })?;
     let elapsed = started.elapsed();

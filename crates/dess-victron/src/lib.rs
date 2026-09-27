@@ -5,16 +5,18 @@
 //! keeps them flowing. This crate keeps a [`Snapshot`] of every value and
 //! turns it into typed readings.
 //!
-//! The client is **read-only by construction**: the only topics it ever
-//! publishes to are `R/…` read requests. Writing (`W/…`) arrives with the
-//! executor in a later milestone, as a separate capability.
+//! Reading is the default. Writing (`W/…`) is a separate capability,
+//! [`Writer`], which needs a [`WriteAccess`] that only the `control: true`
+//! option creates, and it can only write three values.
 
 mod client;
 pub mod probe;
 pub mod reading;
 mod snapshot;
 mod value;
+pub mod writer;
 
 pub use client::{Venus, VenusError, VenusOptions};
 pub use snapshot::{Entry, Snapshot};
 pub use value::Value;
+pub use writer::{WriteAccess, Writer};

@@ -24,6 +24,8 @@ use dess_core::efficiency::EfficiencySampler;
 use dess_core::record::{Recorder, SlotRecord};
 use dess_core::tariff::Tariff;
 use dess_core::weather::Weather;
+use dess_models::heatpump::HpModel;
+use dess_models::load::LoadModel;
 use dess_models::pv::PvModel;
 use dess_victron::probe::{ProbeReport, Severity};
 use dess_victron::{Snapshot, Venus, VenusOptions, reading};
@@ -59,7 +61,11 @@ pub struct Shared {
     pub location: watch::Sender<Option<LocationConfig>>,
     /// The learned PV model, when it beats the configured arrays.
     pub pv_model: watch::Sender<Option<Arc<PvModel>>>,
+    /// The learned heat pump and base-load models, when they beat their baselines.
+    pub hp_model: watch::Sender<Option<Arc<HpModel>>>,
+    pub load_model: watch::Sender<Option<Arc<LoadModel>>>,
     pub status: Mutex<Status>,
+    pub control: Mutex<crate::control::ControlStatus>,
 }
 
 /// What the page shows about the service itself.
@@ -75,6 +81,14 @@ pub struct Status {
 impl Shared {
     fn update_status(&self, f: impl FnOnce(&mut Status)) {
         f(&mut self.status.lock().expect("status lock poisoned"));
+    }
+
+    pub fn set_control(&self, status: crate::control::ControlStatus) {
+        *self.control.lock().expect("control lock poisoned") = status;
+    }
+
+    pub fn control_status(&self) -> crate::control::ControlStatus {
+        self.control.lock().expect("control lock poisoned").clone()
     }
 }
 
@@ -100,7 +114,10 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
         weather: watch::Sender::new(Arc::new(BTreeMap::new())),
         location: watch::Sender::new(None),
         pv_model: watch::Sender::new(None),
+        hp_model: watch::Sender::new(None),
+        load_model: watch::Sender::new(None),
         status: Mutex::new(Status::default()),
+        control: Mutex::new(crate::control::ControlStatus::default()),
     });
     let (stop, stopped) = watch::channel(false);
     let web = tokio::spawn(web::serve(listen, Arc::clone(&shared), stopped.clone()));
@@ -151,6 +168,11 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
             stopped.clone(),
         )));
         tasks.push(tokio::spawn(train(Arc::clone(&shared), stopped.clone())));
+        tasks.push(tokio::spawn(crate::control::run(
+            Arc::clone(&venus),
+            Arc::clone(&shared),
+            stopped.clone(),
+        )));
         tasks.push(tokio::spawn(plan_loop(
             Arc::clone(&venus),
             Arc::clone(&shared),
@@ -308,15 +330,17 @@ fn next_price_check(now: Timestamp, tz: &TimeZone, tomorrow_complete: bool) -> D
 /// Trains the learned models: shortly after startup (once the history
 /// imports have had a moment), then nightly at 03:30.
 async fn train(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
-    // A promoted model from an earlier run is used straight away.
-    match lock(&shared.store).model("pv") {
-        Ok(Some(stored)) if stored.promoted => {
-            if let Some(model) = crate::training::pv_model_from_json(&stored.params) {
-                shared.pv_model.send_replace(Some(Arc::new(model)));
-            }
-        }
-        Ok(_) => {}
-        Err(error) => warn!("loading the PV model: {error:#}"),
+    // Promoted models from an earlier run are used straight away.
+    let stored = crate::training::StoredModels::load(&lock(&shared.store));
+    // Only announce models that exist, so a start without any doesn't replan.
+    if let Some(model) = stored.pv {
+        shared.pv_model.send_replace(Some(Arc::new(model)));
+    }
+    if let Some(model) = stored.heat_pump {
+        shared.hp_model.send_replace(Some(Arc::new(model)));
+    }
+    if let Some(model) = stored.load {
+        shared.load_model.send_replace(Some(Arc::new(model)));
     }
     let mut wait = Duration::from_secs(10 * 60);
     loop {
@@ -328,6 +352,7 @@ async fn train(shared: Arc<Shared>, mut stop: watch::Receiver<bool>) {
         if let Some(location) = location {
             train_pv(&shared, location).await;
         }
+        train_house(&shared).await;
         wait = until_local(&shared.tz, 3, 30);
     }
 }
@@ -369,6 +394,85 @@ async fn train_pv(shared: &Arc<Shared>, location: LocationConfig) {
         Ok(Err(error)) => warn!("training the PV model: {error:#}"),
         Err(error) => error!(%error, "PV training panicked"),
     }
+}
+
+async fn train_house(shared: &Arc<Shared>) {
+    let now = Timestamp::now();
+    let for_fit = Arc::clone(shared);
+    let result = tokio::task::spawn_blocking(move || {
+        let store = lock(&for_fit.store);
+        crate::training::train_house(&store, &for_fit.config, &for_fit.tz, now)
+    })
+    .await;
+    let (heat_pump, load) = match result {
+        Ok(Ok(fits)) => fits,
+        Ok(Err(error)) => return warn!("training the house models: {error:#}"),
+        Err(error) => return error!(%error, "house training panicked"),
+    };
+    let store = lock(&shared.store);
+    let heat_pump = heat_pump.map(|fit| Fitted {
+        params: crate::training::hp_model_json(&fit.model),
+        hours: fit.hours,
+        validation_mae: fit.validation_mae,
+        baseline_mae: fit.baseline_mae,
+        promoted: fit.improves(),
+        model: fit.model,
+    });
+    publish_fit(
+        &store,
+        now,
+        "heat_pump",
+        "heat pump",
+        heat_pump,
+        &shared.hp_model,
+    );
+    let load = load.map(|fit| Fitted {
+        params: crate::training::load_model_json(&fit.model),
+        hours: fit.hours,
+        validation_mae: fit.validation_mae,
+        baseline_mae: fit.baseline_mae,
+        promoted: fit.improves(),
+        model: fit.model,
+    });
+    publish_fit(&store, now, "load", "base load", load, &shared.load_model);
+}
+
+/// A fitted model with a baseline to beat.
+struct Fitted<M> {
+    model: M,
+    params: serde_json::Value,
+    hours: usize,
+    validation_mae: f64,
+    baseline_mae: f64,
+    promoted: bool,
+}
+
+/// Logs, stores and (when it beats its baseline) publishes a fitted model.
+fn publish_fit<M>(
+    store: &Store,
+    now: Timestamp,
+    name: &str,
+    label: &str,
+    fit: Option<Fitted<M>>,
+    sender: &watch::Sender<Option<Arc<M>>>,
+) {
+    let Some(fit) = fit else {
+        info!("not enough {label} history to train yet");
+        return;
+    };
+    info!(
+        hours = fit.hours,
+        learned_mae_kwh = format!("{:.3}", fit.validation_mae),
+        baseline_mae_kwh = format!("{:.3}", fit.baseline_mae),
+        promoted = fit.promoted,
+        "trained the {label} model"
+    );
+    let metrics =
+        crate::training::baseline_metrics(fit.hours, fit.validation_mae, fit.baseline_mae);
+    if let Err(error) = store.save_model(name, now, &fit.params, &metrics, fit.promoted) {
+        error!(%error, "storing the {label} model");
+    }
+    sender.send_replace(fit.promoted.then(|| Arc::new(fit.model)));
 }
 
 /// Time until the next `hour:minute` local time.
@@ -459,16 +563,33 @@ async fn plan_loop(
 ) {
     let mut weather = shared.weather.subscribe();
     let mut model = shared.pv_model.subscribe();
+    let mut hp_model = shared.hp_model.subscribe();
+    let mut load_model = shared.load_model.subscribe();
     loop {
         replan(&venus, &shared);
         let now = Timestamp::now();
         let next = Slot::containing(now).end() + SignedDuration::from_secs(5);
-        tokio::select! {
-            () = tokio::time::sleep(next.duration_since(now).unsigned_abs()) => {}
-            _ = prices.changed() => {}
-            _ = weather.changed() => {}
-            _ = model.changed() => {}
+        let changed = tokio::select! {
+            () = tokio::time::sleep(next.duration_since(now).unsigned_abs()) => false,
+            _ = prices.changed() => true,
+            _ = weather.changed() => true,
+            _ = model.changed() => true,
+            _ = hp_model.changed() => true,
+            _ = load_model.changed() => true,
             () = stopped(&mut stop) => return,
+        };
+        if changed {
+            // Changes come in bursts (prices, weather and models at startup):
+            // give the rest a moment, so one replan covers them all.
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(2)) => {}
+                () = stopped(&mut stop) => return,
+            }
+            prices.mark_unchanged();
+            weather.mark_unchanged();
+            model.mark_unchanged();
+            hp_model.mark_unchanged();
+            load_model.mark_unchanged();
         }
     }
 }
@@ -477,14 +598,25 @@ fn replan(venus: &Venus, shared: &Shared) {
     let Some(tariff) = &shared.tariff else { return };
     let now = Timestamp::now();
     let snapshot = venus.snapshot();
+    let weather = shared.weather.borrow().clone();
+    let (pv_model, hp_model, load_model) = (
+        shared.pv_model.borrow().clone(),
+        shared.hp_model.borrow().clone(),
+        shared.load_model.borrow().clone(),
+    );
     let pv = match *shared.location.borrow() {
-        Some(location) => planning::pv_from_weather(
-            &shared.weather.borrow(),
-            &shared.config,
-            location,
-            shared.pv_model.borrow().as_deref(),
-        ),
+        Some(location) => {
+            planning::pv_from_weather(&weather, &shared.config, location, pv_model.as_deref())
+        }
         None => BTreeMap::new(),
+    };
+    let inputs = planning::ForecastInputs {
+        pv: &pv,
+        weather: &weather,
+        models: planning::Models {
+            heat_pump: hp_model.as_deref(),
+            load: load_model.as_deref(),
+        },
     };
     let result = fresh(venus, &snapshot, now)
         .map_err(anyhow::Error::msg)
@@ -492,7 +624,7 @@ fn replan(venus: &Venus, shared: &Shared) {
             tokio::task::block_in_place(|| {
                 let mut store = lock(&shared.store);
                 let view =
-                    planning::make_plan(now, &snapshot, &store, &shared.config, tariff, &pv)?;
+                    planning::make_plan(now, &snapshot, &store, &shared.config, tariff, inputs)?;
                 store.save_plan(now.as_second(), &view.plan.slots, &view.forecasts)?;
                 store.prune_plans((now - PLAN_RETENTION).as_second())?;
                 anyhow::Ok(view)
