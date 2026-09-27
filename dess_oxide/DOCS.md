@@ -106,7 +106,7 @@ tariff:                     # each component takes effect on its date
   markup_buy: [{from: "2025-01-01", value: 0.02}]
   markup_sell: [{from: "2025-01-01", value: 0.02}]
   net_metering_until: "2026-12-31"
-  net_exporter: false       # true if you export more than you import over the year
+  net_exporter: false       # true only if the meter shows net export over the year
   vat_on_export: false
 pv:                         # optional: your arrays, for the PV forecast
   - {kwp: 5.59, tilt: 33, azimuth: 193}   # compass degrees, 180 = south
@@ -204,6 +204,12 @@ imported history too.
 
 - **Set your supplier's markups.** The defaults are typical values, not
   yours.
-- **`net_exporter`:** if your panels produce more than you use over the
-  year, the energy tax isn't at stake on the marginal kWh while net metering
-  lasts, so set this to `true`.
+- **`net_exporter`:** only `true` if your *meter* shows more exported
+  than imported over the year. It's not about the panels against the
+  house: trading through the battery costs energy (battery and inverter
+  losses, standby), and a heat pump adds use, so many homes with more PV
+  than use still end the year as net importers. As a net importer every
+  exported kWh cancels an imported one, energy tax and VAT included, so
+  selling pays the same as buying (with equal markups). As a net exporter
+  the extra kWh gets neither, which is why the page then shows a lower sell
+  price.

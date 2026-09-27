@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.16.1
+
+- The price card says why selling pays less than buying when it does
+  (set as a net exporter, net metering ended, or different markups).
+- The docs explain `net_exporter` better: it's about the meter over the
+  year, battery losses and the heat pump included, not panels against use.
+
 ## 0.16.0
 
 - **Dutch:** the page follows Home Assistant's language (or set `language`

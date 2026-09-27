@@ -562,7 +562,14 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
         section.cards {
             div.card { span.label { (l.t("Battery", "Accu")) } span.value { (format!("{:.1} %", shared.soc(Timestamp::now()).unwrap_or(view.soc))) } span.sub { (format!("{:.1} kWh", view.battery.capacity.0 / 1000.0)) (l.t(" usable", " bruikbaar")) } }
             div.card { span.label { (l.t("This quarter hour", "Dit kwartier")) } span.value { (format!("{battery:+.1} kW")) } span.sub { (action) (l.t(", grid ", ", net ")) (format!("{:+.1} kW", first.grid.0 / 1000.0)) } }
-            div.card { span.label { (l.t("Price now", "Prijs nu")) } span.value { (format!("€{:.3}", first.prices.buy.0)) } span.sub { (l.t("sell €", "teruglevering €")) (format!("{:.3}", first.prices.sell.0)) } }
+            div.card {
+                span.label { (l.t("Price now", "Prijs nu")) }
+                span.value { (format!("€{:.3}", first.prices.buy.0)) }
+                span.sub {
+                    (l.t("sell €", "teruglevering €")) (format!("{:.3}", first.prices.sell.0))
+                    @if let Some(why) = sell_note(shared, first.slot) { " · " (why) }
+                }
+            }
             div.card {
                 span.label { (l.t("One more kWh in the battery is worth", "Eén kWh extra in de accu is waard")) }
                 span.value { (format!("€{:.3}", value)) }
@@ -1385,6 +1392,36 @@ fn decimal_commas(page: &str) -> String {
         previous = c;
     }
     out
+}
+
+/// Why selling pays less than buying, when the tariff makes it so.
+fn sell_note(shared: &Shared, slot: Slot) -> Option<&'static str> {
+    let l = shared.lang();
+    let tariff = shared.tariff.as_ref()?;
+    let date = slot.start().to_zoned(tariff.time_zone.clone()).date();
+    let netted = tariff.net_metering_until.is_some_and(|until| date <= until);
+    if netted && tariff.net_exporter {
+        return Some(l.t(
+            "set as a net exporter, so no energy tax or VAT back on the extra kWh",
+            "ingesteld als netto-teruglevering, dus geen energiebelasting of btw terug op de extra kWh",
+        ));
+    }
+    if !netted {
+        return Some(l.t(
+            "net metering has ended: no energy tax back",
+            "salderen is voorbij: geen energiebelasting terug",
+        ));
+    }
+    let markups = (
+        tariff.markup_buy.at(date).ok()?,
+        tariff.markup_sell.at(date).ok()?,
+    );
+    ((markups.0 - markups.1).0.abs() > 1e-6).then(|| {
+        l.t(
+            "the markups for buying and selling differ",
+            "de opslagen voor levering en teruglevering verschillen",
+        )
+    })
 }
 
 /// A day as "Sun 27 Sep" (or "zo 27 sep").
