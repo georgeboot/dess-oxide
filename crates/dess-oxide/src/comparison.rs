@@ -135,12 +135,8 @@ mod tests {
     use dess_core::record::{Recorder, Sample};
     use dess_core::{EurPerKwh, WattHours, Watts};
 
-    /// Four hours: two cheap, two expensive. The house uses 2 kW, and DAO
-    /// left the battery idle at 60 %.
-    #[test]
-    fn replays_a_recorded_stretch() {
-        let mut store = Store::in_memory().unwrap();
-        let start: Timestamp = "2026-09-27T16:00:00Z".parse().unwrap();
+    /// Four hours at 2 kW with the battery idle at 60 %, recorded.
+    fn record_idle(store: &mut Store, start: Timestamp) {
         let mut recorder = Recorder::new(SignedDuration::from_secs(10));
         for s in 0..=4 * 3600 {
             let records = recorder.push(Sample {
@@ -162,6 +158,15 @@ mod tests {
                 store.save_slot(&record, 0).unwrap();
             }
         }
+    }
+
+    /// Four hours: two cheap, two expensive. The house uses 2 kW, and DAO
+    /// left the battery idle at 60 %.
+    #[test]
+    fn replays_a_recorded_stretch() {
+        let mut store = Store::in_memory().unwrap();
+        let start: Timestamp = "2026-09-27T16:00:00Z".parse().unwrap();
+        record_idle(&mut store, start);
         let slots: Vec<Slot> =
             std::iter::successors(Some(Slot::containing(start)), |s| Some(s.next()))
                 .take(16)
@@ -231,6 +236,7 @@ mod tests {
             heat_pump: Vec::new(),
             settings,
             min_soc: 10.0,
+            limits: crate::planning::PowerLimits::default(),
             plan,
         };
 

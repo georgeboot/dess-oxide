@@ -1483,6 +1483,7 @@ fn battery_section(
             (l.t(", the plan can use ", " kan de planning er ")) strong { (kwh(usable)) }
             (l.t(" of it; what's below the minimum stays for a power cut.", " van gebruiken; wat onder het minimum zit, blijft over voor een stroomstoring."))
         }
+        (power_limits(l, view))
         p {
             (l.t("Charging curve: ", "Laadcurve: ")) (if learned(true) { l.t("learned", "geleerd") } else { l.t("prior (not enough steady data yet)", "aanname (nog niet genoeg stabiele gegevens)") })
             (l.t("; discharging: ", "; ontladen: ")) (if learned(false) { l.t("learned", "geleerd") } else { l.t("prior (not enough steady data yet)", "aanname (nog niet genoeg stabiele gegevens)") })
@@ -1523,6 +1524,54 @@ fn battery_section(
                 (None, Some(_)) => (l.t(", measured from the charge and discharge stretches.", ", gemeten uit de laad- en ontlaadreeksen.")),
                 (None, None) => (l.t(", typical for LFP until measured.", ", gebruikelijk voor LFP tot het gemeten is.")),
             }
+        }
+    }
+}
+
+/// How much power the plan can use, and what sets it.
+fn power_limits(l: Lang, view: &PlanView) -> Markup {
+    use crate::planning::Limit;
+    let limits = view.limits;
+    let units = limits.units;
+    let by = |limit: Limit, bms: Option<f64>| -> String {
+        match limit {
+            Limit::Bms => format!(
+                "{} ({:.0} A)",
+                l.t("the BMS", "de BMS"),
+                bms.unwrap_or(f64::NAN)
+            ),
+            Limit::Dvcc => l
+                .t(
+                    "DVCC's charge current limit on the Cerbo",
+                    "de DVCC-laadstroomlimiet op de Cerbo",
+                )
+                .to_owned(),
+            Limit::Chargers => format!("{} ({units} × 70 A)", l.t("the chargers", "de laders")),
+            Limit::Inverters => {
+                format!("{} ({units} × 4 kW)", l.t("the inverters", "de omvormers"))
+            }
+            Limit::Ess => l
+                .t(
+                    "ESS's power limit on the Cerbo",
+                    "de ESS-vermogenslimiet op de Cerbo",
+                )
+                .to_owned(),
+        }
+    };
+    let kw = |w: f64| format!("{:.1} kW", w / 1000.0);
+    let battery = &view.battery;
+    // At the battery's terminals: the AC power with the inverters' losses.
+    let cells = battery.cell_efficiency.clamp(0.5, 1.0);
+    let charge_dc = battery.dc_for_ac(battery.max_charge_ac).0 / cells;
+    let discharge_dc = -battery.dc_for_ac(Watts(-battery.max_discharge_ac.0)).0 * cells;
+    html! {
+        p {
+            (l.t("It can charge with up to ", "Laden kan met maximaal ")) strong { (kw(battery.max_charge_ac.0)) }
+            (l.t(" from the AC side (", " aan de AC-kant (")) (kw(charge_dc)) (l.t(" into the battery) and discharge with up to ", " de accu in) en ontladen met maximaal "))
+            strong { (kw(battery.max_discharge_ac.0)) } " (" (kw(discharge_dc)) (l.t(" out of the battery). Charging is limited by ", " de accu uit). Laden wordt begrensd door "))
+            (by(limits.charge, limits.bms_charge)) (l.t(", discharging by ", ", ontladen door ")) (by(limits.discharge, limits.bms_discharge)) ". "
+            (l.t("The BMS's limits count as the highest it reported today or yesterday: when it lowers them for a while (full, cold), ESS keeps to that every second, but the plan doesn't count on it for days.",
+                 "Voor de BMS telt de hoogste limiet die hij vandaag of gisteren gaf: verlaagt hij die even (vol, koud), dan houdt ESS zich daar elke seconde aan, maar rekent de planning er niet dagen mee."))
         }
     }
 }

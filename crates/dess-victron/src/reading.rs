@@ -108,6 +108,11 @@ pub struct BatteryInfo {
     /// BMS charge and discharge current limits (CCL/DCL), A.
     pub max_charge_current: Option<f64>,
     pub max_discharge_current: Option<f64>,
+    /// DVCC's "limit charge current", A, when set.
+    pub dvcc_max_charge_current: Option<f64>,
+    /// ESS's "limit charge power" and "limit inverter power", W, when set.
+    pub ess_max_charge_power: Option<f64>,
+    pub ess_max_discharge_power: Option<f64>,
     pub voltage: Option<f64>,
     /// The minimum SoC ESS enforces right now, %.
     pub active_min_soc: Option<f64>,
@@ -148,11 +153,16 @@ pub fn battery_info(snapshot: &Snapshot) -> BatteryInfo {
             .count()
             .max(1) as u32
     });
+    // A limit set on the GX device; -1 means none.
+    let limit = |key: &str| snapshot.number(key).filter(|v| *v >= 0.0);
     BatteryInfo {
         capacity_wh,
         inverter_units,
         max_charge_current: battery("Info/MaxChargeCurrent"),
         max_discharge_current: battery("Info/MaxDischargeCurrent"),
+        dvcc_max_charge_current: limit("settings/0/Settings/SystemSetup/MaxChargeCurrent"),
+        ess_max_charge_power: limit("settings/0/Settings/CGwacs/MaxChargePower"),
+        ess_max_discharge_power: limit("settings/0/Settings/CGwacs/MaxDischargePower"),
         voltage: snapshot.number("system/0/Dc/Battery/Voltage"),
         active_min_soc: snapshot.number("system/0/Control/ActiveSocLimit"),
     }
@@ -347,5 +357,19 @@ mod tests {
         // …and the setting when it's there.
         values.push(("settings/0/Settings/DynamicEss/BatteryCapacity", n(32.0)));
         assert_eq!(battery_info(&snapshot(&values)).capacity_wh, Some(32_000.0));
+    }
+
+    #[test]
+    fn limits_set_on_the_gx_device() {
+        let mut values = georges_cerbo();
+        values.extend([
+            ("settings/0/Settings/SystemSetup/MaxChargeCurrent", n(-1.0)),
+            ("settings/0/Settings/CGwacs/MaxChargePower", n(8000.0)),
+            ("settings/0/Settings/CGwacs/MaxDischargePower", n(-1.0)),
+        ]);
+        let info = battery_info(&snapshot(&values));
+        assert_eq!(info.dvcc_max_charge_current, None, "-1 is no limit");
+        assert_eq!(info.ess_max_charge_power, Some(8000.0));
+        assert_eq!(info.ess_max_discharge_power, None);
     }
 }

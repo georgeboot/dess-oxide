@@ -180,6 +180,8 @@ pub struct PlanView {
     pub heat_pump: Vec<Option<Watts>>,
     pub settings: PlannerSettings,
     pub min_soc: f64,
+    /// What limits the battery's power, for the page.
+    pub limits: PowerLimits,
     pub plan: Plan,
 }
 
@@ -227,9 +229,10 @@ pub fn make_plan(
         Some(soc) => soc,
         None => reading::sample(snapshot, now)?.soc_pct,
     };
-    let info = reading::battery_info(snapshot);
+    let info = usual_bms_limits(store, reading::battery_info(snapshot), now)?;
     let fit = learned_capacity(store, now)?;
-    let mut battery = battery_model(&info, &learned_losses(store, now)?, fit.usable_wh())?;
+    let (mut battery, limits) =
+        battery_model(&info, &learned_losses(store, now)?, fit.usable_wh())?;
     // The cells' own round trip: from the BMS's counters, else from the
     // charge and discharge stretches.
     let counters = cell_round_trip(store, &config.history, now)?.map(|c| c.round_trip);
@@ -302,6 +305,7 @@ pub fn make_plan(
         heat_pump,
         settings,
         min_soc,
+        limits,
         plan,
     })
 }
@@ -551,36 +555,148 @@ pub fn capacity_wh(info: &BatteryInfo, learned: Option<f64>) -> Option<f64> {
     learned.or(info.capacity_wh)
 }
 
+/// What caps the battery's power.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Limit {
+    /// The BMS's current limit.
+    Bms,
+    /// DVCC's "limit charge current" on the GX device.
+    Dvcc,
+    /// The chargers: 70 A per MultiPlus-II 48/5000.
+    #[default]
+    Chargers,
+    /// The inverters: 4 kW continuous per MultiPlus-II 48/5000.
+    Inverters,
+    /// ESS's "limit charge power" or "limit inverter power".
+    Ess,
+}
+
+/// What limits charging and discharging, and the BMS's limits used.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct PowerLimits {
+    pub charge: Limit,
+    pub discharge: Limit,
+    /// A: the highest the BMS reported today or yesterday.
+    pub bms_charge: Option<f64>,
+    pub bms_discharge: Option<f64>,
+    /// Inverter/charger units.
+    pub units: u32,
+}
+
+/// The battery model, and what limits its power. Current limits apply at
+/// the battery's terminals and become AC through the (learned) conversion
+/// losses; the inverters' rating and ESS's power limits apply on the AC side.
 pub fn battery_model(
     info: &BatteryInfo,
     learned: &LearnedLosses,
     learned_capacity: Option<f64>,
-) -> anyhow::Result<BatteryModel> {
+) -> anyhow::Result<(BatteryModel, PowerLimits)> {
     let capacity_wh = capacity_wh(info, learned_capacity).context(
         "battery capacity unknown: the GX device reports none (set it under Settings → ESS → Dynamic ESS)",
     )?;
     let units = info.inverter_units;
+    let n = f64::from(units);
     let voltage = info.voltage.unwrap_or(51.2);
-    // MultiPlus-II 48/5000: 70 A charger and 4 kW continuous per unit.
-    let charge_current = info
-        .max_charge_current
-        .unwrap_or(f64::INFINITY)
-        .min(70.0 * f64::from(units));
-    let discharge_limit = info
-        .max_discharge_current
-        .map_or(f64::INFINITY, |a| a * voltage);
-    let mut model = BatteryModel::multiplus_ii_prior(
-        WattHours(capacity_wh),
-        units,
-        Watts(charge_current * voltage / 0.95),
-        Watts(discharge_limit.min(4000.0 * f64::from(units))),
-    );
+    let mut model =
+        BatteryModel::multiplus_ii_prior(WattHours(capacity_wh), units, Watts::ZERO, Watts::ZERO);
     if let Some(standby) = learned.standby {
         model.standby = Watts(standby);
     }
     model.charge_loss = learned.charge.unwrap_or(model.charge_loss);
     model.discharge_loss = learned.discharge.unwrap_or(model.discharge_loss);
-    Ok(model)
+
+    let lowest = |limits: &[(Limit, Option<f64>)]| {
+        limits
+            .iter()
+            .filter_map(|&(limit, w)| Some((limit, w?)))
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .unwrap_or((Limit::Chargers, 0.0))
+    };
+    let charge_ac = |dc: f64| {
+        let c = model.charge_loss;
+        c.ac_for_charging(dc).unwrap_or_else(|| {
+            // Beyond what the curve can deliver: its peak.
+            if c.quadratic > 0.0 {
+                (1.0 - c.linear) / (2.0 * c.quadratic)
+            } else {
+                dc / (1.0 - c.linear)
+            }
+        })
+    };
+    let (charge_by, charge_dc) = lowest(&[
+        (Limit::Bms, info.max_charge_current.map(|a| a * voltage)),
+        (
+            Limit::Dvcc,
+            info.dvcc_max_charge_current.map(|a| a * voltage),
+        ),
+        (Limit::Chargers, Some(70.0 * n * voltage)),
+    ]);
+    let (charge_by, charge) = lowest(&[
+        (charge_by, Some(charge_ac(charge_dc))),
+        (Limit::Ess, info.ess_max_charge_power),
+    ]);
+    let (discharge_by, discharge) = lowest(&[
+        (
+            Limit::Bms,
+            info.max_discharge_current
+                .map(|a| model.discharge_loss.ac_from_discharging(a * voltage)),
+        ),
+        (Limit::Inverters, Some(4000.0 * n)),
+        (Limit::Ess, info.ess_max_discharge_power),
+    ]);
+    model.max_charge_ac = Watts(charge);
+    model.max_discharge_ac = Watts(discharge);
+    Ok((
+        model,
+        PowerLimits {
+            charge: charge_by,
+            discharge: discharge_by,
+            bms_charge: info.max_charge_current,
+            bms_discharge: info.max_discharge_current,
+            units,
+        },
+    ))
+}
+
+/// The BMS's usual current limits, as `day,charge,discharge,charge
+/// yesterday,discharge yesterday`.
+const BMS_LIMITS: &str = "bms_limits";
+
+/// `info` with the BMS's current limits raised to the highest it reported
+/// today or yesterday. A BMS lowers them for a while (a full battery, a cold
+/// cell); ESS keeps to that second by second, but the plan shouldn't assume
+/// it for the next two days.
+pub fn usual_bms_limits(
+    store: &Store,
+    mut info: BatteryInfo,
+    now: Timestamp,
+) -> anyhow::Result<BatteryInfo> {
+    let day = now.as_second().div_euclid(86_400);
+    let stored: Vec<f64> = store
+        .setting(BMS_LIMITS)?
+        .map(|s| s.split(',').filter_map(|v| v.parse().ok()).collect())
+        .unwrap_or_default();
+    let [was, charge, discharge, charge_before, discharge_before] =
+        <[f64; 5]>::try_from(stored).unwrap_or([f64::NAN; 5]);
+    let (today, yesterday) = match was as i64 {
+        d if d == day => ([charge, discharge], [charge_before, discharge_before]),
+        d if d == day - 1 => ([f64::NAN; 2], [charge, discharge]),
+        _ => ([f64::NAN; 2], [f64::NAN; 2]),
+    };
+    // `f64::max` skips NaN, which stands for "nothing reported".
+    let live = [info.max_charge_current, info.max_discharge_current].map(|a| a.unwrap_or(f64::NAN));
+    let today = [today[0].max(live[0]), today[1].max(live[1])];
+    store.set_setting(
+        BMS_LIMITS,
+        &format!(
+            "{day},{},{},{},{}",
+            today[0], today[1], yesterday[0], yesterday[1]
+        ),
+    )?;
+    let usual = |i: usize| Some(today[i].max(yesterday[i])).filter(|a| a.is_finite());
+    info.max_charge_current = usual(0);
+    info.max_discharge_current = usual(1);
+    Ok(info)
 }
 
 /// Whether PV is on right now, from the configured relay.
@@ -989,6 +1105,110 @@ pub fn pv_from_weather(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Three MultiPlus-II 48/5000s and a 32 kWh battery whose BMS allows 247 A.
+    fn three_multis() -> BatteryInfo {
+        BatteryInfo {
+            capacity_wh: Some(32_000.0),
+            inverter_units: 3,
+            max_charge_current: Some(247.0),
+            max_discharge_current: Some(247.0),
+            dvcc_max_charge_current: None,
+            ess_max_charge_power: None,
+            ess_max_discharge_power: None,
+            voltage: Some(52.0),
+            active_min_soc: Some(5.0),
+        }
+    }
+
+    #[test]
+    fn power_limits_go_through_the_losses() {
+        let prior = LearnedLosses {
+            standby: None,
+            charge: None,
+            discharge: None,
+        };
+        let (model, limits) = battery_model(&three_multis(), &prior, None).unwrap();
+        // The chargers' 3 × 70 A at 52 V reach the terminals; more comes in on AC.
+        assert_eq!(limits.charge, Limit::Chargers);
+        let terminals = model.dc_for_ac(model.max_charge_ac).0 / model.cell_efficiency;
+        assert!((terminals - 3.0 * 70.0 * 52.0).abs() < 1.0, "{terminals}");
+        assert!(model.max_charge_ac.0 > 3.0 * 70.0 * 52.0);
+        // The BMS's 247 A at 52 V is 12.8 kW at the terminals, but less after
+        // the inverters' losses: below their 12 kW.
+        assert_eq!(limits.discharge, Limit::Bms);
+        let ac = model.max_discharge_ac.0;
+        assert!(ac > 11_400.0 && ac < 12_000.0, "{ac}");
+        // A BMS that allows more: then the inverters' 12 kW.
+        let big = BatteryInfo {
+            max_discharge_current: Some(350.0),
+            ..three_multis()
+        };
+        let (model, limits) = battery_model(&big, &prior, None).unwrap();
+        assert_eq!(limits.discharge, Limit::Inverters);
+        assert_eq!(model.max_discharge_ac, Watts(12_000.0));
+
+        // A 100 A BMS limit applies at the terminals: less comes out on AC.
+        let small = BatteryInfo {
+            max_discharge_current: Some(100.0),
+            ..three_multis()
+        };
+        let (model, limits) = battery_model(&small, &prior, None).unwrap();
+        assert_eq!(limits.discharge, Limit::Bms);
+        assert!(model.max_discharge_ac.0 < 5200.0 && model.max_discharge_ac.0 > 4700.0);
+
+        // Limits set on the GX device win when they're lower.
+        let capped = BatteryInfo {
+            dvcc_max_charge_current: Some(150.0),
+            ess_max_discharge_power: Some(9000.0),
+            ..three_multis()
+        };
+        let (model, limits) = battery_model(&capped, &prior, None).unwrap();
+        assert_eq!(limits.charge, Limit::Dvcc);
+        assert_eq!(
+            (limits.discharge, model.max_discharge_ac),
+            (Limit::Ess, Watts(9000.0))
+        );
+        let capped = BatteryInfo {
+            ess_max_charge_power: Some(5000.0),
+            ..capped
+        };
+        let (model, limits) = battery_model(&capped, &prior, None).unwrap();
+        assert_eq!(
+            (limits.charge, model.max_charge_ac),
+            (Limit::Ess, Watts(5000.0))
+        );
+    }
+
+    #[test]
+    fn a_bms_that_lowers_its_limits_for_a_while() {
+        let store = Store::in_memory().unwrap();
+        let at = |a: f64| BatteryInfo {
+            max_charge_current: Some(a),
+            ..three_multis()
+        };
+        let day: Timestamp = "2026-09-27T12:00:00Z".parse().unwrap();
+        let usual = |info, now| {
+            usual_bms_limits(&store, info, now)
+                .unwrap()
+                .max_charge_current
+        };
+        assert_eq!(usual(at(247.0), day), Some(247.0));
+        // Full: the BMS stops charging for a while, the plan doesn't.
+        let hours = |h| SignedDuration::from_hours(h);
+        assert_eq!(usual(at(0.0), day + hours(2)), Some(247.0));
+        // Still the next day.
+        assert_eq!(usual(at(0.0), day + hours(24)), Some(247.0));
+        // Two days at most 100 A: that's the limit now.
+        assert_eq!(usual(at(100.0), day + hours(48)), Some(100.0));
+        // The discharge limit is kept apart.
+        assert_eq!(
+            usual_bms_limits(&store, three_multis(), day + hours(48))
+                .unwrap()
+                .max_discharge_current,
+            Some(247.0)
+        );
+    }
 
     #[test]
     fn hot_water_is_what_is_left_today_plus_legionella() {

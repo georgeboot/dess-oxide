@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.20.3
+
+- **Power limits through the losses.** Current limits (the BMS's, DVCC's,
+  the chargers' 70 A each) apply at the battery's terminals. They now become
+  AC power through the learned loss curves, instead of a fixed 95 % for
+  charging and none for discharging. The inverters' 4 kW each apply on the
+  AC side.
+- **Limits set on the Cerbo** are followed: ESS's "limit charge power" and
+  "limit inverter power", and DVCC's "limit charge current".
+- **A BMS that lowers its limits for a while** (a full battery, a cold cell)
+  no longer shrinks the whole plan: it plans with the highest limit the BMS
+  gave today or yesterday, while ESS keeps to the live limit every second.
+- The battery section shows how much power the plan can use, on the AC side
+  and at the battery, and what limits each direction.
+
 ## 0.20.2
 
 - **Clearer texts around the last 24 hours.** The price chart has its own
