@@ -40,6 +40,9 @@ impl LossCurve {
     }
 }
 
+/// Victron's standby draw of an inverter/charger unit, W, until measured.
+pub const STANDBY_PER_UNIT: f64 = 20.0;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct BatteryModel {
     /// Usable energy between 0 and 100 % SoC, at the battery terminals.
@@ -60,14 +63,21 @@ pub struct BatteryModel {
     /// The cells' own efficiency, each way: of the DC energy at the terminals
     /// this share ends up stored, and taking energy out costs `1 / this`.
     pub cell_efficiency: f64,
+    /// How much a nearly full battery still takes: `(SoC %, W at the
+    /// terminals)` in rising SoC, interpolated, no limit below the first
+    /// point. Near full the charger holds the absorption voltage and the
+    /// current falls off.
+    pub charge_taper: Vec<(f64, f64)>,
 }
 
 impl BatteryModel {
-    /// Prior for `units` MultiPlus-II 48/5000s, until M2 learns the real curve.
+    /// Prior for `units` MultiPlus-II units, until each site's own samples
+    /// replace it.
     ///
-    /// Fitted to the stage table in George's DAO config, with the standby draw
-    /// (about 20 W per unit) taken out. Resistive losses scale with the power
-    /// per unit, so the quadratic term shrinks with more units.
+    /// A typical curve (fitted to one site's measured DAO stage table, with
+    /// the standby draw taken out), and Victron's standby figure of about
+    /// 20 W per unit. Resistive losses scale with the power per unit, so the
+    /// quadratic term shrinks with more units.
     pub fn multiplus_ii_prior(
         capacity: WattHours,
         units: u32,
@@ -85,13 +95,31 @@ impl BatteryModel {
                 linear: 0.0,
                 quadratic: 2.55e-5 / n,
             },
-            standby: Watts(20.0 * n),
+            standby: Watts(STANDBY_PER_UNIT * n),
             bypass_draw: Some(Watts(8.0 * n)),
             max_charge_ac,
             max_discharge_ac,
             // LFP cells lose about 4 % over a round trip, until measured.
             cell_efficiency: 0.98,
+            charge_taper: Vec::new(),
         }
+    }
+
+    /// The most the battery takes at its terminals at `soc_pct`, W.
+    pub fn max_charge_terminal(&self, soc_pct: f64) -> f64 {
+        let points = &self.charge_taper;
+        match points.first() {
+            None => return f64::INFINITY,
+            Some(&(first, _)) if soc_pct <= first => return f64::INFINITY,
+            _ => {}
+        }
+        for pair in points.windows(2) {
+            let ((s0, w0), (s1, w1)) = (pair[0], pair[1]);
+            if soc_pct <= s1 {
+                return w0 + (w1 - w0) * (soc_pct - s0) / (s1 - s0).max(1e-9);
+            }
+        }
+        points.last().map_or(f64::INFINITY, |&(_, w)| w)
     }
 
     /// How fast the stored energy changes for AC power `ac` (positive =

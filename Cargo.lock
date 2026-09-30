@@ -1890,7 +1890,7 @@ dependencies = [
 
 [[package]]
 name = "dess-core"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "jiff",
  "proptest",
@@ -1899,7 +1899,7 @@ dependencies = [
 
 [[package]]
 name = "dess-models"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "burn",
  "dess-core",
@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "dess-oxide"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -1936,7 +1936,7 @@ dependencies = [
 
 [[package]]
 name = "dess-victron"
-version = "0.20.3"
+version = "0.21.0"
 dependencies = [
  "dess-core",
  "jiff",

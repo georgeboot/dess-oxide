@@ -247,6 +247,24 @@ impl<'a> Problem<'a> {
         }
     }
 
+    /// The level `m` leads to from `level`: `None` beyond the battery, or
+    /// when it charges faster than a nearly full battery takes (at the SoC
+    /// halfway through the move).
+    fn next_level(&self, level: usize, m: &Move) -> Option<usize> {
+        let next = level
+            .checked_add_signed(m.levels)
+            .filter(|&n| n < self.levels)?;
+        let battery = self.request.battery;
+        if m.levels > 0 && !battery.charge_taper.is_empty() {
+            let midway = (level as f64 + m.levels as f64 / 2.0) * self.step / self.capacity * 100.0;
+            let terminals = m.dc / battery.cell_efficiency.clamp(0.5, 1.0);
+            if terminals > battery.max_charge_terminal(midway) + 1e-6 {
+                return None;
+            }
+        }
+        Some(next)
+    }
+
     /// The grid level nearest to `soc_pct`.
     fn level_of(&self, soc_pct: f64) -> usize {
         ((soc_pct / 100.0 * self.capacity) / self.step)
@@ -336,9 +354,7 @@ impl<'a> Problem<'a> {
                             settings.relay_switch_cost
                         };
                         for (m, costs) in moves.iter().zip(&stage) {
-                            let Some(next) =
-                                level.checked_add_signed(m.levels).filter(|&n| n < levels)
-                            else {
+                            let Some(next) = self.next_level(level, m) else {
                                 continue;
                             };
                             let shortfall_wh = (floor_level.saturating_sub(next)
@@ -604,6 +620,45 @@ mod tests {
         // Starting above it, the plan comes down.
         let p = run(&forecasts(&[0.25; 8], 500.0, 0.0), 95.0, &capped);
         assert!(p.slots[0].soc_end < 95.0);
+    }
+
+    #[test]
+    fn a_nearly_full_battery_charges_slower() {
+        // Cheap now, dear later: fill up. Above 95 % it takes at most 1 kW.
+        let tapered = BatteryModel {
+            charge_taper: vec![(90.0, 10_000.0), (95.0, 1_000.0), (100.0, 1_000.0)],
+            ..battery()
+        };
+        let mut prices = vec![0.05; 12];
+        prices.extend([0.60; 4]);
+        let slots = forecasts(&prices, 500.0, 0.0);
+        let p = plan(&PlanRequest {
+            now: start(),
+            soc_pct: 60.0,
+            pv_on: true,
+            battery: &tapered,
+            slots: &slots,
+            settings: &settings(),
+        });
+        for s in &p.slots {
+            let midway = f64::midpoint(s.soc_start, s.soc_end);
+            let terminals = s.battery_dc.0 / tapered.cell_efficiency;
+            assert!(
+                terminals <= tapered.max_charge_terminal(midway) + 1.0,
+                "{s:?}"
+            );
+        }
+        let highest = p.slots.iter().map(|s| s.soc_end).fold(0.0, f64::max);
+        assert!(highest > 97.0, "still fills up: {highest}");
+        // It gets there by charging earlier, not faster at the top.
+        let untapered = run(&slots, 60.0, &settings());
+        let top = |p: &Plan| p.slots.iter().position(|s| s.soc_end > 97.0);
+        assert!(
+            top(&p) >= top(&untapered),
+            "{:?} {:?}",
+            top(&p),
+            top(&untapered)
+        );
     }
 
     #[test]

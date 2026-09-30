@@ -214,17 +214,18 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
     venus.full_publish(Duration::from_secs(30)).await?;
     let started = Instant::now();
     let view = venus.with_snapshot(|snapshot| {
+        let store = planning::lock(&store);
         planning::make_plan(
             now,
             snapshot,
-            &planning::lock(&store),
+            &store,
             &config,
             &tariff,
             planning::ForecastInputs {
                 pv: &pv,
                 weather: &weather,
                 models: models.as_models(),
-                outage: planning::outage_window(&planning::lock(&store), now),
+                outage: planning::outage_window(&store, now),
                 soc: None,
                 next_legionella: None,
                 price_forecast: &std::collections::BTreeMap::new(),

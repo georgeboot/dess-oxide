@@ -231,8 +231,8 @@ pub fn make_plan(
     };
     let info = usual_bms_limits(store, reading::battery_info(snapshot), now)?;
     let fit = learned_capacity(store, now)?;
-    let (mut battery, limits) =
-        battery_model(&info, &learned_losses(store, now)?, fit.usable_wh())?;
+    let losses = learned_losses(store, now, info.inverter_units)?;
+    let (mut battery, mut limits) = battery_model(&info, &losses, fit.usable_wh())?;
     // The cells' own round trip: from the BMS's counters, else from the
     // charge and discharge stretches.
     let counters = cell_round_trip(store, &config.history, now)?.map(|c| c.round_trip);
@@ -242,6 +242,8 @@ pub fn make_plan(
     if let Some(draw) = learned_bypass_draw(store) {
         battery.bypass_draw = Some(Watts(draw));
     }
+    let full = battery.dc_for_ac(battery.max_charge_ac).0 / battery.cell_efficiency.clamp(0.5, 1.0);
+    (battery.charge_taper, limits.taper_measured) = charge_taper(&charge_taper_stats(store), full);
     let lookback =
         Slot::containing(now - SignedDuration::from_hours(24 * i64::from(PRICE_LOOKBACK_DAYS + 1)));
     let prices = store.prices(
@@ -443,11 +445,91 @@ pub fn money(flows: &[SlotFlows], spot: &BTreeMap<Slot, EurPerKwh>, tariff: &Tar
 }
 
 /// Losses learned from the last half year of steady-state samples.
-pub fn learned_losses(store: &Store, now: Timestamp) -> anyhow::Result<LearnedLosses> {
+/// `units` inverter/chargers: their standby draw anchors the curves until
+/// it's measured.
+pub fn learned_losses(store: &Store, now: Timestamp, units: u32) -> anyhow::Result<LearnedLosses> {
     let today = now.as_second().div_euclid(86_400);
     Ok(dess_core::efficiency::fit_losses(
         &store.efficiency_bins(today - 180, today)?,
+        dess_core::battery::STANDBY_PER_UNIT * f64::from(units),
     ))
+}
+
+/// Seconds of charging at the battery's limit, per SoC percent: `soc:sum
+/// of W:samples;…`.
+pub const CHARGE_TAPER: &str = "charge_taper";
+/// Seconds at a SoC percent before its measured limit counts.
+const MIN_TAPER_SAMPLES: f64 = 60.0;
+/// Below this SoC the battery takes whatever the chargers give.
+pub const TAPER_FROM_SOC: f64 = 80.0;
+
+/// The stored taper measurements: SoC percent → (sum of W, samples).
+pub fn charge_taper_stats(store: &Store) -> BTreeMap<u8, (f64, f64)> {
+    store
+        .setting(CHARGE_TAPER)
+        .ok()
+        .flatten()
+        .map(|s| {
+            s.split(';')
+                .filter_map(|bin| {
+                    let mut parts = bin.split(':');
+                    Some((
+                        parts.next()?.parse().ok()?,
+                        (parts.next()?.parse().ok()?, parts.next()?.parse().ok()?),
+                    ))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Adds new measurements, older ones fading as new ones come in.
+pub fn add_charge_taper_stats(store: &Store, new: &BTreeMap<u8, (f64, f64)>) -> anyhow::Result<()> {
+    if new.is_empty() {
+        return Ok(());
+    }
+    let mut stats = charge_taper_stats(store);
+    for (soc, (sum, n)) in new {
+        let entry = stats.entry(*soc).or_default();
+        // A few hours of new samples outweigh the old ones.
+        let decay = 0.98_f64.powf(n / 60.0);
+        *entry = (entry.0 * decay + sum, entry.1 * decay + n);
+    }
+    let text: Vec<String> = stats
+        .iter()
+        .map(|(soc, (sum, n))| format!("{soc}:{sum}:{n}"))
+        .collect();
+    store.set_setting(CHARGE_TAPER, &text.join(";"))
+}
+
+/// How much the battery takes near full, `(SoC %, W at the terminals)`:
+/// measured where there's enough, else a typical LFP shape (full power to
+/// 95 %, falling to 30 % of it at 100 %), never rising with SoC and never
+/// above `full`. Also how many SoC percents are measured.
+pub fn charge_taper(stats: &BTreeMap<u8, (f64, f64)>, full: f64) -> (Vec<(f64, f64)>, usize) {
+    let typical = |soc: f64| {
+        if soc <= 95.0 {
+            full
+        } else {
+            full * (1.0 - 0.7 * (soc - 95.0) / 5.0)
+        }
+    };
+    let mut measured = 0;
+    let mut lowest = full;
+    let points = (TAPER_FROM_SOC as u8..=100)
+        .map(|soc| {
+            let w = match stats.get(&soc) {
+                Some(&(sum, n)) if n >= MIN_TAPER_SAMPLES => {
+                    measured += 1;
+                    sum / n
+                }
+                _ => typical(f64::from(soc)),
+            };
+            lowest = lowest.min(w);
+            (f64::from(soc), lowest)
+        })
+        .collect();
+    (points, measured)
 }
 
 /// The battery model and current state, from the GX device, with learned
@@ -562,10 +644,10 @@ pub enum Limit {
     Bms,
     /// DVCC's "limit charge current" on the GX device.
     Dvcc,
-    /// The chargers: 70 A per MultiPlus-II 48/5000.
+    /// The chargers' rated current.
     #[default]
     Chargers,
-    /// The inverters: 4 kW continuous per MultiPlus-II 48/5000.
+    /// The inverters' continuous power.
     Inverters,
     /// ESS's "limit charge power" or "limit inverter power".
     Ess,
@@ -581,6 +663,11 @@ pub struct PowerLimits {
     pub bms_discharge: Option<f64>,
     /// Inverter/charger units.
     pub units: u32,
+    /// Per unit: the charger's current, A, and the inverter's power, W.
+    pub charger_a: f64,
+    pub inverter_w: f64,
+    /// SoC percents near full where the battery's acceptance is measured.
+    pub taper_measured: usize,
 }
 
 /// The battery model, and what limits its power. Current limits apply at
@@ -597,6 +684,8 @@ pub fn battery_model(
     let units = info.inverter_units;
     let n = f64::from(units);
     let voltage = info.voltage.unwrap_or(51.2);
+    // Without a model name, a MultiPlus-II 48/5000's: 70 A and 4 kW.
+    let (charger_a, inverter_w) = info.unit_ratings.unwrap_or((70.0, 4000.0));
     let mut model =
         BatteryModel::multiplus_ii_prior(WattHours(capacity_wh), units, Watts::ZERO, Watts::ZERO);
     if let Some(standby) = learned.standby {
@@ -629,7 +718,7 @@ pub fn battery_model(
             Limit::Dvcc,
             info.dvcc_max_charge_current.map(|a| a * voltage),
         ),
-        (Limit::Chargers, Some(70.0 * n * voltage)),
+        (Limit::Chargers, Some(charger_a * n * voltage)),
     ]);
     let (charge_by, charge) = lowest(&[
         (charge_by, Some(charge_ac(charge_dc))),
@@ -641,7 +730,7 @@ pub fn battery_model(
             info.max_discharge_current
                 .map(|a| model.discharge_loss.ac_from_discharging(a * voltage)),
         ),
-        (Limit::Inverters, Some(4000.0 * n)),
+        (Limit::Inverters, Some(inverter_w * n)),
         (Limit::Ess, info.ess_max_discharge_power),
     ]);
     model.max_charge_ac = Watts(charge);
@@ -654,6 +743,9 @@ pub fn battery_model(
             bms_charge: info.max_charge_current,
             bms_discharge: info.max_discharge_current,
             units,
+            charger_a,
+            inverter_w,
+            taper_measured: 0,
         },
     ))
 }
@@ -1116,9 +1208,34 @@ mod tests {
             dvcc_max_charge_current: None,
             ess_max_charge_power: None,
             ess_max_discharge_power: None,
+            unit_ratings: Some((70.0, 4000.0)),
             voltage: Some(52.0),
             active_min_soc: Some(5.0),
         }
+    }
+
+    #[test]
+    fn the_taper_is_typical_until_measured() {
+        let store = Store::in_memory().unwrap();
+        let (typical, measured) = charge_taper(&charge_taper_stats(&store), 10_000.0);
+        assert_eq!(measured, 0);
+        let at = |points: &[(f64, f64)], soc: f64| {
+            points.iter().find(|p| p.0 == soc).map(|p| p.1).unwrap()
+        };
+        assert_eq!(at(&typical, 95.0), 10_000.0);
+        assert!((at(&typical, 100.0) - 3_000.0).abs() < 1e-6);
+
+        // Two minutes at 96 % taking 4 kW, and a minute at 90 % taking 9 kW.
+        let mut new = BTreeMap::new();
+        new.insert(96, (4_000.0 * 120.0, 120.0));
+        new.insert(90, (9_000.0 * 60.0, 60.0));
+        add_charge_taper_stats(&store, &new).unwrap();
+        let (learned, measured) = charge_taper(&charge_taper_stats(&store), 10_000.0);
+        assert_eq!(measured, 2);
+        assert!((at(&learned, 90.0) - 9_000.0).abs() < 1e-6);
+        assert!((at(&learned, 96.0) - 4_000.0).abs() < 1e-6);
+        // Never rising with SoC: 97 % can't take more than 96 % did.
+        assert!(at(&learned, 97.0) <= 4_000.0);
     }
 
     #[test]

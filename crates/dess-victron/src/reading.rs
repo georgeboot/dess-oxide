@@ -113,6 +113,9 @@ pub struct BatteryInfo {
     /// ESS's "limit charge power" and "limit inverter power", W, when set.
     pub ess_max_charge_power: Option<f64>,
     pub ess_max_discharge_power: Option<f64>,
+    /// Per inverter/charger unit, from its model name: the charger's current,
+    /// A, and the inverter's continuous power, W.
+    pub unit_ratings: Option<(f64, f64)>,
     pub voltage: Option<f64>,
     /// The minimum SoC ESS enforces right now, %.
     pub active_min_soc: Option<f64>,
@@ -143,7 +146,7 @@ pub fn battery_info(snapshot: &Snapshot) -> BatteryInfo {
     let vebus = snapshot
         .number("system/0/VebusInstance")
         .map(|i| format!("vebus/{i}"));
-    let inverter_units = vebus.map_or(1, |vebus| {
+    let inverter_units = vebus.as_ref().map_or(1, |vebus| {
         (0..32)
             .take_while(|n| {
                 snapshot
@@ -155,6 +158,10 @@ pub fn battery_info(snapshot: &Snapshot) -> BatteryInfo {
     });
     // A limit set on the GX device; -1 means none.
     let limit = |key: &str| snapshot.number(key).filter(|v| *v >= 0.0);
+    let unit_ratings = vebus
+        .as_ref()
+        .and_then(|vebus| snapshot.text(&format!("{vebus}/ProductName")))
+        .and_then(unit_ratings);
     BatteryInfo {
         capacity_wh,
         inverter_units,
@@ -163,9 +170,23 @@ pub fn battery_info(snapshot: &Snapshot) -> BatteryInfo {
         dvcc_max_charge_current: limit("settings/0/Settings/SystemSetup/MaxChargeCurrent"),
         ess_max_charge_power: limit("settings/0/Settings/CGwacs/MaxChargePower"),
         ess_max_discharge_power: limit("settings/0/Settings/CGwacs/MaxDischargePower"),
+        unit_ratings,
         voltage: snapshot.number("system/0/Dc/Battery/Voltage"),
         active_min_soc: snapshot.number("system/0/Control/ActiveSocLimit"),
     }
+}
+
+/// A Victron inverter/charger's ratings from its name, such as
+/// "MultiPlus-II 48/5000/70-50": 70 A charging, and continuous power of 80 %
+/// of its 5000 VA (Victron's figure at 25 °C).
+fn unit_ratings(name: &str) -> Option<(f64, f64)> {
+    let token = name
+        .split_whitespace()
+        .find(|t| t.matches('/').count() >= 2)?;
+    let mut parts = token.split('/').skip(1);
+    let va: f64 = parts.next()?.parse().ok()?;
+    let amps: f64 = parts.next()?.split(['-', '+']).next()?.parse().ok()?;
+    Some((amps, 0.8 * va))
 }
 
 fn missing(key: &str) -> ReadingError {
@@ -371,5 +392,18 @@ mod tests {
         assert_eq!(info.dvcc_max_charge_current, None, "-1 is no limit");
         assert_eq!(info.ess_max_charge_power, Some(8000.0));
         assert_eq!(info.ess_max_discharge_power, None);
+    }
+
+    #[test]
+    fn ratings_from_the_model_name() {
+        assert_eq!(
+            unit_ratings("MultiPlus-II 48/5000/70-50"),
+            Some((70.0, 4000.0))
+        );
+        assert_eq!(
+            unit_ratings("Quattro 48/10000/140-100+100"),
+            Some((140.0, 8000.0))
+        );
+        assert_eq!(unit_ratings("MultiPlus-II"), None);
     }
 }

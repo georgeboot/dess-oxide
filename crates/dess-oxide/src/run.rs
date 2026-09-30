@@ -298,6 +298,7 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
     let mut recorder = Recorder::new(MAX_SAMPLE_GAP);
     let mut sampler = EfficiencySampler::default();
     let mut bypass = BypassSampler::default();
+    let mut taper = TaperSampler::default();
     let mut soc = SocEstimator::new(dess_core::WattHours(0.0));
     let mut warnings = RateLimitedWarning::default();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
@@ -345,10 +346,14 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
                     }
                     _ => {}
                 }
+                taper.push(&sample);
                 for record in recorder.push(sample) {
                     persist(&shared, &record, &mut sampler, now);
                     if let Err(error) = bypass.persist(&shared) {
                         warn!(%error, "storing the bypass draw");
+                    }
+                    if let Err(error) = taper.persist(&shared) {
+                        warn!(%error, "storing the charge taper");
                     }
                 }
             }
@@ -399,6 +404,45 @@ impl BypassSampler {
         store.set_setting(planning::BYPASS_DRAW, &format!("{sum},{n}"))?;
         *self = Self::default();
         Ok(())
+    }
+}
+
+/// How much a nearly full battery takes. While ESS regulates towards a
+/// setpoint, a grid that stays below it as the battery charges means the
+/// battery takes less than it's asked: its power then is what it accepts at
+/// that SoC. Counted after 20 s of it, so ESS's own ramps don't.
+#[derive(Debug, Default)]
+struct TaperSampler {
+    run: u32,
+    bins: BTreeMap<u8, (f64, f64)>,
+}
+
+impl TaperSampler {
+    fn push(&mut self, sample: &dess_core::record::Sample) {
+        let limited = sample.grid_connected
+            && sample.soc_pct >= planning::TAPER_FROM_SOC
+            && sample.battery.0 > 100.0
+            && sample
+                .setpoint
+                .is_some_and(|s| sample.grid.0 < s.0 - (0.05 * s.0.abs()).max(250.0));
+        if !limited {
+            self.run = 0;
+            return;
+        }
+        self.run += 1;
+        if self.run > 20 {
+            let bin = self
+                .bins
+                .entry(sample.soc_pct.floor().min(100.0) as u8)
+                .or_default();
+            bin.0 += sample.battery.0;
+            bin.1 += 1.0;
+        }
+    }
+
+    fn persist(&mut self, shared: &Shared) -> anyhow::Result<()> {
+        let bins = std::mem::take(&mut self.bins);
+        planning::add_charge_taper_stats(&lock(&shared.store), &bins)
     }
 }
 

@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.21.0
+
+- **The battery charges slower near full, and the plan knows it.** Above
+  80 % SoC dess-oxide measures how much the battery takes whenever ESS can't
+  reach its setpoint while charging (the battery accepting less than asked).
+  Until it has seen that, it assumes a typical LFP shape: full power to 95 %,
+  falling to 30 % at 100 %. The plan then charges earlier instead of
+  counting on full power right up to 100 %. The page shows what it takes at
+  95, 97 and 99 %.
+- **Loss curves anchored on the measured standby draw.** The inverters'
+  draw while ESS regulates and the battery idles is measured on its own, and
+  the charge and discharge curves are fitted around it; until measured,
+  Victron's 20 W per unit. Fitted together, a controller that bypasses
+  whenever the battery idles left too few idle samples, which pulled the
+  standby down and flattened the curves.
+- **Ratings from the inverters' model name:** the chargers' current and the
+  inverters' continuous power come from, for example, "MultiPlus-II
+  48/5000/70-50", instead of assuming that model.
+- `dess-oxide plan` no longer hangs: it locked its database twice.
+
 ## 0.20.3
 
 - **Power limits through the losses.** Current limits (the BMS's, DVCC's,

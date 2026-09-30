@@ -262,7 +262,12 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
                     Vec::new()
                 });
             let battery = (
-                crate::planning::learned_losses(&store, now).ok(),
+                crate::planning::learned_losses(
+                    &store,
+                    now,
+                    view.as_ref().map_or(1, |v| v.limits.units),
+                )
+                .ok(),
                 crate::planning::learned_capacity(&store, now).ok(),
             );
             let money = money_by_period(&shared, &store, now).unwrap_or_else(|error| {
@@ -1546,10 +1551,16 @@ fn power_limits(l: Lang, view: &PlanView) -> Markup {
                     "de DVCC-laadstroomlimiet op de Cerbo",
                 )
                 .to_owned(),
-            Limit::Chargers => format!("{} ({units} × 70 A)", l.t("the chargers", "de laders")),
-            Limit::Inverters => {
-                format!("{} ({units} × 4 kW)", l.t("the inverters", "de omvormers"))
-            }
+            Limit::Chargers => format!(
+                "{} ({units} × {:.0} A)",
+                l.t("the chargers", "de laders"),
+                limits.charger_a
+            ),
+            Limit::Inverters => format!(
+                "{} ({units} × {:.1} kW)",
+                l.t("the inverters", "de omvormers"),
+                limits.inverter_w / 1000.0
+            ),
             Limit::Ess => l
                 .t(
                     "ESS's power limit on the Cerbo",
@@ -1572,6 +1583,21 @@ fn power_limits(l: Lang, view: &PlanView) -> Markup {
             (by(limits.charge, limits.bms_charge)) (l.t(", discharging by ", ", ontladen door ")) (by(limits.discharge, limits.bms_discharge)) ". "
             (l.t("The BMS's limits count as the highest it reported today or yesterday: when it lowers them for a while (full, cold), ESS keeps to that every second, but the plan doesn't count on it for days.",
                  "Voor de BMS telt de hoogste limiet die hij vandaag of gisteren gaf: verlaagt hij die even (vol, koud), dan houdt ESS zich daar elke seconde aan, maar rekent de planning er niet dagen mee."))
+        }
+        p {
+            (l.t("Nearly full it takes less: ", "Bijna vol neemt hij minder op: "))
+            @for (i, soc) in [95.0, 97.0, 99.0].into_iter().enumerate() {
+                @if i > 0 { ", " }
+                (format!("{soc:.0} % ")) (kw(battery.max_charge_terminal(soc).min(charge_dc)))
+            }
+            (l.t(" into the battery", " de accu in"))
+            @if limits.taper_measured > 0 {
+                (l.t(" (measured at ", " (gemeten bij ")) (limits.taper_measured)
+                (l.t(" SoC percents above 80 %, where the battery took less than ESS asked).", " SoC-procenten boven 80 %, waar de accu minder opnam dan ESS vroeg)."))
+            } @else {
+                (l.t(" (typical for LFP until measured: whenever the battery takes less than ESS asks above 80 %).", " (gebruikelijk voor LFP tot het gemeten is: zodra de accu boven 80 % minder opneemt dan ESS vraagt)."))
+            }
+            (l.t(" The plan charges earlier rather than counting on full power up to 100 %.", " De planning laadt daarom eerder, in plaats van tot 100 % op vol vermogen te rekenen."))
         }
     }
 }

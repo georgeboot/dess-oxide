@@ -137,13 +137,23 @@ pub struct LearnedLosses {
 /// a direction's curve is trusted over the prior.
 const MIN_SAMPLES: u64 = 600;
 const MIN_SPAN_W: f64 = 1500.0;
+/// Idle samples (ESS regulating, the inverters converting next to nothing)
+/// needed before the measured standby draw replaces the prior.
+const MIN_IDLE_SAMPLES: f64 = 300.0;
 /// Older bins count less: half weight per month.
 const HALF_LIFE_DAYS: f64 = 30.0;
 
 /// Fits `loss(P) = a + b·P + c·P²` (with `loss = AC − DC` and `P = |AC|`)
 /// for each direction by weighted least squares, with `b, c ≥ 0`. `bins` are
 /// `(age in days, bin, stats)`.
-pub fn fit_losses(bins: &[(f64, i32, BinStats)]) -> LearnedLosses {
+///
+/// The standby draw `a` is measured on its own, from the idle samples, and
+/// the curves are fitted around it. Fitted together with the curves it's
+/// poorly pinned down when idle samples are scarce (a controller that
+/// bypasses the inverters whenever the battery idles leaves few), and a
+/// wrong `a` bends the curves the other way. Until there are enough idle
+/// samples, `standby_prior` stands in.
+pub fn fit_losses(bins: &[(f64, i32, BinStats)], standby_prior: f64) -> LearnedLosses {
     let points: Vec<(f64, f64, f64)> = bins
         .iter()
         .filter(|(_, _, s)| s.n > 0)
@@ -154,51 +164,44 @@ pub fn fit_losses(bins: &[(f64, i32, BinStats)]) -> LearnedLosses {
             (ac, loss, n * 0.5f64.powf(age / HALF_LIFE_DAYS))
         })
         .collect();
-    let idle = |(ac, _, _): &&(f64, f64, f64)| ac.abs() <= 50.0;
-    let direction = |charging: bool| -> Option<(f64, LossCurve)> {
-        let side: Vec<(f64, f64, f64)> = points
+    let (idle_loss, idle_weight) = points
+        .iter()
+        .filter(|p| p.0.abs() <= 50.0)
+        .fold((0.0, 0.0), |(l, w), p| (l + p.1 * p.2, w + p.2));
+    let standby = (idle_weight >= MIN_IDLE_SAMPLES).then(|| (idle_loss / idle_weight).max(0.0));
+    let a = standby.unwrap_or(standby_prior);
+    let direction = |charging: bool| -> Option<LossCurve> {
+        let active: Vec<(f64, f64, f64)> = points
             .iter()
-            .filter(|p| idle(p) || (p.0 > 50.0) == charging)
-            .map(|&(ac, loss, w)| (ac.abs(), loss, w))
+            .filter(|p| p.0.abs() > 50.0 && (p.0 > 0.0) == charging)
+            .map(|&(ac, loss, w)| (ac.abs(), loss - a, w))
             .collect();
-        let active: Vec<_> = side.iter().filter(|p| p.0 > 50.0).collect();
         let samples: f64 = active.iter().map(|p| p.2).sum();
         let span = active.iter().map(|p| p.0).fold(0.0, f64::max)
             - active.iter().map(|p| p.0).fold(f64::MAX, f64::min);
         if samples < MIN_SAMPLES as f64 * 0.5 || span < MIN_SPAN_W {
             return None;
         }
-        let [a, b, c] = constrained_quadratic(&side)?;
-        Some((
-            a,
-            LossCurve {
-                linear: b,
-                quadratic: c,
-            },
-        ))
-    };
-    let charge = direction(true);
-    let discharge = direction(false);
-    let standby = match (charge, discharge) {
-        (Some((a, _)), Some((b, _))) => Some(f64::midpoint(a, b)),
-        (Some((a, _)), None) | (None, Some((a, _))) => Some(a),
-        (None, None) => None,
+        let [_, b, c] = constrained_through_origin(&active)?;
+        Some(LossCurve {
+            linear: b,
+            quadratic: c,
+        })
     };
     LearnedLosses {
-        standby: standby.map(|s| s.max(0.0)),
-        charge: charge.map(|(_, curve)| curve),
-        discharge: discharge.map(|(_, curve)| curve),
+        standby,
+        charge: direction(true),
+        discharge: direction(false),
     }
 }
 
-/// Weighted least squares for `y = a + b·x + c·x²` with `b, c ≥ 0`: drops a
-/// term that comes out negative and refits.
-fn constrained_quadratic(points: &[(f64, f64, f64)]) -> Option<[f64; 3]> {
+/// Weighted least squares for `y = b·x + c·x²` with `b, c ≥ 0`: drops a term
+/// that comes out negative and refits.
+fn constrained_through_origin(points: &[(f64, f64, f64)]) -> Option<[f64; 3]> {
     for terms in [
-        [true, true, true],
-        [true, true, false],
-        [true, false, true],
-        [true, false, false],
+        [false, true, true],
+        [false, true, false],
+        [false, false, true],
     ] {
         let Some(solution) = weighted_least_squares(points, terms) else {
             continue;
@@ -278,7 +281,8 @@ mod tests {
                 };
                 let loss = 40.0 + lin * p + quad * p * p;
                 let dc = ac - loss;
-                let n = 50u64;
+                // Minutes of idling, under a minute at each power.
+                let n = if b == 0 { 400u64 } else { 50 };
                 let stats = BinStats {
                     n,
                     sum_ac: ac * n as f64,
@@ -292,7 +296,7 @@ mod tests {
 
     #[test]
     fn recovers_a_known_loss_curve() {
-        let learned = fit_losses(&bins());
+        let learned = fit_losses(&bins(), 60.0);
         assert!((learned.standby.unwrap() - 40.0).abs() < 1e-6);
         let charge = learned.charge.unwrap();
         assert!((charge.linear - 0.02).abs() < 1e-6 && (charge.quadratic - 1e-5).abs() < 1e-9);
@@ -308,8 +312,25 @@ mod tests {
             .into_iter()
             .filter(|(_, b, _)| (0..=10).contains(b))
             .collect();
-        let learned = fit_losses(&few);
+        let learned = fit_losses(&few, 60.0);
         assert!(learned.charge.is_none() && learned.discharge.is_none());
+    }
+
+    #[test]
+    fn without_idle_samples_the_standby_prior_anchors_the_curves() {
+        // As under a controller that bypasses whenever the battery idles:
+        // no samples near zero power.
+        let busy: Vec<_> = bins()
+            .into_iter()
+            .filter(|(_, b, _)| b.abs() >= 5)
+            .collect();
+        let learned = fit_losses(&busy, 40.0);
+        assert_eq!(learned.standby, None, "not measured");
+        let discharge = learned.discharge.unwrap();
+        assert!(
+            (discharge.linear - 0.01).abs() < 1e-6 && (discharge.quadratic - 1.5e-5).abs() < 1e-9,
+            "{discharge:?}"
+        );
     }
 
     fn t(s: i64) -> Timestamp {
