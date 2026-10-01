@@ -197,6 +197,10 @@ pub struct HistorySlot {
     pub setpoint: Option<Watts>,
     /// dess-oxide's plan for the slot, made when it started.
     pub planned_grid: Option<Watts>,
+    /// Shares of the slot ESS regulated towards a setpoint (else it was in
+    /// external control: bypass), and the grid was down.
+    pub regulating: f64,
+    pub islanded: f64,
     pub forecast_load: Option<Watts>,
     pub forecast_pv: Option<Watts>,
 }
@@ -478,8 +482,12 @@ impl Store {
                     (m.load_out_wh + CASE WHEN ?2 THEN m.load_in_wh ELSE 0 END) * 3600.0 / m.covered_seconds,
                     (m.pv_ac_wh + m.pv_dc_wh) * 3600.0 / m.covered_seconds,
                     m.soc_end,
-                    CASE WHEN m.setpoint_seconds > 0 THEN m.setpoint_integral_wh * 3600.0 / m.setpoint_seconds END,
-                    p.grid_w, p.load_w, p.pv_w
+                    -- Only where ESS steered by it for most of the slot: a slot in bypass
+                    -- otherwise shows the setpoint of its first seconds.
+                    CASE WHEN m.setpoint_seconds >= 0.5 * m.covered_seconds
+                         THEN m.setpoint_integral_wh * 3600.0 / m.setpoint_seconds END,
+                    p.grid_w, p.load_w, p.pv_w,
+                    m.setpoint_seconds / m.covered_seconds, m.grid_lost_seconds / m.covered_seconds
              FROM slot_measurements m
              LEFT JOIN (SELECT slot_start, grid_w, load_w, pv_w, min(planned_at)
                         FROM plans WHERE slot_start <= planned_at GROUP BY slot_start) p
@@ -500,6 +508,8 @@ impl Store {
                     planned_grid: row.get::<_, Option<f64>>(6)?.map(Watts),
                     forecast_load: row.get::<_, Option<f64>>(7)?.map(Watts),
                     forecast_pv: row.get::<_, Option<f64>>(8)?.map(Watts),
+                    regulating: row.get(9)?,
+                    islanded: row.get(10)?,
                 },
             ))
         })?;
@@ -1296,6 +1306,25 @@ mod tests {
         assert!((mean(false) - 1000.0).abs() < 10.0, "{}", mean(false));
         let history = store.history(from, false).unwrap();
         assert!((history[0].load.0 - 1000.0).abs() < 10.0);
+    }
+
+    #[test]
+    fn a_slot_mostly_in_bypass_shows_no_setpoint() {
+        let store = Store::in_memory().unwrap();
+        // 10 s still regulating towards the last slot's 10 kW, then bypass.
+        let mut slot = record("2026-09-27T11:00:00Z", 899);
+        slot.setpoint_integral = Watts(10_000.0).over_seconds(10.0);
+        slot.setpoint_seconds = 10.0;
+        store.save_slot(&slot, 0).unwrap();
+        let history = store.history(slot.slot, false).unwrap();
+        assert_eq!(history[0].setpoint, None);
+        // Regulating throughout: shown.
+        let mut slot = record("2026-09-27T11:15:00Z", 899);
+        slot.setpoint_integral = Watts(2_000.0).over_seconds(899.0);
+        slot.setpoint_seconds = 899.0;
+        store.save_slot(&slot, 0).unwrap();
+        let history = store.history(slot.slot, false).unwrap();
+        assert!((history[0].setpoint.unwrap().0 - 2_000.0).abs() < 1.0);
     }
 
     #[test]

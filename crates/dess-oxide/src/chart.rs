@@ -16,6 +16,8 @@ const LEFT: f64 = 52.0;
 const RIGHT: f64 = 8.0;
 const TOP: f64 = 8.0;
 const BOTTOM: f64 = 22.0;
+/// Room for a band under the plot.
+const BAND: f64 = 14.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -68,6 +70,15 @@ impl<'a> Series<'a> {
     }
 }
 
+/// A strip under the plot with a state per slot, such as ESS's mode.
+pub struct Band<'a> {
+    pub label: &'a str,
+    /// Each state's label and CSS class.
+    pub states: Vec<(&'a str, &'a str)>,
+    /// Per slot, an index into `states`.
+    pub values: Vec<Option<usize>>,
+}
+
 pub struct Chart<'a> {
     /// Slot starts, 15 minutes apart.
     pub slots: &'a [Timestamp],
@@ -79,6 +90,7 @@ pub struct Chart<'a> {
     pub shade_from: Option<usize>,
     /// Fixed y range, e.g. 0–100 for SoC.
     pub y_range: Option<(f64, f64)>,
+    pub band: Option<Band<'a>>,
     pub lang: Lang,
 }
 
@@ -91,12 +103,12 @@ impl Chart<'_> {
         let (low, high) = self.y_range.unwrap_or_else(|| self.value_range());
         let plot_height = self.height - TOP - BOTTOM;
         let y = |v: f64| TOP + (high - v) / (high - low) * plot_height;
+        let height = self.height + if self.band.is_some() { BAND } else { 0.0 };
 
         let mut svg = String::new();
         let _ = write!(
             svg,
-            r#"<svg viewBox="0 0 {WIDTH} {h}" class="chart" role="img" preserveAspectRatio="none">"#,
-            h = self.height
+            r#"<svg viewBox="0 0 {WIDTH} {height}" class="chart" role="img" preserveAspectRatio="none">"#,
         );
         if let Some(from) = self.shade_from.filter(|&i| i < self.slots.len()) {
             let _ = write!(
@@ -140,8 +152,11 @@ impl Chart<'_> {
                 svg,
                 r#"<line class="grid" x1="{xi:.1}" x2="{xi:.1}" y1="{TOP}" y2="{:.1}"/><text class="axis" x="{xi:.1}" y="{:.1}" text-anchor="middle">{label}</text>"#,
                 TOP + plot_height,
-                self.height - 6.0
+                height - 6.0
             );
+        }
+        if let Some(band) = &self.band {
+            draw_band(&mut svg, band, &x, TOP + plot_height + 4.0, slot_width);
         }
         for (i, series) in self.series.iter().enumerate() {
             let _ = write!(svg, r#"<g data-i="{i}">"#);
@@ -175,6 +190,11 @@ impl Chart<'_> {
                     @for (i, series) in self.series.iter().enumerate() {
                         span.legend data-i=(i) title=(self.lang.t("click to hide or show", "klik om te verbergen of te tonen")) { i class=(series.swatch()) {} (series.label) }
                     }
+                    @if let Some(band) = &self.band {
+                        @for (label, class) in &band.states {
+                            span.legend { i class=(class) {} (label) }
+                        }
+                    }
                 }
             }
         }
@@ -202,6 +222,14 @@ impl Chart<'_> {
                     "values": s.values.iter().map(round).collect::<Vec<_>>(),
                 }))
                 .collect::<Vec<_>>(),
+            "band": self.band.as_ref().map(|band| {
+                let state = |v: &Option<usize>| v.and_then(|s| band.states.get(s));
+                serde_json::json!({
+                    "label": band.label,
+                    "values": band.values.iter().map(|v| state(v).map(|s| s.0)).collect::<Vec<_>>(),
+                    "classes": band.values.iter().map(|v| state(v).map(|s| s.1)).collect::<Vec<_>>(),
+                })
+            }),
         })
         .to_string()
     }
@@ -217,6 +245,21 @@ impl Chart<'_> {
         }
         let pad = (high - low) * 0.05;
         (if low < 0.0 { low - pad } else { low }, high + pad)
+    }
+}
+
+/// The band's strip: a rect per slot with a known state, at `top`.
+fn draw_band(svg: &mut String, band: &Band<'_>, x: &impl Fn(f64) -> f64, top: f64, width: f64) {
+    for (i, state) in band.values.iter().enumerate() {
+        let Some((_, class)) = state.and_then(|s| band.states.get(s)) else {
+            continue;
+        };
+        let _ = write!(
+            svg,
+            r#"<rect class="{class} band" x="{:.1}" y="{top:.1}" width="{:.1}" height="7"/>"#,
+            x(i as f64),
+            width + 0.3
+        );
     }
 }
 
@@ -348,6 +391,11 @@ mod tests {
             now: None,
             shade_from: Some(3),
             y_range: None,
+            band: Some(Band {
+                label: "ESS",
+                states: vec![("regulating", "m-reg"), ("bypass", "m-bypass")],
+                values: vec![Some(0), Some(1), None, Some(0)],
+            }),
             lang: Lang::En,
         };
         let svg = chart.render(&TimeZone::UTC).into_string();
@@ -357,5 +405,10 @@ mod tests {
             "the gap splits the line"
         );
         assert!(svg.contains(r#"class="shade""#));
+        // The band: a strip per known slot, its states in the legend and
+        // the tooltip's data.
+        assert_eq!(svg.matches(r#" band""#).count(), 3);
+        assert!(svg.contains("bypass</span>"));
+        assert!(svg.contains("&quot;band&quot;"));
     }
 }

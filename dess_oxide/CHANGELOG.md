@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.21.1
+
+- **The last 24 hours no longer show a stale setpoint in bypass.** A
+  quarter hour in bypass showed the setpoint of its first seconds (still the
+  previous quarter hour's, before ESS switched over), so the red line seemed
+  to stay at 10 kW while the grid was near 0. The setpoint is now drawn only
+  where ESS steered by it for most of the quarter hour.
+- **A strip under the grid chart shows ESS's mode** per quarter hour:
+  steering to the setpoint, bypass, or a power cut. It's in the tooltip too.
+
 ## 0.21.0
 
 - **The battery charges slower near full, and the plan knows it.** Above

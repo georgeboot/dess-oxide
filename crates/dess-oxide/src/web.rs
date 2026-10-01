@@ -19,7 +19,7 @@ use maud::{DOCTYPE, Markup, PreEscaped, html};
 use tokio::sync::watch;
 use tracing::{error, info};
 
-use crate::chart::{Chart, Kind, Series};
+use crate::chart::{Band, Chart, Kind, Series};
 use crate::comparison::Comparison;
 use crate::i18n::Lang;
 use crate::planning::Money;
@@ -761,6 +761,7 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
         now: Some(now),
         shade_from,
         y_range: None,
+        band: None,
         lang: l,
     };
     let power = Chart {
@@ -803,6 +804,7 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
         now: Some(now),
         shade_from,
         y_range: None,
+        band: None,
         lang: l,
     };
     let soc = Chart {
@@ -818,6 +820,7 @@ fn plan_section(shared: &Shared, view: &PlanView, now: Timestamp) -> Markup {
         now: Some(now),
         shade_from,
         y_range: Some((0.0, 100.0)),
+        band: None,
         lang: l,
     };
     html! {
@@ -886,6 +889,7 @@ fn history_section(
         now: Some(now),
         shade_from: None,
         y_range: None,
+        band: Some(ess_mode_band(l, &window, &recorded)),
         lang: l,
     };
     let load = Chart {
@@ -923,17 +927,50 @@ fn history_section(
         now: Some(now),
         shade_from: None,
         y_range: None,
+        band: None,
         lang: l,
     };
     html! {
         section {
             h2 { (l.t("Last 24 hours", "Afgelopen 24 uur")) }
-            p.muted { (l.t("The first chart: what went through the grid, what dess-oxide had planned for it, and the setpoint ESS steered to (DAO's, while DAO is in control). Where the setpoint line is missing, ESS was in bypass: the battery idle, the grid passing through.", "De eerste grafiek: wat er door het net ging, wat dess-oxide daarvoor had gepland, en het setpoint waarop ESS stuurde (dat van DAO, zolang DAO stuurt). Waar de setpointlijn ontbreekt, stond ESS in bypass: accu stil, het net gaat er rechtstreeks doorheen.")) }
+            p.muted { (l.t("The first chart: what went through the grid, what dess-oxide had planned for it, and the setpoint ESS steered to (DAO's, while DAO is in control). The strip under it shows ESS's mode: steering to the setpoint, or in bypass (the battery idle, the grid passing through), where the setpoint means nothing and isn't drawn.", "De eerste grafiek: wat er door het net ging, wat dess-oxide daarvoor had gepland, en het setpoint waarop ESS stuurde (dat van DAO, zolang DAO stuurt). De balk eronder toont de modus van ESS: sturen op het setpoint, of bypass (accu stil, het net gaat er rechtstreeks doorheen), waar het setpoint niets betekent en niet getekend wordt.")) }
             (grid.render(&shared.tz))
             (load.render(&shared.tz))
             (forecast_errors(l, history))
             (price_history(shared, &slots, &window, prices, now))
         }
+    }
+}
+
+/// ESS's mode per recorded slot: steering to its setpoint, in bypass, or
+/// running the island in a power cut.
+fn ess_mode_band<'a>(
+    l: Lang,
+    window: &[Slot],
+    recorded: &std::collections::HashMap<Slot, &HistorySlot>,
+) -> Band<'a> {
+    Band {
+        label: "ESS",
+        states: vec![
+            (
+                l.t("steers to the setpoint", "stuurt op het setpoint"),
+                "m-reg",
+            ),
+            ("bypass", "m-bypass"),
+            (l.t("power cut", "stroomstoring"), "m-island"),
+        ],
+        values: window
+            .iter()
+            .map(|slot| {
+                recorded
+                    .get(slot)
+                    .map(|h| match (h.islanded >= 0.5, h.regulating >= 0.5) {
+                        (true, _) => 2,
+                        (false, true) => 0,
+                        (false, false) => 1,
+                    })
+            })
+            .collect(),
     }
 }
 
@@ -976,6 +1013,7 @@ fn price_history(
         now: Some(now),
         shade_from: None,
         y_range: None,
+        band: None,
         lang: l,
     };
     html! {
@@ -1825,6 +1863,10 @@ document.addEventListener('DOMContentLoaded', () => {
         swatch.className = s.class; value.textContent = fmt(s.values[i]) + ' ' + d.unit;
         row.append(swatch, s.label + ' ', value); tip.append(row);
       });
+      if (d.band && d.band.values[i] != null) {
+        const row = document.createElement('div'), swatch = document.createElement('i');
+        swatch.className = d.band.classes[i]; row.append(swatch, d.band.label + ': ' + d.band.values[i]); tip.append(row);
+      }
       tip.hidden = false;
       const left = ev.clientX - fig.getBoundingClientRect().left;
       tip.style.left = (left + 14 + tip.offsetWidth > fig.clientWidth ? left - 14 - tip.offsetWidth : left + 14) + 'px';
@@ -1897,6 +1939,8 @@ figcaption { font-size: 12px; color: var(--muted); padding: 2px 6px; display: fl
 .s-bat { color: var(--bat); fill: var(--bat); } .s-grid { color: var(--grid); stroke: var(--grid); }
 .s-soc { color: var(--soc); stroke: var(--soc); } .s-plan { color: var(--plan); stroke: var(--plan); }
 .s-dao { color: var(--dao); stroke: var(--dao); } .s-hp { color: var(--hp); stroke: var(--hp); }
+.m-reg { color: var(--soc); fill: var(--soc); } .m-bypass { color: var(--muted); fill: var(--muted); }
+.m-island { color: var(--buy); fill: var(--buy); } .band { opacity: .8; }
 details { margin-top: 20px; } summary { cursor: pointer; }
 .scroll { overflow-x: auto; }
 table { border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; margin-top: 8px; }
