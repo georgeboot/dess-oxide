@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.21.2
+
+- **The charging curve is a curve again.** Fitting the losses with no
+  negative terms, a free fit whose linear term came out slightly negative
+  was replaced by the first allowed fit (a straight line) rather than the
+  best one (losses growing with the square of the power). On real data that
+  turned 97 % at 3 kW and 89 % at 12 kW into a flat 91 %: charging at
+  moderate power looked dearer than it is, and at full power cheaper. The
+  best allowed fit is used now. Checked against a week of VRM data.
+
 ## 0.21.1
 
 - **The last 24 hours no longer show a stale setpoint in bypass.** A

@@ -195,22 +195,27 @@ pub fn fit_losses(bins: &[(f64, i32, BinStats)], standby_prior: f64) -> LearnedL
     }
 }
 
-/// Weighted least squares for `y = b·x + c·x²` with `b, c ≥ 0`: drops a term
-/// that comes out negative and refits.
+/// Weighted least squares for `y = b·x + c·x²` with `b, c ≥ 0`. When the
+/// free fit has a negative term, the best allowed fit has that term at zero:
+/// of the fits with one term dropped, the one that fits best. (Taking the
+/// first allowed one instead turns a curve whose free fit has a slightly
+/// negative linear term into a straight line.)
 fn constrained_through_origin(points: &[(f64, f64, f64)]) -> Option<[f64; 3]> {
-    for terms in [
+    let residual = |s: &[f64; 3]| -> f64 {
+        points
+            .iter()
+            .map(|&(x, y, w)| w * (y - s[1] * x - s[2] * x * x).powi(2))
+            .sum()
+    };
+    [
         [false, true, true],
         [false, true, false],
         [false, false, true],
-    ] {
-        let Some(solution) = weighted_least_squares(points, terms) else {
-            continue;
-        };
-        if solution[1] >= 0.0 && solution[2] >= 0.0 {
-            return Some(solution);
-        }
-    }
-    None
+    ]
+    .into_iter()
+    .filter_map(|terms| weighted_least_squares(points, terms))
+    .filter(|s| s[1] >= 0.0 && s[2] >= 0.0)
+    .min_by(|a, b| residual(a).total_cmp(&residual(b)))
 }
 
 /// Weighted least squares on the chosen terms of `[1, x, x²]`.
@@ -314,6 +319,34 @@ mod tests {
             .collect();
         let learned = fit_losses(&few, 60.0);
         assert!(learned.charge.is_none() && learned.discharge.is_none());
+    }
+
+    #[test]
+    fn a_curve_is_not_flattened_into_a_line() {
+        // Charging losses that grow with the square of the power, measured
+        // with a standby a little under the prior: the free fit's linear term
+        // comes out slightly negative. The best allowed fit is the curve.
+        let curve: Vec<_> = (15..=120)
+            .step_by(5)
+            .map(|b: i32| {
+                let ac = f64::from(b) * 100.0;
+                let loss = 50.0 + 9e-6 * ac * ac;
+                let stats = BinStats {
+                    n: 50,
+                    sum_ac: ac * 50.0,
+                    sum_dc: (ac - loss) * 50.0,
+                    ..BinStats::default()
+                };
+                (1.0, b, stats)
+            })
+            .collect();
+        let charge = fit_losses(&curve, 60.0).charge.unwrap();
+        assert!(charge.quadratic > 5e-6, "{charge:?}");
+        let efficiency = |p: f64| 1.0 - charge.linear - charge.quadratic * p;
+        assert!(
+            efficiency(3000.0) - efficiency(10_000.0) > 0.04,
+            "{charge:?}"
+        );
     }
 
     #[test]
