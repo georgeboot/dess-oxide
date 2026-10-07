@@ -89,6 +89,7 @@ Venus OS mirrors its D-Bus onto a local MQTT broker: `N/<portal>/…` publishes 
 | `hub4/0/Overrides/Setpoint` | the grid setpoint, once a second (volatile) |
 | `settings/0/Settings/CGwacs/Hub4Mode` | 3 (external control) for a bypass slot, back to 1 otherwise and on release |
 | `system/0/Relay/<n>/State` | the PV contactor, per slot |
+| Home Assistant `turn_on`/`turn_off` | the PV contactor instead, where it's on a switch in HA (`pv_switch`). Its state is polled and recorded in the relay's place. It has no fail-safe of its own, so dess-oxide turns PV back on at release, at shutdown, and at startup after stopping with it off |
 | `settings/0/Settings/CGwacs/BatteryLife/MinimumSocLimit` | the outage backstop only, restored afterwards |
 
 **Bypass.** With ESS in external control and nothing asked of them, the inverters pass the grid through and the battery idles. They then draw about 20 W instead of about 60 W idling in mode 1 (measured at George's site). The battery model has both, so the planner prefers bypass to trickle-charging or trickle-discharging. The mode is settled once per slot, since it's a stored setting.

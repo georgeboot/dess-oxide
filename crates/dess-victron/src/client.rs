@@ -141,27 +141,38 @@ impl Venus {
 
     /// Asks the GX device to republish every value and waits until it has.
     pub async fn full_publish(&self, timeout: Duration) -> Result<(), VenusError> {
+        /// How long to wait for the echo before asking again.
+        const ASK_AGAIN: Duration = Duration::from_secs(5);
         let token = format!("dess-oxide-{}", Timestamp::now().as_nanosecond());
         let mut echo = self.shared.full_publish_echo.subscribe();
         let payload =
-            serde_json::json!({ "keepalive-options": [{ "full-publish-completed-echo": token }] });
-        self.client
-            .publish(
-                format!("R/{}/keepalive", self.portal_id),
-                QoS::AtMostOnce,
-                false,
-                payload.to_string(),
-            )
-            .await?;
-        tokio::time::timeout(
-            timeout,
-            echo.wait_for(|e| e.as_deref() == Some(token.as_str())),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|_| VenusError::FullPublishTimeout {
-            seconds: timeout.as_secs(),
-        })
+            serde_json::json!({ "keepalive-options": [{ "full-publish-completed-echo": token }] })
+                .to_string();
+        let deadline = tokio::time::Instant::now() + timeout;
+        // A full publish is thousands of messages at once, and the broker
+        // drops what a client can't take in time: the echo can get lost in
+        // it. So ask again until it comes.
+        loop {
+            self.client
+                .publish(
+                    format!("R/{}/keepalive", self.portal_id),
+                    QoS::AtMostOnce,
+                    false,
+                    payload.clone(),
+                )
+                .await?;
+            let wait =
+                ASK_AGAIN.min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            let echoed = echo.wait_for(|e| e.as_deref() == Some(token.as_str()));
+            if tokio::time::timeout(wait, echoed).await.is_ok() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(VenusError::FullPublishTimeout {
+                    seconds: timeout.as_secs(),
+                });
+            }
+        }
     }
 
     pub(crate) fn client(&self) -> &AsyncClient {

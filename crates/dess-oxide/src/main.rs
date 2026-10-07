@@ -11,6 +11,7 @@ mod nordpool;
 mod openamber;
 mod openmeteo;
 mod planning;
+mod pv_switch;
 mod run;
 mod station;
 mod store;
@@ -228,6 +229,7 @@ async fn plan(config: Config, data_dir: &std::path::Path, rows: usize) -> anyhow
                 outage: planning::outage_window(&store, now),
                 soc: None,
                 next_legionella: None,
+                pv_switch_on: None,
                 price_forecast: &std::collections::BTreeMap::new(),
             },
         )

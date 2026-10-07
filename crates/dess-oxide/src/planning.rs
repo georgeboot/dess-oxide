@@ -207,6 +207,9 @@ pub struct ForecastInputs<'a> {
     pub soc: Option<f64>,
     /// When OpenAmber's next legionella run is due.
     pub next_legionella: Option<Timestamp>,
+    /// Whether the PV switch in Home Assistant is on, when there is one and
+    /// its state is known.
+    pub pv_switch_on: Option<bool>,
     /// The price model's prices for slots not yet published.
     pub price_forecast: &'a BTreeMap<Slot, EurPerKwh>,
 }
@@ -294,7 +297,7 @@ pub fn make_plan(
     let plan = planner::plan(&PlanRequest {
         now,
         soc_pct: soc,
-        pv_on: pv_on(snapshot, config),
+        pv_on: pv_on(snapshot, config, inputs.pv_switch_on),
         battery: &battery,
         slots: &forecasts,
         settings: &settings,
@@ -791,8 +794,12 @@ pub fn usual_bms_limits(
     Ok(info)
 }
 
-/// Whether PV is on right now, from the configured relay.
-pub fn pv_on(snapshot: &Snapshot, config: &Config) -> bool {
+/// Whether PV is on right now, from the configured relay or Home Assistant
+/// switch (`switch_on`: whether that's on, if known).
+pub fn pv_on(snapshot: &Snapshot, config: &Config, switch_on: Option<bool>) -> bool {
+    if config.pv_switch.is_configured() {
+        return switch_on.is_none_or(|on| on == config.pv_switch.on_for(true));
+    }
     let Some(relay) = config.victron.pv_relay else {
         return true;
     };
@@ -1084,7 +1091,7 @@ pub fn planner_settings(config: &Config, forecasts: &[SlotForecast]) -> PlannerS
         max_import: Watts(config.grid.max_import_kw * 1000.0),
         max_export: Watts(config.grid.max_export_kw * 1000.0),
         wear_cost: EurPerKwh(config.battery.wear_cost_eur_per_kwh),
-        pv_switchable: config.victron.pv_relay.is_some(),
+        pv_switchable: config.pv_switchable(),
         terminal_value: EurPerKwh(0.8 * median_buy.max(0.0)),
         max_soc: config.battery.max_soc(),
         ..PlannerSettings::default()
@@ -1212,6 +1219,23 @@ mod tests {
             voltage: Some(52.0),
             active_min_soc: Some(5.0),
         }
+    }
+
+    #[test]
+    fn pv_state_from_a_home_assistant_switch() {
+        let snapshot = Snapshot::default();
+        let config = |on_means: &str| -> Config {
+            serde_json::from_value(serde_json::json!({
+                "victron": {"host": "x"},
+                "pv_switch": {"entity": "switch.pv", "on_means": on_means},
+            }))
+            .unwrap()
+        };
+        assert!(pv_on(&snapshot, &config("pv_on"), Some(true)));
+        assert!(!pv_on(&snapshot, &config("pv_on"), Some(false)));
+        assert!(pv_on(&snapshot, &config("pv_off"), Some(false)));
+        // Not read yet: assume the PV is on.
+        assert!(pv_on(&snapshot, &config("pv_on"), None));
     }
 
     #[test]

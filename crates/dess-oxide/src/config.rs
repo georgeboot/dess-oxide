@@ -61,6 +61,10 @@ pub struct Config {
     /// Ecowitt WS90), to correct the forecast for the next hours.
     #[serde(default)]
     pub weather_station: WeatherStationConfig,
+    /// Home Assistant switches that connect the PV (such as a Shelly), for
+    /// sites where the GX device's relay doesn't.
+    #[serde(default)]
+    pub pv_switch: PvSwitchConfig,
     /// A key for NED (the Dutch energy dashboard): its wind and solar
     /// forecasts improve the price forecast. Optional.
     #[serde(default)]
@@ -72,6 +76,46 @@ pub struct Config {
 
 fn default_language() -> String {
     "auto".to_owned()
+}
+
+/// A PV contactor behind Home Assistant switches.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(default)]
+pub struct PvSwitchConfig {
+    /// The switch's entity id; several (one per inverter) separated by commas.
+    pub entity: Option<String>,
+    /// What the switch being on does to the PV.
+    pub on_means: RelayAction,
+}
+
+impl Default for PvSwitchConfig {
+    fn default() -> Self {
+        Self {
+            entity: None,
+            on_means: RelayAction::PvOn,
+        }
+    }
+}
+
+impl PvSwitchConfig {
+    pub fn entities(&self) -> Vec<&str> {
+        self.entity
+            .as_deref()
+            .into_iter()
+            .flat_map(|e| e.split(','))
+            .map(str::trim)
+            .filter(|e| !e.is_empty())
+            .collect()
+    }
+
+    pub fn is_configured(&self) -> bool {
+        !self.entities().is_empty()
+    }
+
+    /// Whether the switches are on when PV is (or should be) `pv_on`.
+    pub fn on_for(&self, pv_on: bool) -> bool {
+        pv_on == (self.on_means == RelayAction::PvOn)
+    }
 }
 
 /// Entities of a local weather station; each is optional.
@@ -397,6 +441,22 @@ impl Config {
         Ok((config, ignored))
     }
 
+    /// Whether something can switch the PV: the GX relay or HA switches.
+    pub fn pv_switchable(&self) -> bool {
+        self.victron.pv_relay.is_some() || self.pv_switch.is_configured()
+    }
+
+    /// Where the PV switch's state is recorded, and whether "closed" there
+    /// means PV on: the GX relay's own place, or for Home Assistant switches
+    /// the second relay's (holding whether they're on).
+    pub fn pv_recorded_state(&self) -> Option<(usize, bool)> {
+        if self.pv_switch.is_configured() {
+            Some((1, self.pv_switch.on_for(true)))
+        } else {
+            self.victron.pv_relay_state()
+        }
+    }
+
     fn validate(&self) -> anyhow::Result<()> {
         if self.victron.host.trim().is_empty() {
             bail!("victron.host is empty; set it to the GX device's address");
@@ -407,6 +467,9 @@ impl Config {
             .is_some_and(|relay| !(1..=2).contains(&relay))
         {
             bail!("victron.pv_relay must be 1 or 2");
+        }
+        if self.victron.pv_relay.is_some() && self.pv_switch.is_configured() {
+            bail!("set either victron.pv_relay or pv_switch.entity, not both");
         }
         if !(10.0..=100.0).contains(&self.battery.max_soc()) {
             bail!("battery.max_soc must be between 10 and 100");
@@ -524,12 +587,36 @@ mod tests {
         );
         config.validate().unwrap();
 
-        let (config, ignored) = Config::parse(&sample(&app["schema"]).to_string(), true).unwrap();
+        let (mut config, ignored) =
+            Config::parse(&sample(&app["schema"]).to_string(), true).unwrap();
         assert!(
             ignored.is_empty(),
             "schema options not in the config: {ignored:?}"
         );
+        // The schema has both ways to switch the PV; a config takes one.
+        assert!(config.validate().is_err());
+        config.victron.pv_relay = None;
         config.validate().unwrap();
+        assert_eq!(config.pv_recorded_state(), Some((1, true)));
+    }
+
+    #[test]
+    fn several_pv_switches_and_what_on_means() {
+        let config: Config = serde_json::from_str(
+            r#"{"victron": {"host": "x"}, "pv_switch": {"entity": "switch.pv_east, switch.pv_west", "on_means": "pv_off"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.pv_switch.entities(),
+            ["switch.pv_east", "switch.pv_west"]
+        );
+        assert!(config.pv_switchable());
+        // On disconnects the PV here: off for PV on.
+        assert!(!config.pv_switch.on_for(true));
+        assert_eq!(config.pv_recorded_state(), Some((1, false)));
+        // Without one, nothing to switch.
+        let plain: Config = serde_json::from_str(r#"{"victron": {"host": "x"}}"#).unwrap();
+        assert!(!plain.pv_switchable() && plain.pv_recorded_state().is_none());
     }
 
     #[test]

@@ -4,7 +4,7 @@
 # The Supervisor treats nested groups as required and merges only top-level
 # defaults on update, so every group below has defaults in `options`.
 name: dess-oxide
-version: "0.21.2"
+version: "0.22.0"
 slug: dess_oxide
 description: Plans and (once you allow it) runs a Victron ESS against Dutch day-ahead prices.
 url: https://github.com/georgeboot/dess-oxide
@@ -62,6 +62,7 @@ options:
     on_input: false
   openamber_device: ""
   weather_station: {}
+  pv_switch: {}
   language: auto
 schema:
   dryrun: bool
@@ -120,5 +121,8 @@ schema:
     humidity: str?
     wind_speed: str?
     solar_radiation: str?
+  pv_switch:
+    entity: str?
+    on_means: list(pv_on|pv_off)?
   language: list(auto|en|nl)
   ned_api_key: password?

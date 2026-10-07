@@ -77,7 +77,7 @@ pub fn daily(
             .collect(),
         None => HashMap::new(),
     };
-    let relay = config.victron.pv_relay_state();
+    let relay = config.pv_recorded_state();
     let kwh = |watts: f64| watts * 0.25 / 1000.0;
 
     let mut out = Vec::new();

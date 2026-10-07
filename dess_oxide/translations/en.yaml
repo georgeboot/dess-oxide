@@ -43,6 +43,15 @@ configuration:
       Ecowitt WS90: temperature, humidity, wind_speed, solar_radiation (each
       optional). dess-oxide compares the last hour with the forecast and
       corrects the next hours by the difference.
+  pv_switch:
+    name: PV switch
+    description: >-
+      entity: a Home Assistant switch that connects the PV (such as a Shelly
+      on a contactor), where the GX device's relay doesn't; several (one per
+      inverter) separated by commas. on_means: what the switch being on does,
+      pv_on (default) or pv_off. dess-oxide switches the PV off when feeding
+      in would cost money, and only with both locks on. Don't set
+      victron.pv_relay as well.
   language:
     name: Language
     description: >-

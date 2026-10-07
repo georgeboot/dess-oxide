@@ -18,6 +18,11 @@ host = "192.168.1.20"   # the GX device; "MQTT on LAN" must be enabled
 pv_relay = 2                  # Cerbo relay driving a PV contactor (function: Manual)
 pv_relay_energized = "pv_off" # what a closed relay does
 
+# Or the PV on a Home Assistant switch (a Shelly, say) instead of the GX relay:
+# [pv_switch]
+# entity = "switch.pv_contactor"   # several, one per inverter: separate with commas
+# on_means = "pv_on"
+
 [grid]
 max_import_kw = 17
 max_export_kw = 17

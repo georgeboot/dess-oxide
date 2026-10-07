@@ -491,6 +491,11 @@ impl State {
                     Err(error) => warn!(%error, "switching the PV relay"),
                 }
             }
+        } else if shared.config.pv_switch.is_configured() && self.relay_closed != Some(pv_on) {
+            // A switch in Home Assistant: its own task makes it so.
+            crate::pv_switch::request(shared, pv_on);
+            info!(pv_on, %now, "asked for the PV switch");
+            self.relay_closed = Some(pv_on);
         }
     }
 
@@ -508,6 +513,8 @@ impl State {
             if let Err(error) = writer.set_relay(relay, closed).await {
                 error!(%error, "switching the PV back on");
             }
+        } else if shared.config.pv_switch.is_configured() {
+            crate::pv_switch::request(shared, true);
         }
         self.active = false;
         self.written = None;

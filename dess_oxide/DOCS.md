@@ -132,6 +132,9 @@ ha_entities: false          # publish a few entities for automations
 ev:
   on_input: false           # the charger is between the grid meter and the Victrons
 openamber_device: ""        # e.g. openamber: split the heat pump into heating and hot water
+pv_switch:                  # optional: the PV on a Home Assistant switch instead of the GX relay
+  entity: switch.pv_contactor   # several, one per inverter: separate with commas
+  on_means: pv_on               # or pv_off, if switching it on disconnects the PV
 weather_station:            # optional: a local station in HA, such as an Ecowitt WS90
   temperature: sensor.ws90_outdoor_temperature
   humidity: sensor.ws90_humidity
@@ -196,6 +199,17 @@ history grows from the day you set it. Heating is then learned from heating
 alone. Hot water gets its own forecast: energy per day against the outdoor
 temperature, at the hours it usually runs (your schedule), and legionella
 runs at the time OpenAmber announces. The page shows the split per day.
+
+**Switching the PV off** (when feeding in would cost money) works through
+either the GX device's relay (`victron.pv_relay`) or a switch in Home
+Assistant (`pv_switch`), such as a Shelly on a contactor. Give one of the
+two. With `pv_switch`, dess-oxide reads the switch every few seconds, so it
+knows when the PV is off (those quarter hours don't count as "the sun
+didn't shine"), and it operates the switch only with both locks on. A GX
+relay wired fail-safe falls back to PV on by itself; a switch doesn't. So
+dess-oxide turns the PV back on when it releases control or stops, and when
+it starts up after stopping with the PV off. If Home Assistant can't reach
+the switch at that moment, the PV stays off until you switch it on.
 
 **`weather_station`**: the forecast (KNMI's Harmonie model, at your
 location) is right on average but can be off on the day: fog it missed, a

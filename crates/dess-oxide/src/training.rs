@@ -61,7 +61,7 @@ pub fn pv_hours(
     );
     let until = Slot::containing(now);
     let weather = store.weather(from, until)?;
-    let recorded = store.recorded_pv(from, config.victron.pv_relay_state())?;
+    let recorded = store.recorded_pv(from, config.pv_recorded_state())?;
     let ha: BTreeMap<i64, f64> = match config.history.pv.as_deref().filter(|e| !e.is_empty()) {
         Some(entity) => store
             .ha_hourly(&[entity], from.start())?

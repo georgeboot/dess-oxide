@@ -1,5 +1,19 @@
 # Changelog
 
+## 0.22.0
+
+- **`pv_switch`: the PV on a Home Assistant switch.** For sites where a
+  Shelly (or any switch in Home Assistant) connects the PV rather than the
+  GX device's relay. Give the switch's entity, or several separated by
+  commas for more than one inverter, and whether on means PV on (default)
+  or off. dess-oxide reads the switch every few seconds, so the plan and the
+  recordings know when the PV is off, and it operates the switch only with
+  both locks on. It turns the PV back on when it releases control or stops.
+- **Faster, steadier start.** Connecting to the GX device sometimes waited
+  30 seconds for a confirmation that got lost in the burst of values the
+  device sends at once (seen after updating to Venus 3.80). It now asks
+  again after a few seconds.
+
 ## 0.21.2
 
 - **The charging curve is a curve again.** Fitting the losses with no

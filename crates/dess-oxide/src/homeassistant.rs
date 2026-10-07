@@ -269,6 +269,28 @@ pub async fn state(
     Ok(body["state"].as_str().map(str::to_owned))
 }
 
+/// Turns a switch (or anything Home Assistant can turn on and off) on or off.
+pub async fn turn(
+    client: &reqwest::Client,
+    endpoint: &Endpoint,
+    entity_id: &str,
+    on: bool,
+) -> anyhow::Result<()> {
+    let service = if on { "turn_on" } else { "turn_off" };
+    client
+        .post(format!(
+            "{}/services/homeassistant/{service}",
+            endpoint.rest
+        ))
+        .bearer_auth(&endpoint.token)
+        .json(&json!({ "entity_id": entity_id }))
+        .send()
+        .await
+        .with_context(|| format!("switching {entity_id}"))?
+        .error_for_status()?;
+    Ok(())
+}
+
 /// Hourly change of energy statistics (kWh) in `[start, end)`.
 pub async fn hourly_energy(
     connection: &mut Connection,

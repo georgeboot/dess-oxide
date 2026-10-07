@@ -86,6 +86,10 @@ pub struct Shared {
     pub weather_correction: Mutex<Option<dess_core::weather_correction::Correction>>,
     /// The page's language.
     pub lang: Mutex<crate::i18n::Lang>,
+    /// A PV switch in Home Assistant: when it was read, and whether it's on.
+    pub pv_switch: Mutex<Option<(Timestamp, bool)>>,
+    /// What the executor wants that switch to be.
+    pub pv_switch_wanted: watch::Sender<Option<bool>>,
     /// The price model, when it beats the recent median.
     pub price_model: watch::Sender<Option<Arc<dess_models::price::PriceModel>>>,
     /// Its prices for the hours not yet published, per slot.
@@ -121,6 +125,13 @@ impl Shared {
 
     pub fn control_status(&self) -> crate::control::ControlStatus {
         self.control.lock().expect("control lock poisoned").clone()
+    }
+
+    /// Whether the PV switch in Home Assistant is on, if it was read lately.
+    pub fn pv_switch_on(&self, now: Timestamp) -> Option<bool> {
+        let read = *self.pv_switch.lock().expect("lock poisoned");
+        read.filter(|(at, _)| now.duration_since(*at) <= SignedDuration::from_secs(30))
+            .map(|(_, on)| on)
     }
 
     /// The SoC estimate, if it's current.
@@ -212,6 +223,8 @@ impl Shared {
             next_legionella: Mutex::new(None),
             station: Mutex::new(None),
             weather_correction: Mutex::new(None),
+            pv_switch: Mutex::new(None),
+            pv_switch_wanted: watch::Sender::new(None),
             price_model: watch::Sender::new(None),
             price_forecast: watch::Sender::new(Arc::new(BTreeMap::new())),
             lang: Mutex::new(match config_language.as_str() {
@@ -264,6 +277,11 @@ fn spawn_tasks(
         stopped.clone(),
     )));
     tasks.push(tokio::spawn(crate::openamber::run(
+        Arc::clone(shared),
+        client.clone(),
+        stopped.clone(),
+    )));
+    tasks.push(tokio::spawn(crate::pv_switch::run(
         Arc::clone(shared),
         client.clone(),
         stopped.clone(),
@@ -345,6 +363,11 @@ async fn record(venus: Arc<Venus>, shared: Arc<Shared>, mut stop: watch::Receive
                         bypass.push(sample.inverter_ac.0);
                     }
                     _ => {}
+                }
+                // A PV switch in Home Assistant is recorded in the second
+                // relay's place (see `Config::pv_recorded_state`).
+                if shared.config.pv_switch.is_configured() {
+                    sample.relays[1] = shared.pv_switch_on(now);
                 }
                 taper.push(&sample);
                 for record in recorder.push(sample) {
@@ -907,6 +930,7 @@ fn replan(venus: &Venus, shared: &Shared) {
         outage,
         soc: shared.soc(now),
         next_legionella: *shared.next_legionella.lock().expect("lock poisoned"),
+        pv_switch_on: shared.pv_switch_on(now),
         price_forecast: &price_forecast,
     };
     let result = fresh(venus, &snapshot, now)

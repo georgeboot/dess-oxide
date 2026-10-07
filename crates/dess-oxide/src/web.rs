@@ -255,7 +255,7 @@ async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
                 .forecast_accuracy(
                     Slot::containing(now - SignedDuration::from_hours(24 * 7)),
                     !shared.config.ev.on_input,
-                    shared.config.victron.pv_relay_state(),
+                    shared.config.pv_recorded_state(),
                 )
                 .unwrap_or_else(|error| {
                     error!(%error, "reading forecast accuracy");
