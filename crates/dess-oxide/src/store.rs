@@ -768,6 +768,34 @@ impl Store {
         }
     }
 
+    /// A stored model's training time, metrics and whether it's in use,
+    /// without its parameters (which can be large).
+    pub fn model_summary(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<(jiff::Timestamp, serde_json::Value, bool)>> {
+        let row = self.conn.query_row(
+            "SELECT trained_at, metrics, promoted FROM models WHERE name = ?1",
+            [name],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        );
+        match row {
+            Ok((trained_at, metrics, promoted)) => Ok(Some((
+                jiff::Timestamp::from_second(trained_at)?,
+                serde_json::from_str(&metrics)?,
+                promoted,
+            ))),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
     /// How far off the stored forecasts were for the slots recorded since
     /// `from`, by how far ahead they were made (up to 48 h). Load is
     /// compared as in [`Store::load_history`]; PV only in daylight slots with

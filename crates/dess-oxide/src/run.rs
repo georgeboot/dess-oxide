@@ -618,7 +618,8 @@ async fn train_pv(shared: &Arc<Shared>, location: LocationConfig) {
     })
     .await;
     match result {
-        Ok(Ok(Some(report))) => {
+        Ok(Ok(Some(training))) => {
+            let report = &training.physics;
             let promoted = report.improves();
             info!(
                 hours = report.hours,
@@ -628,19 +629,40 @@ async fn train_pv(shared: &Arc<Shared>, location: LocationConfig) {
                 model = %crate::training::pv_model_json(&report.model),
                 "trained the PV model"
             );
-            let saved = lock(&shared.store).save_model(
+            let store = lock(&shared.store);
+            let saved = store.save_model(
                 "pv",
                 now,
                 &crate::training::pv_model_json(&report.model),
-                &crate::training::fit_metrics(&report),
+                &crate::training::fit_metrics(report),
                 promoted,
             );
             if let Err(error) = saved {
                 error!(%error, "storing the PV model");
             }
+            if let Some((model, fit)) = &training.corrected {
+                info!(
+                    hours = fit.hours,
+                    corrected_mae_kwh = format!("{:.3}", fit.validation_mae),
+                    physics_mae_kwh = format!("{:.3}", fit.physics_mae),
+                    promoted = fit.improves(),
+                    "trained the PV correction"
+                );
+                let saved = store.save_model(
+                    crate::training::PV_CORRECTED,
+                    now,
+                    &crate::training::pv_model_json(model),
+                    &crate::training::correction_metrics(fit, promoted),
+                    fit.improves(),
+                );
+                if let Err(error) = saved {
+                    error!(%error, "storing the PV correction");
+                }
+            }
+            drop(store);
             shared
                 .pv_model
-                .send_replace(promoted.then(|| Arc::new(report.model)));
+                .send_replace(training.in_use().map(Arc::new));
         }
         Ok(Ok(None)) => info!("not enough history to train the PV model yet"),
         Ok(Err(error)) => warn!("training the PV model: {error:#}"),

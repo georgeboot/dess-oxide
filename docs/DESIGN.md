@@ -124,7 +124,11 @@ Home Assistant's statistics can glitch (a counter reset shows up as its whole to
 
 ### 7.3 PV
 
-Per virtual array: effective kWp (losses folded in), tilt and azimuth, plus the inverter's AC limit as a soft clip, all learned from hourly history against the archived forecast. Configured arrays are the starting point. The virtual arrays needn't match the physical strings; only the inverter's total is seen. Hours with the PV relay open are excluded.
+**Physics.** Per virtual array: effective kWp (losses folded in), tilt and azimuth, plus the inverter's AC limit as a soft clip, all learned from hourly history against the archived forecast. Configured arrays are the starting point. The virtual arrays needn't match the physical strings; only the inverter's total is seen. Hours with the PV relay open are excluded.
+
+**Correction.** The physics can't know about shading when the sun is low, reflection at shallow angles, or a weather forecast that reads low. On a year of one site's data, the panels made half of what the physics predicted with the sun below 10° and a tenth more than predicted above 30°: one kWp figure has to compromise. So boosted trees are fitted to what the physics got wrong, from the physics' own output, the irradiance, temperature and wind, the sky's clearness, and the sun's height and direction. No date is needed: the sun's position carries the season. On that site it takes about a fifth off the forecast's hourly error and removes the seasonal bias (the physics alone forecast 29 % too much in winter). Tried once there are about two months of daylight hours, and used while it beats the physics alone on held-out days.
+
+Two things tested and not adopted: fitting the physics on satellite-measured irradiance (worse: the forecast reads about 10 % lower than the satellite, so a model has to learn from the forecast it will be fed), and trees without the physics (nearly as good with a year of data, but nothing to start from at a new site).
 
 ### 7.4 Base load
 

@@ -1243,6 +1243,7 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                     }
                 }
             }
+            (pv_correction_line(shared))
             h3 { (l.t("Heat pump", "Warmtepomp")) }
             @match heat_pump.as_ref().and_then(|m| crate::training::hp_model_from_json(&m.params).map(|hp| (m, hp))) {
                 None => p.muted { (l.t("Not trained yet: it needs two weeks of the heat pump meter's history (history.heat_pump).", "Nog niet getraind: het heeft twee weken historie van de warmtepompmeter nodig (history.heat_pump).")) },
@@ -1273,6 +1274,38 @@ fn models_section(shared: &Shared, models: &[Option<StoredModel>; 3]) -> Markup 
                 None => p.muted { (l.t("Not trained yet: it needs two weeks of load history.", "Nog niet getraind: het heeft twee weken verbruikshistorie nodig.")) },
                 Some(model) => (model_summary(shared, model, "baseline_mae_kwh", l.t("the same hour's average on the same weekday over the four weeks before", "het gemiddelde van hetzelfde uur op dezelfde weekdag over de vier weken ervoor"))),
             }
+        }
+    }
+}
+
+/// The correction on top of the PV physics: how it does against the physics
+/// alone.
+fn pv_correction_line(shared: &Shared) -> Markup {
+    let l = shared.lang();
+    let summary = lock(&shared.store)
+        .model_summary(crate::training::PV_CORRECTED)
+        .ok()
+        .flatten();
+    let what = l.t(
+        "On top of that comes a correction for what the physics can't know: shading when the sun is low, reflection at shallow angles, a weather forecast that reads low. It's learned from what the physics got wrong, by the sun's height and direction and the weather",
+        "Daarbovenop komt een correctie voor wat de natuurkunde niet kan weten: schaduw bij lage zon, reflectie bij een vlakke invalshoek, een weersverwachting die te laag zit. Die is geleerd uit wat de natuurkunde fout had, naar de hoogte en richting van de zon en het weer",
+    );
+    html! {
+        @match summary {
+            None => p.muted { (what) (l.t(", once there are about two months of daylight hours.", ", zodra er zo'n twee maanden aan uren met daglicht zijn.")) },
+            Some((at, metrics, promoted)) => p {
+                (what) ". " (l.t("Trained ", "Getraind ")) (local(shared, at, "%a %d %b %H:%M")) (l.t(" on ", " op ")) (metrics["hours"])
+                (l.t(" hours. Held-out error ", " uur. Fout op achtergehouden dagen "))
+                (format!("{:.3}", metrics["validation_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
+                (l.t(" kWh/h, against ", " kWh/u, tegen "))
+                (format!("{:.3}", metrics["physics_mae_kwh"].as_f64().unwrap_or(f64::NAN)))
+                (l.t(" without it: ", " zonder: "))
+                @if promoted { strong { (l.t("in use", "in gebruik")) } } @else { (l.t("not better yet, so not used", "nog niet beter, dus niet in gebruik")) }
+                @if metrics["on_learned_physics"].as_bool() == Some(false) {
+                    (l.t(" (on the configured arrays)", " (op de ingestelde panelenvelden)"))
+                }
+                "."
+            },
         }
     }
 }

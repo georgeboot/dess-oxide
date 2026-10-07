@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.23.0
+
+- **The PV forecast learns what the physics can't know.** The panel model
+  knows where the sun stands and how warm the panels get, but not that a
+  low sun is partly shaded, or that the weather forecast reads a little low.
+  On a year of real data the panels made half of what it predicted with the
+  sun under 10° and a tenth more than predicted above 30°. So it forecast
+  too much in winter (29 %) and too little around midday in spring and
+  autumn. Boosted trees now correct the physics from what it got wrong, by
+  the sun's height and direction and the weather. On that data the
+  forecast's hourly error drops by about a fifth and the seasonal bias goes.
+  It starts after about two months of history, and is used while it beats
+  the physics alone on held-out days; the page shows both errors.
+- The PV physics is now checked on every fifth day through the year rather
+  than on the most recent fifth of the history, so every season counts.
+
 ## 0.22.0
 
 - **`pv_switch`: the PV on a Home Assistant switch.** For sites where a

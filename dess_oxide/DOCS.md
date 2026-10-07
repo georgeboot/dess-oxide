@@ -47,7 +47,9 @@ on here.
 - **Forecasts:**
   - PV from KNMI Harmonie (via Open-Meteo), at Home Assistant's location,
     through a **learned PV model**. It's trained nightly on your history and
-    the archived weather, and starts from your configured arrays.
+    the archived weather, and starts from your configured arrays. After
+    about two months it also learns what the physics can't know, such as
+    shading when the sun is low, from what it got wrong.
   - house load from a **learned base-load model plus a learned heat pump
     model**. The heat pump model includes frost losses in humid air. Until
     they beat the naive forecast, load comes from history.

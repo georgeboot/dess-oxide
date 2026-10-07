@@ -7,10 +7,11 @@ use dess_core::battery::BatteryModel;
 use dess_core::calendar;
 use dess_core::weather::Weather;
 use dess_models::features::{self, HourWeather};
+use dess_models::gbdt::{Gbdt, Node, Tree};
 use dess_models::heatpump::{self, HpFit, HpHour, HpModel};
 use dess_models::hot_water::{self, HotWaterDay, HotWaterModel};
 use dess_models::load::{self, Dense, LoadFit, LoadHour, LoadModel};
-use dess_models::pv::{self, Array, FitReport, Hour, PvModel, Quarter};
+use dess_models::pv::{self, Array, CorrectionFit, FitReport, Hour, PvModel, Quarter};
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde_json::json;
@@ -43,6 +44,7 @@ pub fn initial_pv_model(config: &Config) -> Option<PvModel> {
             .collect(),
         // Unknown: start well above the arrays' output, so it's learned only if it binds.
         cap_kw: total * 1.2,
+        correction: None,
     })
 }
 
@@ -90,6 +92,7 @@ pub fn pv_hours(
             continue;
         };
         hours.push(Hour {
+            start: hour_start,
             quarters,
             energy_kwh,
         });
@@ -114,13 +117,31 @@ fn quarters(
     (slots.len() == 4).then_some(out)
 }
 
+/// A PV training run: the physics, and the correction on top of whichever
+/// physics is in use (the learned one if it beats the configured arrays).
+pub struct PvTraining {
+    pub physics: FitReport,
+    /// The model with its correction, and how the correction did.
+    pub corrected: Option<(PvModel, CorrectionFit)>,
+}
+
+impl PvTraining {
+    /// The model to forecast with, if any beats the configured arrays.
+    pub fn in_use(&self) -> Option<PvModel> {
+        match &self.corrected {
+            Some((model, fit)) if fit.improves() => Some(model.clone()),
+            _ => self.physics.improves().then(|| self.physics.model.clone()),
+        }
+    }
+}
+
 /// Fits the PV model, or `None` when there isn't enough history yet.
 pub fn train_pv(
     store: &Store,
     config: &Config,
     location: LocationConfig,
     now: Timestamp,
-) -> anyhow::Result<Option<FitReport>> {
+) -> anyhow::Result<Option<PvTraining>> {
     let Some(initial) = initial_pv_model(config) else {
         return Ok(None);
     };
@@ -136,7 +157,20 @@ pub fn train_pv(
     if hours.len() < MIN_HOURS {
         return Ok(None);
     }
-    Ok(Some(pv::fit(&hours, &initial, ITERATIONS)))
+    let physics = pv::fit(&hours, &initial, ITERATIONS);
+    let base = if physics.improves() {
+        &physics.model
+    } else {
+        &initial
+    };
+    let corrected = pv::fit_correction(&hours, base).map(|fit| {
+        let model = PvModel {
+            correction: Some(fit.trees.clone()),
+            ..base.clone()
+        };
+        (model, fit)
+    });
+    Ok(Some(PvTraining { physics, corrected }))
 }
 
 /// The promoted models in the store.
@@ -165,7 +199,9 @@ impl StoredModels {
             }
         }
         Self {
-            pv: promoted(store, "pv", pv_model_from_json),
+            // With its correction when that's in use, else the physics.
+            pv: promoted(store, PV_CORRECTED, pv_model_from_json)
+                .or_else(|| promoted(store, "pv", pv_model_from_json)),
             heat_pump: promoted(store, "heat_pump", hp_model_from_json),
             load: promoted(store, "load", load_model_from_json),
             hot_water: promoted(store, "hot_water", hot_water_model_from_json),
@@ -478,10 +514,69 @@ pub fn baseline_metrics(
     })
 }
 
+/// The stored model with its correction (the physics alone is "pv").
+pub const PV_CORRECTED: &str = "pv_correction";
+
 pub fn pv_model_json(model: &PvModel) -> serde_json::Value {
     json!({
         "arrays": model.arrays.iter().map(|a| json!({ "kwp": a.kwp, "tilt": a.tilt, "azimuth": a.azimuth })).collect::<Vec<_>>(),
         "cap_kw": model.cap_kw,
+        "correction": model.correction.as_ref().map(trees_json),
+    })
+}
+
+/// Trees as nested arrays: a leaf is `[value]`, a split `[feature,
+/// threshold, left, right]`.
+fn trees_json(trees: &Gbdt) -> serde_json::Value {
+    let node = |n: &Node| match *n {
+        Node::Leaf(value) => json!([value]),
+        Node::Split {
+            feature,
+            threshold,
+            left,
+            right,
+        } => json!([feature, threshold, left, right]),
+    };
+    json!({
+        "base": trees.base,
+        "trees": trees.trees.iter().map(|t| t.nodes.iter().map(node).collect::<Vec<_>>()).collect::<Vec<_>>(),
+    })
+}
+
+fn trees_from_json(value: &serde_json::Value) -> Option<Gbdt> {
+    let index = |v: &serde_json::Value| usize::try_from(v.as_u64()?).ok();
+    let node = |n: &serde_json::Value| -> Option<Node> {
+        match n.as_array()?.as_slice() {
+            [value] => Some(Node::Leaf(value.as_f64()?)),
+            [feature, threshold, left, right] => Some(Node::Split {
+                feature: index(feature)?,
+                threshold: threshold.as_f64()?,
+                left: index(left)?,
+                right: index(right)?,
+            }),
+            _ => None,
+        }
+    };
+    let trees = value["trees"]
+        .as_array()?
+        .iter()
+        .map(|tree| {
+            let nodes = tree
+                .as_array()?
+                .iter()
+                .map(node)
+                .collect::<Option<Vec<_>>>()?;
+            // Children must exist, or predicting would run off the tree.
+            let inside = |n: &Node| match n {
+                Node::Split { left, right, .. } => *left < nodes.len() && *right < nodes.len(),
+                Node::Leaf(_) => true,
+            };
+            (!nodes.is_empty() && nodes.iter().all(inside)).then_some(Tree { nodes })
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(Gbdt {
+        base: value["base"].as_f64()?,
+        trees,
     })
 }
 
@@ -497,9 +592,23 @@ pub fn pv_model_from_json(value: &serde_json::Value) -> Option<PvModel> {
             })
         })
         .collect::<Option<Vec<_>>>()?;
+    let correction = match &value["correction"] {
+        serde_json::Value::Null => None,
+        trees => Some(trees_from_json(trees)?),
+    };
     Some(PvModel {
         arrays,
         cap_kw: value["cap_kw"].as_f64()?,
+        correction,
+    })
+}
+
+pub fn correction_metrics(fit: &CorrectionFit, on_learned_physics: bool) -> serde_json::Value {
+    json!({
+        "hours": fit.hours,
+        "validation_mae_kwh": fit.validation_mae,
+        "physics_mae_kwh": fit.physics_mae,
+        "on_learned_physics": on_learned_physics,
     })
 }
 
@@ -583,8 +692,38 @@ mod tests {
                 azimuth: 193.0,
             }],
             cap_kw: 8.1,
+            correction: Some(Gbdt {
+                base: 0.25,
+                trees: vec![Tree {
+                    nodes: vec![
+                        Node::Split {
+                            feature: 7,
+                            threshold: 12.5,
+                            left: 1,
+                            right: 2,
+                        },
+                        Node::Leaf(-0.4),
+                        Node::Leaf(0.1),
+                    ],
+                }],
+            }),
         };
-        assert_eq!(pv_model_from_json(&pv_model_json(&model)), Some(model));
+        assert_eq!(
+            pv_model_from_json(&pv_model_json(&model)),
+            Some(model.clone())
+        );
+        // Without a correction, and a broken tree isn't loaded.
+        let plain = PvModel {
+            correction: None,
+            ..model
+        };
+        assert_eq!(
+            pv_model_from_json(&pv_model_json(&plain)),
+            Some(plain.clone())
+        );
+        let mut broken = pv_model_json(&plain);
+        broken["correction"] = json!({"base": 0.0, "trees": [[[7, 12.5, 1, 9], [0.1]]]});
+        assert_eq!(pv_model_from_json(&broken), None);
     }
 
     #[test]

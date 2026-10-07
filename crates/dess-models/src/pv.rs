@@ -5,6 +5,14 @@
 //! the inverter's AC limit as a soft clip. Training fits hourly PV energy with
 //! Adam on a pseudo-Huber loss, so curtailed or odd hours don't dominate.
 //! Burn is only used to fit; predictions use plain `f64` with the same maths.
+//!
+//! On top of the physics comes a correction for what it can't know: shading
+//! when the sun is low, reflection at shallow angles, a weather forecast
+//! that reads a little low. Boosted trees ([`crate::gbdt`]) fitted to what
+//! the physics got wrong, from its own output, the weather and where the
+//! sun stands. On a year of one site's data the physics made half of what
+//! it predicted below 10° of sun and a tenth more than predicted above 30°;
+//! the correction took a fifth off the forecast's error.
 
 use std::f64::consts::FRAC_PI_2;
 
@@ -16,6 +24,9 @@ use burn::tensor::{Tensor, TensorData, activation};
 use dess_core::Slot;
 use dess_core::solar::{self, ALBEDO};
 use dess_core::weather::Weather;
+
+use crate::features::is_validation_hour;
+use crate::gbdt::{self, Gbdt, Params};
 
 /// Power temperature coefficient of crystalline silicon, per °C.
 const TEMPERATURE_COEFFICIENT: f64 = -0.004;
@@ -66,6 +77,8 @@ impl Quarter {
 /// An hour of measured PV energy with its four quarters of weather.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hour {
+    /// Unix seconds, the hour's start.
+    pub start: i64,
     pub quarters: [Quarter; 4],
     pub energy_kwh: f64,
 }
@@ -87,11 +100,46 @@ pub struct PvModel {
     pub arrays: Vec<Array>,
     /// AC limit of the inverter(s), kW.
     pub cap_kw: f64,
+    /// What the physics gets wrong, learned (see the module's notes).
+    pub correction: Option<Gbdt>,
+}
+
+/// What the correction sees for a quarter hour (or, in training, an hour's
+/// means): the physics' power, the weather, how clear the sky is, and the
+/// sun's height and compass direction in degrees.
+fn correction_features(q: &Quarter, physics_kw: f64) -> [f64; 9] {
+    let clearness = if q.cos_zenith > 0.05 {
+        (q.ghi / (q.extraterrestrial * q.cos_zenith).max(1.0)).clamp(0.0, 1.5)
+    } else {
+        0.0
+    };
+    [
+        physics_kw,
+        q.ghi,
+        q.dni,
+        q.dhi,
+        q.temperature,
+        q.wind,
+        clearness,
+        q.cos_zenith.clamp(-1.0, 1.0).asin().to_degrees(),
+        q.sun_azimuth.to_degrees(),
+    ]
 }
 
 impl PvModel {
     /// AC power for a quarter hour, kW.
     pub fn power_kw(&self, q: &Quarter) -> f64 {
+        let physics = self.physics_kw(q);
+        match &self.correction {
+            Some(trees) if q.has_light() => {
+                (physics + trees.predict(&correction_features(q, physics))).clamp(0.0, self.cap_kw)
+            }
+            _ => physics,
+        }
+    }
+
+    /// The physics alone.
+    fn physics_kw(&self, q: &Quarter) -> f64 {
         let cos_zenith_guard = q.cos_zenith.max(MIN_COS_ZENITH);
         let anisotropy = (q.dni / q.extraterrestrial).clamp(0.0, 1.0);
         let dc: f64 = self
@@ -119,6 +167,96 @@ impl PvModel {
     pub fn hour_kwh(&self, hour: &Hour) -> f64 {
         hour.quarters.iter().map(|q| self.power_kw(q) * 0.25).sum()
     }
+
+    fn physics_hour_kwh(&self, hour: &Hour) -> f64 {
+        hour.quarters
+            .iter()
+            .map(|q| self.physics_kw(q) * 0.25)
+            .sum()
+    }
+}
+
+/// A fitted correction and how it did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CorrectionFit {
+    pub trees: Gbdt,
+    pub hours: usize,
+    /// Mean absolute error on held-out days with the correction, kWh per hour.
+    pub validation_mae: f64,
+    /// The same for the physics alone.
+    pub physics_mae: f64,
+}
+
+impl CorrectionFit {
+    pub fn improves(&self) -> bool {
+        self.validation_mae < self.physics_mae
+    }
+}
+
+/// Daylight hours needed before a correction is tried: about two months.
+const MIN_CORRECTION_HOURS: usize = 600;
+
+/// Fits the correction to what `physics` gets wrong on `hours`; every fifth
+/// day is held out. `None` without enough daylight hours.
+pub fn fit_correction(hours: &[Hour], physics: &PvModel) -> Option<CorrectionFit> {
+    let physics = PvModel {
+        correction: None,
+        ..physics.clone()
+    };
+    let usable: Vec<&Hour> = hours
+        .iter()
+        .filter(|h| h.quarters.iter().any(Quarter::has_light) && h.energy_kwh.is_finite())
+        .collect();
+    if usable.len() < MIN_CORRECTION_HOURS {
+        return None;
+    }
+    let (validation, training): (Vec<&Hour>, Vec<&Hour>) =
+        usable.iter().partition(|h| is_validation_hour(h.start));
+    // An hour's features are the means over its quarters; the target is what
+    // the physics missed, as mean power.
+    let row = |h: &Hour| {
+        let mut mean = [0.0; 9];
+        for q in &h.quarters {
+            for (m, f) in mean
+                .iter_mut()
+                .zip(correction_features(q, physics.physics_kw(q)))
+            {
+                *m += f / 4.0;
+            }
+        }
+        mean.to_vec()
+    };
+    let rows: Vec<Vec<f64>> = training.iter().map(|h| row(h)).collect();
+    let targets: Vec<f64> = training
+        .iter()
+        .map(|h| h.energy_kwh - physics.physics_hour_kwh(h))
+        .collect();
+    let trees = gbdt::fit(
+        &rows,
+        &targets,
+        &Params {
+            rounds: 200,
+            max_depth: 4,
+            ..Params::default()
+        },
+    );
+    let corrected = PvModel {
+        correction: Some(trees),
+        ..physics.clone()
+    };
+    let mae = |m: &PvModel| {
+        validation
+            .iter()
+            .map(|h| (m.hour_kwh(h) - h.energy_kwh).abs())
+            .sum::<f64>()
+            / validation.len().max(1) as f64
+    };
+    Some(CorrectionFit {
+        hours: usable.len(),
+        validation_mae: mae(&corrected),
+        physics_mae: mae(&physics),
+        trees: corrected.correction?,
+    })
 }
 
 /// `min(x, cap)`, smoothed as in the training graph.
@@ -135,7 +273,7 @@ fn soft_min(x: f64, cap: f64) -> f64 {
 pub struct FitReport {
     pub model: PvModel,
     pub hours: usize,
-    /// Mean absolute error on the held-out last fifth of the hours, kWh.
+    /// Mean absolute error on the held-out days, kWh.
     pub validation_mae: f64,
     /// The same for the starting model (the configured arrays).
     pub initial_validation_mae: f64,
@@ -150,9 +288,11 @@ impl FitReport {
 
 type Train = Autodiff<NdArray<f32>>;
 
-/// Fits the model to `hours` (oldest first), starting from `initial`.
+/// Fits the physics to `hours`, starting from `initial` (its correction is
+/// left out).
 ///
-/// The last fifth of the hours is held out for validation.
+/// Every fifth day is held out for validation, so every season is in both
+/// sets: the sun's height matters as much as the weather.
 pub fn fit(hours: &[Hour], initial: &PvModel, iterations: usize) -> FitReport {
     let usable: Vec<&Hour> = hours
         .iter()
@@ -162,8 +302,13 @@ pub fn fit(hours: &[Hour], initial: &PvModel, iterations: usize) -> FitReport {
                 && h.energy_kwh >= 0.0
         })
         .collect();
-    let split = usable.len() * 4 / 5;
-    let (training, validation) = usable.split_at(split);
+    let (validation, training): (Vec<&Hour>, Vec<&Hour>) =
+        usable.iter().partition(|h| is_validation_hour(h.start));
+    let (training, validation) = (&training[..], &validation[..]);
+    let initial = &PvModel {
+        correction: None,
+        ..initial.clone()
+    };
 
     let device = burn::backend::ndarray::NdArrayDevice::default();
     let batch = Batch::<Train>::new(training, &device);
@@ -334,6 +479,7 @@ impl<B: Backend> Net<B> {
                 })
                 .collect(),
             cap_kw: cap[0],
+            correction: None,
         }
     }
 }
@@ -352,6 +498,7 @@ mod tests {
         for day in 0..90u32 {
             let cloudiness = f64::from((day * 7) % 10) / 10.0;
             for _hour in 0..24 {
+                let start = slot.start_unix();
                 let quarters: [Quarter; 4] = std::array::from_fn(|_| {
                     let middle = slot.start() + jiff::SignedDuration::from_secs(450);
                     let sun = solar::sun_position(middle, LATITUDE, LONGITUDE);
@@ -376,6 +523,7 @@ mod tests {
                     q
                 });
                 let mut hour = Hour {
+                    start,
                     quarters,
                     energy_kwh: 0.0,
                 };
@@ -402,6 +550,7 @@ mod tests {
                 },
             ],
             cap_kw: 7.0,
+            correction: None,
         };
         let data = hours(&model);
         let sample: Vec<&Hour> = data.iter().skip(24 * 30 + 10).take(4).collect();
@@ -430,6 +579,7 @@ mod tests {
                 azimuth: 210.0,
             }],
             cap_kw: 20.0,
+            correction: None,
         };
         let data = hours(&truth);
         let guess = PvModel {
@@ -439,6 +589,7 @@ mod tests {
                 azimuth: 170.0,
             }],
             cap_kw: 20.0,
+            correction: None,
         };
         let report = fit(&data, &guess, 600);
         let learned = report.model.arrays[0];
@@ -446,5 +597,52 @@ mod tests {
         assert!((learned.kwp - 6.0).abs() < 0.6, "{learned:?}");
         assert!((learned.azimuth - 210.0).abs() < 10.0, "{learned:?}");
         assert!(report.validation_mae < 0.1, "{report:?}");
+    }
+    #[test]
+    fn the_correction_learns_shading_at_low_sun() {
+        // The truth: the physics, but half of it is lost below 15° of sun
+        // (trees on the horizon).
+        let physics = PvModel {
+            arrays: vec![Array {
+                kwp: 6.0,
+                tilt: 35.0,
+                azimuth: 180.0,
+            }],
+            cap_kw: 20.0,
+            correction: None,
+        };
+        let mut data = hours(&physics);
+        for hour in &mut data {
+            hour.energy_kwh = hour
+                .quarters
+                .iter()
+                .map(|q| {
+                    let shaded = q.cos_zenith < 15f64.to_radians().sin();
+                    physics.power_kw(q) * if shaded { 0.5 } else { 1.0 } * 0.25
+                })
+                .sum();
+        }
+        let fit = fit_correction(&data, &physics).unwrap();
+        assert!(
+            fit.improves(),
+            "{} vs {}",
+            fit.validation_mae,
+            fit.physics_mae
+        );
+        assert!(fit.validation_mae < 0.4 * fit.physics_mae, "{fit:?}");
+        // A quarter hour with the sun at 8°: about half of the physics.
+        let corrected = PvModel {
+            correction: Some(fit.trees),
+            ..physics.clone()
+        };
+        let low = data
+            .iter()
+            .flat_map(|h| h.quarters.iter())
+            .find(|q| q.has_light() && (0.12..0.16).contains(&q.cos_zenith) && q.dni > 200.0)
+            .unwrap();
+        let ratio = corrected.power_kw(low) / physics.power_kw(low);
+        assert!((ratio - 0.5).abs() < 0.15, "{ratio}");
+        // Too few hours: no correction.
+        assert!(fit_correction(&data[..24 * 20], &physics).is_none());
     }
 }
