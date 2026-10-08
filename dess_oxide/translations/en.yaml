@@ -11,6 +11,10 @@ configuration:
       host: address of the Cerbo GX (MQTT on LAN must be enabled).
       port: MQTT port, default 1883.
       portal_id: VRM portal id; discovered automatically when empty.
+      pv_relay: only when a relay on the GX device itself switches the PV: its
+      number (1 or 2), and pv_relay_energized says what the relay being on
+      does. Leave both empty when the PV is on a Home Assistant switch (see
+      PV switch below) or can't be switched at all.
   cheapest_start:
     name: Cheapest start
     description: >-
@@ -50,8 +54,9 @@ configuration:
       on a contactor), where the GX device's relay doesn't; several (one per
       inverter) separated by commas. on_means: what the switch being on does,
       pv_on (default) or pv_off. dess-oxide switches the PV off when feeding
-      in would cost money, and only with both locks on. Don't set
-      victron.pv_relay as well.
+      in would cost money, and only with both locks on. This is the
+      alternative to pv_relay under Victron GX device: fill in one of the
+      two, never both.
   language:
     name: Language
     description: >-

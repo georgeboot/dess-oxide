@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.23.1
+
+- The settings now say what `pv_relay` under "Victron GX device" is for: a
+  relay on the GX device itself that switches the PV. It and "PV switch" (a
+  switch in Home Assistant) are two ways to do the same thing; fill in one
+  and leave the other empty.
+
 ## 0.23.0
 
 - **The PV forecast learns what the physics can't know.** The panel model
