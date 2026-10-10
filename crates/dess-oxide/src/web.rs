@@ -1304,7 +1304,18 @@ fn pv_correction_line(shared: &Shared) -> Markup {
                 @if metrics["on_learned_physics"].as_bool() == Some(false) {
                     (l.t(" (on the configured arrays)", " (op de ingestelde panelenvelden)"))
                 }
-                "."
+                ". "
+                @if metrics["weighs_models"].as_bool() == Some(true) {
+                    (l.t(
+                        "It weighs three weather models against each other (KNMI, ECMWF and ICON): none of them is right about the clouds every day.",
+                        "De correctie weegt drie weermodellen tegen elkaar af (KNMI, ECMWF en ICON): geen daarvan heeft elke dag gelijk over de bewolking.",
+                    ))
+                } @else {
+                    (l.t(
+                        "It goes by KNMI's weather alone: there's no history of ECMWF's and ICON's forecasts here yet.",
+                        "De correctie gaat alleen uit van het weer van KNMI: van de verwachtingen van ECMWF en ICON is hier nog geen historie.",
+                    ))
+                }
             },
         }
     }
@@ -1870,22 +1881,26 @@ fn severity_label(l: Lang, severity: Severity) -> &'static str {
 }
 
 /// Hover tooltips and legend toggles for the charts, and a refresh every
-/// minute that waits while someone is looking at a value. Progressive: the
-/// page works without it.
+/// minute that waits while someone is looking at a value. Charts over the
+/// same hours show their values for the same moment together. Progressive:
+/// the page works without it.
 const SCRIPT: &str = r#"
 document.addEventListener('DOMContentLoaded', () => {
   const locale = document.documentElement.lang || 'en';
   const fixed = (v, d) => v.toLocaleString(locale, { minimumFractionDigits: d, maximumFractionDigits: d });
   const fmt = v => v == null ? '–' : fixed(v, Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 10 ? 1 : 2);
+  // Charts over the same hours show the same moment together: pointing at
+  // one puts the guide and the values in the others too.
+  const charts = [];
   document.querySelectorAll('figure[data-chart]').forEach(fig => {
     const d = JSON.parse(fig.dataset.chart);
     const svg = fig.querySelector('svg'), cursor = svg.querySelector('.cursor'), tip = fig.querySelector('.tip');
     const n = d.labels.length, hidden = new Set();
-    const hide = () => { cursor.style.display = 'none'; tip.hidden = true; };
-    const show = ev => {
-      const r = svg.getBoundingClientRect();
-      const i = Math.floor(((ev.clientX - r.left) / r.width * d.width - d.left) / d.plot * n);
-      if (i < 0 || i >= n) return hide();
+    const hours = n + ' ' + d.labels[0] + ' ' + d.labels[n - 1];
+    const clear = () => { cursor.style.display = 'none'; tip.hidden = true; };
+    // `pointer`: where the pointer is, in pixels from the figure's left; the
+    // other charts put the values next to their guide.
+    const paint = (i, pointer) => {
       const x = d.left + (i + 0.5) * d.plot / n;
       cursor.setAttribute('x1', x); cursor.setAttribute('x2', x); cursor.style.display = 'inline';
       tip.replaceChildren();
@@ -1901,8 +1916,19 @@ document.addEventListener('DOMContentLoaded', () => {
         swatch.className = d.band.classes[i]; row.append(swatch, d.band.label + ': ' + d.band.values[i]); tip.append(row);
       }
       tip.hidden = false;
-      const left = ev.clientX - fig.getBoundingClientRect().left;
+      const r = svg.getBoundingClientRect();
+      const left = pointer ?? r.left - fig.getBoundingClientRect().left + x / d.width * r.width;
       tip.style.left = (left + 14 + tip.offsetWidth > fig.clientWidth ? left - 14 - tip.offsetWidth : left + 14) + 'px';
+    };
+    const chart = { hours, paint, clear };
+    charts.push(chart);
+    const together = act => charts.forEach(c => c.hours === hours && act(c));
+    const hide = () => together(c => c.clear());
+    const show = ev => {
+      const r = svg.getBoundingClientRect();
+      const i = Math.floor(((ev.clientX - r.left) / r.width * d.width - d.left) / d.plot * n);
+      if (i < 0 || i >= n) return hide();
+      together(c => c === chart ? c.paint(i, ev.clientX - fig.getBoundingClientRect().left) : c.paint(i));
     };
     svg.addEventListener('pointermove', show);
     svg.addEventListener('pointerdown', show);

@@ -151,6 +151,7 @@ mod tests {
             temperature,
             humidity: 80.0,
             wind: 3.0,
+            others: [None; 2],
         }
     }
 

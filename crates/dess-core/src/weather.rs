@@ -4,6 +4,9 @@ use crate::slot::Slot;
 use crate::solar::{self, Irradiance, Orientation};
 use crate::units::Watts;
 
+/// How many other weather models' irradiance a slot can carry.
+pub const OTHER_MODELS: usize = 2;
+
 /// Weather for one 15-minute slot.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Weather {
@@ -19,6 +22,10 @@ pub struct Weather {
     pub humidity: f64,
     /// Wind speed at 10 m, m/s.
     pub wind: f64,
+    /// The irradiance other weather models expect for the same slot, where
+    /// known. Models disagree most about clouds, and none is right every
+    /// day: the PV forecast learns how far to trust each.
+    pub others: [Option<Irradiance>; OTHER_MODELS],
 }
 
 /// A PV array as configured: peak power and orientation.
@@ -84,6 +91,7 @@ mod tests {
             temperature: 22.0,
             humidity: 50.0,
             wind: 3.0,
+            others: [None; 2],
         };
         let south = PvArray {
             kwp: 5.0,

@@ -13,6 +13,11 @@
 //! sun stands. On a year of one site's data the physics made half of what
 //! it predicted below 10° of sun and a tenth more than predicted above 30°;
 //! the correction took a fifth off the forecast's error.
+//!
+//! The correction also sees what other weather models expect for the same
+//! hour. They disagree most about clouds and none is right every day; on
+//! that same year two more models took another eighth off the error of the
+//! forecast for tomorrow, and a quarter off that for the next hours.
 
 use std::f64::consts::FRAC_PI_2;
 
@@ -22,8 +27,8 @@ use burn::optim::{AdamConfig, GradientsParams, Optimizer};
 use burn::tensor::backend::Backend;
 use burn::tensor::{Tensor, TensorData, activation};
 use dess_core::Slot;
-use dess_core::solar::{self, ALBEDO};
-use dess_core::weather::Weather;
+use dess_core::solar::{self, ALBEDO, Irradiance};
+use dess_core::weather::{OTHER_MODELS, Weather};
 
 use crate::features::is_validation_hour;
 use crate::gbdt::{self, Gbdt, Params};
@@ -48,6 +53,8 @@ pub struct Quarter {
     pub extraterrestrial: f64,
     pub temperature: f64,
     pub wind: f64,
+    /// What other weather models expect (see [`Weather::others`]).
+    pub others: [Option<Irradiance>; OTHER_MODELS],
 }
 
 impl Quarter {
@@ -66,11 +73,30 @@ impl Quarter {
             extraterrestrial: solar::extraterrestrial(middle),
             temperature: weather.temperature,
             wind: weather.wind,
+            others: weather.others.map(|other| {
+                other.map(|sky| Irradiance {
+                    ghi: light(sky.ghi),
+                    dni: light(sky.dni),
+                    dhi: light(sky.dhi),
+                })
+            }),
         }
     }
 
     fn has_light(&self) -> bool {
         self.ghi > 0.0
+    }
+
+    fn sky(&self) -> Irradiance {
+        Irradiance {
+            ghi: self.ghi,
+            dni: self.dni,
+            dhi: self.dhi,
+        }
+    }
+
+    fn knows_all_models(&self) -> bool {
+        self.others.iter().all(Option::is_some)
     }
 }
 
@@ -104,44 +130,70 @@ pub struct PvModel {
     pub correction: Option<Gbdt>,
 }
 
-/// What the correction sees for a quarter hour (or, in training, an hour's
-/// means): the physics' power, the weather, how clear the sky is, and the
-/// sun's height and compass direction in degrees.
-fn correction_features(q: &Quarter, physics_kw: f64) -> [f64; 9] {
-    let clearness = if q.cos_zenith > 0.05 {
-        (q.ghi / (q.extraterrestrial * q.cos_zenith).max(1.0)).clamp(0.0, 1.5)
-    } else {
-        0.0
-    };
-    [
-        physics_kw,
-        q.ghi,
-        q.dni,
-        q.dhi,
-        q.temperature,
-        q.wind,
-        clearness,
-        q.cos_zenith.clamp(-1.0, 1.0).asin().to_degrees(),
-        q.sun_azimuth.to_degrees(),
-    ]
-}
+/// The correction's inputs: nine from the first weather model, then three
+/// for each other one. Trees fitted without the others only get, and so
+/// only look at, the first nine.
+const OWN_FEATURES: usize = 9;
+const FEATURES: usize = OWN_FEATURES + 3 * OTHER_MODELS;
 
 impl PvModel {
+    /// What the correction sees for a quarter hour (or, in training, an
+    /// hour's means): the physics' power, the weather, how clear the sky is,
+    /// and the sun's height and compass direction in degrees; then, for each
+    /// other weather model, the physics' power under its sky and that sky.
+    /// A model without a value counts as agreeing with the first.
+    fn correction_features(&self, q: &Quarter, physics_kw: f64) -> [f64; FEATURES] {
+        let clearness = if q.cos_zenith > 0.05 {
+            (q.ghi / (q.extraterrestrial * q.cos_zenith).max(1.0)).clamp(0.0, 1.5)
+        } else {
+            0.0
+        };
+        let mut features = [0.0; FEATURES];
+        features[..OWN_FEATURES].copy_from_slice(&[
+            physics_kw,
+            q.ghi,
+            q.dni,
+            q.dhi,
+            q.temperature,
+            q.wind,
+            clearness,
+            q.cos_zenith.clamp(-1.0, 1.0).asin().to_degrees(),
+            q.sun_azimuth.to_degrees(),
+        ]);
+        for (other, out) in q
+            .others
+            .iter()
+            .zip(features[OWN_FEATURES..].chunks_exact_mut(3))
+        {
+            let (power, sky) = match other {
+                Some(sky) => (self.physics_under(q, *sky), *sky),
+                None => (physics_kw, q.sky()),
+            };
+            out.copy_from_slice(&[power, sky.ghi, sky.dni]);
+        }
+        features
+    }
+
     /// AC power for a quarter hour, kW.
     pub fn power_kw(&self, q: &Quarter) -> f64 {
         let physics = self.physics_kw(q);
         match &self.correction {
-            Some(trees) if q.has_light() => {
-                (physics + trees.predict(&correction_features(q, physics))).clamp(0.0, self.cap_kw)
-            }
+            Some(trees) if q.has_light() => (physics
+                + trees.predict(&self.correction_features(q, physics)))
+            .clamp(0.0, self.cap_kw),
             _ => physics,
         }
     }
 
     /// The physics alone.
     fn physics_kw(&self, q: &Quarter) -> f64 {
+        self.physics_under(q, q.sky())
+    }
+
+    /// The physics for the quarter hour's sun and air under `sky`.
+    fn physics_under(&self, q: &Quarter, sky: Irradiance) -> f64 {
         let cos_zenith_guard = q.cos_zenith.max(MIN_COS_ZENITH);
-        let anisotropy = (q.dni / q.extraterrestrial).clamp(0.0, 1.0);
+        let anisotropy = (sky.dni / q.extraterrestrial).clamp(0.0, 1.0);
         let dc: f64 = self
             .arrays
             .iter()
@@ -152,11 +204,11 @@ impl PvModel {
                         * tilt.sin()
                         * (q.sun_azimuth - array.azimuth.to_radians()).cos())
                 .max(0.0);
-                let poa = q.dni * cos_incidence
-                    + q.dhi
+                let poa = sky.dni * cos_incidence
+                    + sky.dhi
                         * (anisotropy * cos_incidence / cos_zenith_guard
                             + (1.0 - anisotropy) * (1.0 + tilt.cos()) / 2.0)
-                    + q.ghi * ALBEDO * (1.0 - tilt.cos()) / 2.0;
+                    + sky.ghi * ALBEDO * (1.0 - tilt.cos()) / 2.0;
                 let cell = q.temperature + poa / (25.0 + 6.84 * q.wind.max(0.0));
                 array.kwp * poa / 1000.0 * (1.0 + TEMPERATURE_COEFFICIENT * (cell - 25.0))
             })
@@ -185,6 +237,9 @@ pub struct CorrectionFit {
     pub validation_mae: f64,
     /// The same for the physics alone.
     pub physics_mae: f64,
+    /// Whether it was fitted on hours where every weather model had a value,
+    /// so it weighs them; otherwise it only knows the first.
+    pub weighs_models: bool,
 }
 
 impl CorrectionFit {
@@ -210,21 +265,38 @@ pub fn fit_correction(hours: &[Hour], physics: &PvModel) -> Option<CorrectionFit
     if usable.len() < MIN_CORRECTION_HOURS {
         return None;
     }
+    // Where nearly all hours have a value from every weather model, only
+    // those: the trees then learn how far to trust each. Otherwise (a site
+    // the others don't cover, or an archive still being filled) the trees
+    // get the first model alone.
+    let complete: Vec<&Hour> = usable
+        .iter()
+        .copied()
+        .filter(|h| h.quarters.iter().all(Quarter::knows_all_models))
+        .collect();
+    let weighs_models =
+        complete.len() >= MIN_CORRECTION_HOURS && complete.len() * 5 >= usable.len() * 4;
+    let usable = if weighs_models { complete } else { usable };
     let (validation, training): (Vec<&Hour>, Vec<&Hour>) =
         usable.iter().partition(|h| is_validation_hour(h.start));
     // An hour's features are the means over its quarters; the target is what
     // the physics missed, as mean power.
     let row = |h: &Hour| {
-        let mut mean = [0.0; 9];
+        let mut mean = [0.0; FEATURES];
         for q in &h.quarters {
             for (m, f) in mean
                 .iter_mut()
-                .zip(correction_features(q, physics.physics_kw(q)))
+                .zip(physics.correction_features(q, physics.physics_kw(q)))
             {
                 *m += f / 4.0;
             }
         }
-        mean.to_vec()
+        let inputs = if weighs_models {
+            FEATURES
+        } else {
+            OWN_FEATURES
+        };
+        mean[..inputs].to_vec()
     };
     let rows: Vec<Vec<f64>> = training.iter().map(|h| row(h)).collect();
     let targets: Vec<f64> = training
@@ -255,6 +327,7 @@ pub fn fit_correction(hours: &[Hour], physics: &PvModel) -> Option<CorrectionFit
         hours: usable.len(),
         validation_mae: mae(&corrected),
         physics_mae: mae(&physics),
+        weighs_models,
         trees: corrected.correction?,
     })
 }
@@ -517,6 +590,7 @@ mod tests {
                         temperature: 12.0,
                         humidity: 70.0,
                         wind: 3.0,
+                        others: [None; 2],
                     };
                     let q = Quarter::new(slot, &weather, LATITUDE, LONGITUDE);
                     slot = slot.next();
@@ -644,5 +718,61 @@ mod tests {
         assert!((ratio - 0.5).abs() < 0.15, "{ratio}");
         // Too few hours: no correction.
         assert!(fit_correction(&data[..24 * 20], &physics).is_none());
+    }
+
+    #[test]
+    fn the_correction_weighs_the_weather_models() {
+        let physics = PvModel {
+            arrays: vec![Array {
+                kwp: 6.0,
+                tilt: 35.0,
+                azimuth: 180.0,
+            }],
+            cap_kw: 20.0,
+            correction: None,
+        };
+        // Every third day the first weather model expects far too little
+        // sun; the others have it right.
+        let mut data = hours(&physics);
+        for hour in &mut data {
+            let wrong = hour.start.div_euclid(86_400) % 3 == 0;
+            for q in &mut hour.quarters {
+                q.others = [Some(q.sky()); 2];
+                if wrong {
+                    q.ghi *= 0.4;
+                    q.dni *= 0.4;
+                    q.dhi *= 0.4;
+                }
+            }
+        }
+        let with_others = fit_correction(&data, &physics).unwrap();
+        assert!(with_others.weighs_models);
+        for hour in &mut data {
+            for q in &mut hour.quarters {
+                q.others = [None; 2];
+            }
+        }
+        let alone = fit_correction(&data, &physics).unwrap();
+        assert!(!alone.weighs_models);
+        assert!(
+            with_others.validation_mae < 0.5 * alone.validation_mae,
+            "{} vs {}",
+            with_others.validation_mae,
+            alone.validation_mae
+        );
+        // Trees that only know the first model still work on quarter hours
+        // that carry the others.
+        let old = PvModel {
+            correction: Some(alone.trees),
+            ..physics.clone()
+        };
+        let mut q = data[24 * 40 + 12].quarters[0];
+        let before = old.power_kw(&q);
+        q.others = [Some(Irradiance {
+            ghi: 0.0,
+            dni: 0.0,
+            dhi: 0.0,
+        }); 2];
+        assert!((old.power_kw(&q) - before).abs() < 1e-9);
     }
 }

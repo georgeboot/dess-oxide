@@ -609,6 +609,7 @@ pub fn correction_metrics(fit: &CorrectionFit, on_learned_physics: bool) -> serd
         "validation_mae_kwh": fit.validation_mae,
         "physics_mae_kwh": fit.physics_mae,
         "on_learned_physics": on_learned_physics,
+        "weighs_models": fit.weighs_models,
     })
 }
 
@@ -656,6 +657,7 @@ mod tests {
                         temperature: 18.0,
                         humidity: 60.0,
                         wind: 2.0,
+                        others: [None; 2],
                     },
                 )
             })

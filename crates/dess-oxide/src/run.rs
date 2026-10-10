@@ -646,6 +646,7 @@ async fn train_pv(shared: &Arc<Shared>, location: LocationConfig) {
                     corrected_mae_kwh = format!("{:.3}", fit.validation_mae),
                     physics_mae_kwh = format!("{:.3}", fit.physics_mae),
                     promoted = fit.improves(),
+                    weighs_weather_models = fit.weighs_models,
                     "trained the PV correction"
                 );
                 let saved = store.save_model(

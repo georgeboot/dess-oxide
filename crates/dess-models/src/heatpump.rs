@@ -408,6 +408,7 @@ mod tests {
                     temperature,
                     humidity,
                     wind: 3.0 + 2.0 * (day * 0.7).sin(),
+                    others: [None; 2],
                 },
             );
             slot = slot.next();

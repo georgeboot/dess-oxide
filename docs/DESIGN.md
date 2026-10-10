@@ -97,7 +97,7 @@ Venus OS mirrors its D-Bus onto a local MQTT broker: `N/<portal>/…` publishes 
 ## 6. Data and storage
 
 - **Prices:** Nord Pool's data portal (15-minute NL day-ahead, €/MWh). The tariff is applied at planning time.
-- **Weather:** Open-Meteo, `knmi_seamless` (KNMI Harmonie-AROME, then ECMWF). History from the historical-forecast archive back to 2024-07-01, so models train on the same kind of forecast they predict from.
+- **Weather:** Open-Meteo, `knmi_seamless` (KNMI Harmonie-AROME, then ECMWF). History from the historical-forecast archive back to 2024-07-01, so models train on the same kind of forecast they predict from. With it comes the irradiance two more models expect, ECMWF's IFS (`ecmwf_ifs025`) and ICON (`icon_seamless`), for the PV forecast (7.3).
 - **Price model inputs:** EnergyZero's hourly EPEX NL prices (history), Open-Meteo's forecasts at points in NL and Germany, and optionally NED's Dutch wind and solar forecasts.
 - **Home Assistant:** location and language (REST), hourly energy statistics and OpenAmber's state history (WebSocket), the weather station's states.
 
@@ -128,7 +128,13 @@ Home Assistant's statistics can glitch (a counter reset shows up as its whole to
 
 **Correction.** The physics can't know about shading when the sun is low, reflection at shallow angles, or a weather forecast that reads low. On a year of one site's data, the panels made half of what the physics predicted with the sun below 10° and a tenth more than predicted above 30°: one kWp figure has to compromise. So boosted trees are fitted to what the physics got wrong, from the physics' own output, the irradiance, temperature and wind, the sky's clearness, and the sun's height and direction. No date is needed: the sun's position carries the season. On that site it takes about a fifth off the forecast's hourly error and removes the seasonal bias (the physics alone forecast 29 % too much in winter). Tried once there are about two months of daylight hours, and used while it beats the physics alone on held-out days.
 
-Two things tested and not adopted: fitting the physics on satellite-measured irradiance (worse: the forecast reads about 10 % lower than the satellite, so a model has to learn from the forecast it will be fed), and trees without the physics (nearly as good with a year of data, but nothing to start from at a new site).
+**Three weather models.** Most of what's left is the weather forecast: fed the irradiance a satellite measured, a model's error on that site is half of what it is from the forecast. Weather models disagree most about clouds, and none is right every day. Over a year at two Dutch sites, KNMI's day-ahead irradiance was off by 77 W/m² on average against the satellite, ICON's by 65 and ECMWF's by 56, and KNMI was the best of the day on one day in ten. So the correction also gets, for ECMWF and ICON, the physics' output under their sky and their global and direct irradiance, and learns how far to trust each at the site. On the one site's year that took the hourly error for the next day from 0.49 to 0.41 kWh, and for the next hours from 0.46 to 0.34. It needs history of all three, which the archive has back to 2024; where nearly all hours have it the trees are fitted on those, otherwise on KNMI alone. A slot without a value from one of them counts as that model agreeing with KNMI.
+
+Tested and not adopted:
+
+- Training on measured (satellite) irradiance instead of forecasts. The panels are learned more truly that way (a tilt of 36° instead of 15° on the one site), but the forecast for the next day gets worse, 0.63 against 0.53 kWh per hour: the question is what the panels make when the forecast says this, and the forecast's habits are part of the answer.
+- Training on the forecasts as they stood a day ahead, rather than the archive's freshest runs. The same accuracy for the next day with one weather model, and 2 % better with three, for a second archive to keep.
+- Trees without the physics: nearly as good with a year of data, but nothing to start from at a new site.
 
 ### 7.4 Base load
 
@@ -226,7 +232,7 @@ For a window set on the page, the plan treats its slots as islanded: PV forced o
 
 ### 12.1 The page
 
-Served through ingress only (connections from the Supervisor alone). Server-rendered SVG charts with a small script for hover tooltips, legend toggles and a refresh that waits while you're looking. English or Dutch, following HA's language. It shows:
+Served through ingress only (connections from the Supervisor alone). Server-rendered SVG charts with a small script for hover tooltips (charts over the same hours show the same moment together), legend toggles and a refresh that waits while you're looking. English or Dutch, following HA's language. It shows:
 - the plan, and control, overrides and the outage window;
 - the last 24 hours against the plan, including prices against their forecasts;
 - money, and the last week replayed;

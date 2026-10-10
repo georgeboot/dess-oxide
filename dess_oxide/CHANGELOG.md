@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.24.0
+
+- **The PV forecast weighs three weather models.** Most of what the PV
+  forecast gets wrong is the weather forecast, not the panels: fed the
+  sunshine a satellite measured, its error halves. Weather models disagree
+  most about clouds, and none is right every day. Over a year at two Dutch
+  sites KNMI's sunshine for the next day was the least accurate of five
+  models, and the best of the day on one day in ten. So dess-oxide now also
+  fetches what ECMWF and ICON expect (from Open-Meteo, like KNMI's), and the
+  correction on the PV model learns how far to trust each at your place. On
+  a year of real data the hourly error drops by a sixth for tomorrow and by
+  a quarter for the next hours. After the update the weather archive is
+  fetched once more with all three, and the first training, ten minutes
+  after startup, uses them. The page says whether the correction weighs the
+  three models.
+- **The charts show the same moment together.** Pointing at one of the three
+  plan charts, or one of the three of the last 24 hours, puts the guide line
+  and the values in the other two as well.
+
 ## 0.23.1
 
 - The settings now say what `pv_relay` under "Victron GX device" is for: a

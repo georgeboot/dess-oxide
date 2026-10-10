@@ -49,7 +49,9 @@ on here.
     through a **learned PV model**. It's trained nightly on your history and
     the archived weather, and starts from your configured arrays. After
     about two months it also learns what the physics can't know, such as
-    shading when the sun is low, from what it got wrong.
+    shading when the sun is low, from what it got wrong. It then also weighs
+    what two other weather models (ECMWF and ICON) expect: they disagree
+    most about clouds, and none is right every day.
   - house load from a **learned base-load model plus a learned heat pump
     model**. The heat pump model includes frost losses in humid air. Until
     they beat the naive forecast, load comes from history.

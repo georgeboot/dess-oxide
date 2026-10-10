@@ -95,6 +95,7 @@ mod tests {
                     temperature,
                     humidity: 90.0,
                     wind: 2.0,
+                    others: [None; 2],
                 },
             );
             slot = slot.next();

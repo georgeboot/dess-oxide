@@ -9,6 +9,7 @@ use dess_core::efficiency::BinStats;
 use dess_core::heat_pump_modes::ModeSlot;
 use dess_core::planner::{PlannedSlot, SlotForecast};
 use dess_core::record::SlotRecord;
+use dess_core::solar::Irradiance;
 use dess_core::weather::Weather;
 use dess_core::weather_correction::Observation;
 use dess_core::{EurPerKwh, Slot, WattHours, Watts};
@@ -168,6 +169,19 @@ const MIGRATIONS: &[&str] = &[
         vals       TEXT NOT NULL, -- JSON array
         PRIMARY KEY (hour_start, source)
     ) STRICT;
+",
+    r"
+    -- The irradiance two more weather models expect for the slot (ECMWF's IFS
+    -- and ICON: openmeteo::OTHERS), W/m²; NULL where one has no value.
+    ALTER TABLE weather ADD COLUMN ghi_ecmwf REAL;
+    ALTER TABLE weather ADD COLUMN dni_ecmwf REAL;
+    ALTER TABLE weather ADD COLUMN dhi_ecmwf REAL;
+    ALTER TABLE weather ADD COLUMN ghi_icon REAL;
+    ALTER TABLE weather ADD COLUMN dni_icon REAL;
+    ALTER TABLE weather ADD COLUMN dhi_icon REAL;
+    -- The archive so far has the first model only. Marked as such, it no
+    -- longer counts as archived: it's fetched once more, with all three.
+    UPDATE weather SET kind = 'history, one model' WHERE kind = 'history';
 ",
 ];
 
@@ -659,12 +673,16 @@ impl Store {
         let tx = self.conn.transaction()?;
         {
             let mut insert = tx.prepare_cached(
-                "INSERT OR REPLACE INTO weather VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                "INSERT OR REPLACE INTO weather
+                    (slot_start, ghi, dni, dhi, temperature, humidity, wind, kind, issued_at,
+                     ghi_ecmwf, dni_ecmwf, dhi_ecmwf, ghi_icon, dni_icon, dhi_icon)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
             )?;
             for (slot, w) in weather {
                 if !is_history && *slot < current {
                     continue;
                 }
+                let [ecmwf, icon] = w.others;
                 insert.execute(params![
                     slot.start_unix(),
                     w.ghi,
@@ -675,6 +693,12 @@ impl Store {
                     w.wind,
                     if is_history { "history" } else { "forecast" },
                     now.as_second(),
+                    ecmwf.map(|sky| sky.ghi),
+                    ecmwf.map(|sky| sky.dni),
+                    ecmwf.map(|sky| sky.dhi),
+                    icon.map(|sky| sky.ghi),
+                    icon.map(|sky| sky.dni),
+                    icon.map(|sky| sky.dhi),
                 ])?;
             }
         }
@@ -685,10 +709,20 @@ impl Store {
     /// Weather for `[from, until)`.
     pub fn weather(&self, from: Slot, until: Slot) -> anyhow::Result<BTreeMap<Slot, Weather>> {
         let mut query = self.conn.prepare_cached(
-            "SELECT slot_start, ghi, dni, dhi, temperature, humidity, wind FROM weather
-             WHERE slot_start >= ?1 AND slot_start < ?2",
+            "SELECT slot_start, ghi, dni, dhi, temperature, humidity, wind,
+                    ghi_ecmwf, dni_ecmwf, dhi_ecmwf, ghi_icon, dni_icon, dhi_icon
+             FROM weather WHERE slot_start >= ?1 AND slot_start < ?2",
         )?;
         let rows = query.query_map([from.start_unix(), until.start_unix()], |row| {
+            let sky = |first: usize| -> rusqlite::Result<Option<Irradiance>> {
+                let value = |i| row.get::<_, Option<f64>>(i);
+                Ok(
+                    match (value(first)?, value(first + 1)?, value(first + 2)?) {
+                        (Some(ghi), Some(dni), Some(dhi)) => Some(Irradiance { ghi, dni, dhi }),
+                        _ => None,
+                    },
+                )
+            };
             Ok((
                 row.get::<_, i64>(0)?,
                 Weather {
@@ -698,6 +732,7 @@ impl Store {
                     temperature: row.get(4)?,
                     humidity: row.get(5)?,
                     wind: row.get(6)?,
+                    others: [sky(7)?, sky(10)?],
                 },
             ))
         })?;
@@ -711,7 +746,8 @@ impl Store {
         Ok(out)
     }
 
-    /// The last slot with archived (historical) weather.
+    /// The last slot with archived (historical) weather, the other weather
+    /// models included.
     pub fn last_weather_history(&self) -> anyhow::Result<Option<Slot>> {
         let last: Option<i64> = self.conn.query_row(
             "SELECT max(slot_start) FROM weather WHERE kind = 'history'",
@@ -1518,6 +1554,14 @@ mod tests {
             temperature: 20.0,
             humidity: 50.0,
             wind: 2.0,
+            others: [
+                Some(Irradiance {
+                    ghi: 750.0,
+                    dni: 650.0,
+                    dhi: 120.0,
+                }),
+                None,
+            ],
         };
         let cloudy = Weather {
             ghi: 100.0,
