@@ -44,6 +44,7 @@ pub async fn serve(listen: SocketAddr, shared: Arc<Shared>, mut stop: watch::Rec
     let app = Router::new()
         .route("/", get(page))
         .route("/api/plan", get(plan_json))
+        .route("/api/debug", get(debug_download))
         .route("/api/control", axum::routing::post(set_control))
         .route("/api/outage", axum::routing::post(set_outage))
         .route("/api/override", axum::routing::post(set_override))
@@ -197,22 +198,58 @@ async fn set_outage(
     axum::response::Redirect::to(&format!("{base}/")).into_response()
 }
 
+/// Everything dess-oxide knows, in one file (see [`crate::debug`]).
+async fn debug_download(State(shared): State<Arc<Shared>>) -> Response {
+    let now = Timestamp::now();
+    match tokio::task::spawn_blocking(move || crate::debug::export(&shared, now)).await {
+        Ok(Ok((name, bytes))) => (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/gzip".to_owned(),
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    format!("attachment; filename=\"{name}\""),
+                ),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Ok(Err(error)) => {
+            error!("making the debug file: {error:#}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("{error:#}")).into_response()
+        }
+        Err(error) => {
+            error!(%error, "making the debug file");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
 async fn plan_json(State(shared): State<Arc<Shared>>) -> Response {
     let Some(view) = shared.plan.borrow().clone() else {
         return (StatusCode::SERVICE_UNAVAILABLE, "no plan yet").into_response();
     };
+    axum::Json(plan_value(&view)).into_response()
+}
+
+/// The plan per slot, with the forecasts it was made from.
+pub fn plan_value(view: &PlanView) -> serde_json::Value {
     let slots: Vec<_> = view
         .plan
         .slots
         .iter()
         .zip(&view.forecasts)
-        .map(|(s, f)| {
+        .zip(view.heat_pump.iter().map(|w| w.map(|w| w.0)))
+        .map(|((s, f), heat_pump)| {
             serde_json::json!({
                 "start": s.slot.start(),
                 "buy": s.prices.buy.0,
                 "sell": s.prices.sell.0,
                 "estimated_price": s.estimated_price,
                 "load_w": f.load.0,
+                "heat_pump_w": heat_pump,
                 "pv_w": f.pv.0,
                 "battery_w": s.battery_ac.0,
                 "grid_w": s.grid.0,
@@ -222,13 +259,12 @@ async fn plan_json(State(shared): State<Arc<Shared>>) -> Response {
             })
         })
         .collect();
-    axum::Json(serde_json::json!({
+    serde_json::json!({
         "planned_at": view.planned_at,
         "soc": view.soc,
         "expected_cost": view.plan.expected_cost,
         "slots": slots,
-    }))
-    .into_response()
+    })
 }
 
 async fn page(State(shared): State<Arc<Shared>>) -> Html<String> {
@@ -464,6 +500,13 @@ fn render(
                         @if let Some(at) = status.prices_updated { (l.t("Prices checked ", "Prijzen gecontroleerd om ")) (local(shared, at, "%H:%M")) ". " }
                         @if let Some(at) = status.pv_updated { (l.t("PV forecast ", "PV-verwachting van ")) (local(shared, at, "%H:%M")) ". " }
                         (l.t("Refreshes every minute.", "Ververst elke minuut."))
+                    }
+                    p.muted {
+                        a href="api/debug" download { (l.t("Download a debug file", "Debugbestand downloaden")) }
+                        (l.t(
+                            ": everything dess-oxide has measured, planned and learned, with its recent log, in one file, to look into how it's doing. Without passwords or your location, but with your energy use.",
+                            ": alles wat dess-oxide heeft gemeten, gepland en geleerd, met het recente logboek, in één bestand, om te onderzoeken hoe het gaat. Zonder wachtwoorden of je locatie, wel met je energieverbruik.",
+                        ))
                     }
                 }
             }

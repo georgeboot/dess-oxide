@@ -3,9 +3,11 @@ mod chart;
 mod comparison;
 mod config;
 mod control;
+mod debug;
 mod entities;
 mod homeassistant;
 mod i18n;
+mod logbuf;
 mod market;
 mod nordpool;
 mod openamber;
@@ -100,7 +102,7 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| EnvFilter::new("info,rumqttc=warn")),
         )
         .with_ansi(std::io::stderr().is_terminal())
-        .with_writer(std::io::stderr)
+        .with_writer(logbuf::Tee)
         .init();
 
     // ring as the TLS crypto provider (see the rustls dependency).

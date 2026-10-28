@@ -239,7 +239,8 @@ Served through ingress only (connections from the Supervisor alone). Server-rend
 - forecast accuracy;
 - the learned models;
 - the battery;
-- the Victron configuration findings.
+- the Victron configuration findings;
+- a debug download (`api/debug`): a gzipped copy of the database with a `debug` table added (version, the config without secrets or location, control and service status, the current plan, the battery model and limits, the GX device's published values, the last 5,000 log lines). One file holds everything needed to look into how it's doing.
 
 ### 12.2 Optional entities
 

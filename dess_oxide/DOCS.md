@@ -85,6 +85,10 @@ on here.
   - the last week replayed: dess-oxide's own plans and policy run over the
     same loads, PV and prices, next to what actually happened, perfect
     foresight and no battery (updated nightly).
+- **Hands over a debug file** at the bottom of the page: everything it has
+  measured, planned and learned, the GX device's values and its recent log,
+  in one gzipped SQLite file. Passwords, tokens and your location are left
+  out; your energy use is in it, so share it only with whoever helps you.
 
 It creates no Home Assistant entities unless you turn on `ha_entities`.
 

@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.25.0
+
+- **A debug file.** At the bottom of the page: one download with everything
+  dess-oxide has measured, planned and learned (a copy of its database), the
+  current plan and battery model, the GX device's values and the last 5,000
+  log lines. Instead of screenshots and VRM exports when looking into how
+  it's doing. Passwords, tokens and your location are left out; your energy
+  use is in it.
+- The plan's JSON (`api/plan`) now has the heat pump's part of each slot's
+  load forecast.
+
 ## 0.24.0
 
 - **The PV forecast weighs three weather models.** Most of what the PV

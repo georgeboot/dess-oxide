@@ -395,6 +395,19 @@ fn default_time_zone() -> String {
 }
 
 impl Config {
+    /// The config without its secrets and the house's location, for the
+    /// debug download.
+    pub fn redacted(&self) -> Self {
+        let hidden = || "(hidden)".to_owned();
+        let mut config = self.clone();
+        config.ned_api_key = config.ned_api_key.map(|_| hidden());
+        if let Some(ha) = &mut config.homeassistant {
+            ha.token = hidden();
+        }
+        config.location = None;
+        config
+    }
+
     /// OpenAmber's entities, when it's configured with a heat pump meter.
     pub fn openamber(&self) -> Option<OpenAmberEntities> {
         let device = self.openamber_device.trim();

@@ -94,6 +94,11 @@ pub struct Shared {
     pub price_model: watch::Sender<Option<Arc<dess_models::price::PriceModel>>>,
     /// Its prices for the hours not yet published, per slot.
     pub price_forecast: watch::Sender<Arc<BTreeMap<Slot, dess_core::EurPerKwh>>>,
+    /// Where the database lives.
+    pub data_dir: std::path::PathBuf,
+    /// The GX device once connected, for the debug download. Weak, so it
+    /// can still be closed at shutdown.
+    pub venus: std::sync::OnceLock<std::sync::Weak<Venus>>,
 }
 
 impl Shared {
@@ -149,6 +154,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
     let shared = Arc::new(Shared::new(
         config,
         Store::open(&data_dir.join("dess.db"))?,
+        data_dir,
     )?);
     let (stop, stopped) = watch::channel(false);
     let web = tokio::spawn(web::serve(listen, Arc::clone(&shared), stopped.clone()));
@@ -169,6 +175,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
             return Ok(());
         }
     };
+    let _ = shared.venus.set(Arc::downgrade(&venus));
     if let Err(error) = venus.full_publish(Duration::from_secs(30)).await {
         warn!(%error, "continuing without a complete first snapshot");
     }
@@ -191,7 +198,7 @@ pub async fn run(config: Config, data_dir: &Path, listen: SocketAddr) -> anyhow:
 }
 
 impl Shared {
-    fn new(config: Config, store: Store) -> anyhow::Result<Self> {
+    fn new(config: Config, store: Store, data_dir: &Path) -> anyhow::Result<Self> {
         let config_language = config.language.clone();
         let tariff = config
             .tariff
@@ -227,6 +234,8 @@ impl Shared {
             pv_switch_wanted: watch::Sender::new(None),
             price_model: watch::Sender::new(None),
             price_forecast: watch::Sender::new(Arc::new(BTreeMap::new())),
+            data_dir: data_dir.to_owned(),
+            venus: std::sync::OnceLock::new(),
             lang: Mutex::new(match config_language.as_str() {
                 "auto" => crate::i18n::Lang::En,
                 code => crate::i18n::Lang::from_code(code),

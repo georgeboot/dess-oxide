@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.24.0"
+version = "0.25.0"
 edition = "2024"
 rust-version = "1.90"
 repository = "https://github.com/georgeboot/dess-oxide"
@@ -16,6 +16,7 @@ dess-models = { path = "crates/dess-models" }
 anyhow = "1.0.104"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query", "form"] }
 clap = { version = "4.6.7", features = ["derive"] }
+flate2 = "1.1.10"
 futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
 jiff = { version = "0.2.37", features = ["serde", "tzdb-bundle-always"] }
 maud = "0.27.0"
