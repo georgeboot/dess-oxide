@@ -79,8 +79,9 @@ on here.
     what was forecast for them before they were published;
   - forecast accuracy over the last week, per day and by how far ahead each
     forecast was made;
-  - what today, yesterday, the last week and this month cost, and what
-    they would have cost without the battery. While DAO runs the system,
+  - what today, yesterday, the last week, this month and everything since
+    the start cost, and what they would have cost without the battery;
+    and for the next 48 hours, what the plan expects to pay and to save. While DAO runs the system,
     that's DAO's result, so it's the yardstick for the handover;
   - the last week replayed: dess-oxide's own plans and policy run over the
     same loads, PV and prices, next to what actually happened, perfect

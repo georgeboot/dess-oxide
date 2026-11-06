@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.26.0
+
+- **What the battery saves, ahead and so far.** The "grid cost ahead" card
+  now also says what the next 48 hours would cost without the battery, and
+  so what the plan expects to save. The money table gets a row for
+  everything since recording began.
+
 ## 0.25.0
 
 - **A debug file.** At the bottom of the page: one download with everything

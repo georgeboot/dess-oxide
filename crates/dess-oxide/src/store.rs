@@ -901,6 +901,16 @@ impl Store {
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
+    /// The first recorded slot.
+    pub fn first_recorded(&self) -> anyhow::Result<Option<Slot>> {
+        let first: Option<i64> = self.conn.query_row(
+            "SELECT min(slot_start) FROM slot_measurements WHERE covered_seconds > 60",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(first.and_then(Slot::from_start_unix))
+    }
+
     /// Energy through the grid meter, and all loads and PV, per recorded
     /// slot since `from` (at least a minute covered).
     pub fn flows(&self, from: Slot) -> anyhow::Result<Vec<SlotFlows>> {

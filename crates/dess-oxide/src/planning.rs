@@ -447,6 +447,29 @@ pub fn money(flows: &[SlotFlows], spot: &BTreeMap<Slot, EurPerKwh>, tariff: &Tar
     money
 }
 
+/// What the plan's slots would cost the grid without the battery: the same
+/// load and PV, with the PV off where exporting it would cost money (if it
+/// can be switched).
+pub fn cost_without_battery(view: &PlanView, pv_switchable: bool) -> f64 {
+    view.plan
+        .slots
+        .iter()
+        .zip(&view.forecasts)
+        .map(|(s, f)| {
+            let cost = |net_w: f64| {
+                let kw = net_w / 1000.0;
+                (kw.max(0.0) * s.prices.buy.0 - (-kw).max(0.0) * s.prices.sell.0) * s.hours
+            };
+            let with_pv = cost(f.load.0 - f.pv.0);
+            if pv_switchable {
+                with_pv.min(cost(f.load.0))
+            } else {
+                with_pv
+            }
+        })
+        .sum()
+}
+
 /// Losses learned from the last half year of steady-state samples.
 /// `units` inverter/chargers: their standby draw anchors the curves until
 /// it's measured.

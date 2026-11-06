@@ -249,5 +249,14 @@ mod tests {
         // dess-oxide would have covered the expensive hours from the battery.
         assert!(c.replayed < c.actual - 0.3, "{c:?}");
         assert!(c.perfect <= c.replayed + 0.02, "{c:?}");
+        // The plan's own slots without the battery: 2 kW bought throughout.
+        let bought: f64 = view
+            .plan
+            .slots
+            .iter()
+            .map(|s| 2.0 * s.hours * s.prices.buy.0)
+            .sum();
+        let without = crate::planning::cost_without_battery(&view, false);
+        assert!((without - bought).abs() < 1e-9, "{without} vs {bought}");
     }
 }

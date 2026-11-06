@@ -384,7 +384,8 @@ fn past_prices(
     Ok(PastPrices { actual, forecast })
 }
 
-/// Costs for today, yesterday, the last 7 days and this month.
+/// Costs for today, yesterday, the last 7 days, this month and since
+/// recording began.
 fn money_by_period(
     shared: &Shared,
     store: &crate::store::Store,
@@ -413,6 +414,11 @@ fn money_by_period(
         (
             (l.t("this month", "deze maand")),
             start(today.first_of_month())?,
+            now,
+        ),
+        (
+            (l.t("since the start", "sinds de start")),
+            store.first_recorded()?.map_or(now, Slot::start),
             now,
         ),
     ];
@@ -644,6 +650,8 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
     let discharge_above = (value + wear) * efficiency(-3000.0);
     // What the plan expects to pay the grid (and wear) over its horizon.
     let grid_cost: f64 = view.plan.slots.iter().map(|s| s.cost).sum();
+    let without_battery =
+        crate::planning::cost_without_battery(view, shared.config.pv_switchable());
     let horizon_hours: f64 = view.plan.slots.iter().map(|s| s.hours).sum();
     let soc_at_end = view.plan.slots.last().map_or(soc, |s| s.soc_end);
     let action = if first.bypass {
@@ -696,7 +704,9 @@ fn now_cards(shared: &Shared, view: &PlanView) -> Markup {
                     (l.t("over the next ", "over de komende ")) (format!("{horizon_hours:.0}")) (l.t(" h, ", " uur, "))
                     @if wear > 0.0 { (l.t("with wear, ", "met slijtage, ")) }
                     (l.t("with the battery going from ", "terwijl de accu van ")) (format!("{soc:.0} %")) (l.t(" to ", " naar "))
-                    (format!("{soc_at_end:.0} %")) (l.t("; negative is money earned", " gaat; negatief is geld verdiend"))
+                    (format!("{soc_at_end:.0} %")) (l.t("; negative is money earned. ", " gaat; negatief is geld verdiend. "))
+                    (l.t("Without the battery ", "Zonder accu ")) (eur(without_battery)) ", "
+                    strong { (eur(without_battery - grid_cost)) (l.t(" saved", " bespaard")) } "."
                 }
             }
             (cheapest_start_card(shared))
